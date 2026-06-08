@@ -451,6 +451,11 @@ where
         runtime_http_egress(&self.runtime_http_egress)
     }
 
+    /// Returns the configured security-audit sink, if one is installed.
+    pub fn security_audit_sink(&self) -> Option<Arc<dyn SecurityAuditSink>> {
+        self.security_audit_sink.clone()
+    }
+
     /// Returns the canonical host-runtime obligation handler.
     pub fn obligation_handler(&self) -> Arc<dyn CapabilityObligationHandler> {
         Arc::new(self.builtin_obligation_handler())

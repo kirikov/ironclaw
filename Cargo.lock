@@ -4660,6 +4660,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "ironclaw_events",
  "ironclaw_extensions",
  "ironclaw_host_api",
  "ironclaw_resources",
