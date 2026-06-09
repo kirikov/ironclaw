@@ -31,6 +31,8 @@ pub enum RebornReadinessDiagnosticStatus {
     Info,
     Warning,
     Blocking,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,8 +44,15 @@ pub enum RebornReadinessDiagnosticReason {
     LocalOnly,
     Unverified,
     Unsupported,
+    #[serde(other)]
+    Unknown,
 }
 
+/// Stable operator-facing component names.
+///
+/// The serialized names intentionally use `snake_case` to match the
+/// host-runtime production-wiring component vocabulary consumed by readiness
+/// diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RebornReadinessDiagnosticComponent {
@@ -73,6 +82,8 @@ pub enum RebornReadinessDiagnosticComponent {
     TurnState,
     RunProfileResolver,
     TurnRunWakeNotifier,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +92,11 @@ pub struct RebornReadinessDiagnostic {
     pub component: RebornReadinessDiagnosticComponent,
     pub reason: RebornReadinessDiagnosticReason,
     pub status: RebornReadinessDiagnosticStatus,
+    /// Whether this diagnostic prevents production Reborn traffic exposure.
+    ///
+    /// `RebornReadiness::state` remains the primary readiness state. This field
+    /// lets consumers identify which diagnostics are production blockers when
+    /// a profile is disabled, dev-only, or production-shaped but incomplete.
     pub blocks_production: bool,
 }
 
@@ -90,8 +106,8 @@ impl RebornReadinessDiagnostic {
             profile: RebornCompositionProfile::Disabled,
             component: RebornReadinessDiagnosticComponent::CompositionProfile,
             reason: RebornReadinessDiagnosticReason::Disabled,
-            status: RebornReadinessDiagnosticStatus::Info,
-            blocks_production: false,
+            status: RebornReadinessDiagnosticStatus::Blocking,
+            blocks_production: true,
         }
     }
 
@@ -108,7 +124,7 @@ impl RebornReadinessDiagnostic {
             profile,
             component: RebornReadinessDiagnosticComponent::CompositionProfile,
             reason: RebornReadinessDiagnosticReason::DevOnlyProfile,
-            status: RebornReadinessDiagnosticStatus::Warning,
+            status: RebornReadinessDiagnosticStatus::Blocking,
             blocks_production: true,
         }
     }
@@ -118,6 +134,7 @@ impl RebornReadinessDiagnostic {
         component: RebornReadinessDiagnosticComponent,
         reason: RebornReadinessDiagnosticReason,
     ) -> Self {
+        debug_assert!(profile.requires_production_shape());
         Self {
             profile,
             component,
@@ -146,6 +163,10 @@ impl Default for RebornReadiness {
 }
 
 impl RebornReadiness {
+    /// Disabled readiness snapshot with its operator-facing diagnostic.
+    ///
+    /// This is intentionally not `const`: the rich snapshot includes the
+    /// diagnostics vector that downstream readiness surfaces consume.
     pub fn disabled() -> Self {
         Self {
             profile: RebornCompositionProfile::Disabled,
@@ -170,7 +191,20 @@ mod tests {
 
     #[test]
     fn readiness_default_matches_disabled_snapshot() {
-        assert_eq!(RebornReadiness::default(), RebornReadiness::disabled());
+        let readiness = RebornReadiness::default();
+
+        assert_eq!(readiness.profile, RebornCompositionProfile::Disabled);
+        assert_eq!(readiness.state, RebornReadinessState::Disabled);
+        assert_eq!(readiness.diagnostics.len(), 1);
+        assert_eq!(
+            readiness.diagnostics[0].reason,
+            RebornReadinessDiagnosticReason::Disabled
+        );
+        assert_eq!(
+            readiness.diagnostics[0].status,
+            RebornReadinessDiagnosticStatus::Blocking
+        );
+        assert!(readiness.diagnostics[0].blocks_production);
     }
 
     #[test]

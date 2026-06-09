@@ -1236,6 +1236,7 @@ async fn migration_dry_run_validates_libsql_shape() {
         services.readiness.state,
         RebornReadinessState::MigrationDryRunValidated
     );
+    assert!(services.readiness.diagnostics.is_empty());
     assert!(services.host_runtime.is_some());
     assert!(services.turn_coordinator.is_some());
 }
