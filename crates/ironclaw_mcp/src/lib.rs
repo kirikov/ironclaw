@@ -724,6 +724,11 @@ where
             "name": tool_name,
             "arguments": request.input.clone(),
         });
+        // Whole-object assignment is safe: `tool_call_params` is built just
+        // above with only `name`/`arguments`, so there is no other `_meta`
+        // producer to merge with. Revisit (merge like the legacy engine's
+        // `inject_meta_context`) if trace-context propagation ever starts
+        // writing `params._meta` upstream of this point.
         if let Some(meta) = sep414_meta_context(&request.scope) {
             tool_call_params["_meta"] = meta;
         }
