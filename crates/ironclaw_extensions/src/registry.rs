@@ -4,10 +4,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ironclaw_host_api::{CapabilityDescriptor, CapabilityId, ExtensionId};
+use ironclaw_host_api::{
+    CapabilityDescriptor, CapabilityId, CapabilityProfileSchemaRef, ExtensionId,
+};
 use parking_lot::RwLock;
 
-use crate::{CapabilityVisibility, ExtensionError, ExtensionPackage};
+use crate::{CapabilityManifest, CapabilityVisibility, ExtensionError, ExtensionPackage};
 
 /// Registry of validated extension packages and declared capabilities.
 #[derive(Debug, Default, Clone)]
@@ -218,6 +220,120 @@ impl ExtensionRegistry {
             .iter()
             .filter_map(|id| self.capabilities.get(id))
     }
+
+    /// Returns a NEW registry with `descriptor` merged into a clone of its
+    /// provider's package. Never mutates `self` or the registry `self` was
+    /// snapshotted from — callers own a throwaway, per-request clone. Used
+    /// by `ironclaw_host_runtime`'s per-request registry resolution to make
+    /// a per-user discovered hosted-MCP capability resolvable at
+    /// invoke/resume time without ever writing it into the shared boot
+    /// registry (the hosted-MCP overlay's own invariant: discovered
+    /// descriptors are never written into the shared `ExtensionRegistry`).
+    ///
+    /// Mirrors `package_with_discovered_hosted_mcp_tools`'s boot-time shape
+    /// — the provider's other declared capabilities are replaced, not
+    /// appended, because a hosted-MCP provider's static manifest capability
+    /// is a schema template, never meant to be directly invocable once real
+    /// discovery resolves a capability (see that function's own regression
+    /// test). Unlike that helper, the manifest capability entry is built
+    /// FROM `descriptor` field-for-field instead of recomputing
+    /// effects/permission from raw MCP tool annotations — this guarantees
+    /// the merged registry's resolved descriptor is identical, in every
+    /// trust/authorization-relevant field, to the `descriptor` the caller
+    /// passed in, so an ambient grant minted against that same discovered
+    /// descriptor always effects-matches.
+    ///
+    /// Fails if `descriptor.provider` is not a known package in this
+    /// registry, or if the merged package fails consistency validation
+    /// (e.g. the registry's snapshot of the provider's manifest changed
+    /// between discovery and merge). Callers should treat `Err` as
+    /// fail-safe: leave the base registry unchanged rather than propagate.
+    // TODO(M1 follow-up, review item 5): this REPLACES the provider's
+    // capability list (`manifest.capabilities = vec![manifest_capability]`
+    // below), it does not append. The idempotency guard above only catches
+    // re-merging the SAME id; merging two DISTINCT discovered ids into the
+    // same provider sequentially would silently drop the first one's
+    // resolvability. Safe today because every call site resolves exactly
+    // one target id per request (`resolve_invocation_registry` merges the
+    // one id the caller is invoking/resuming). If a future caller ever
+    // needs to merge multiple discovered ids from the same provider into
+    // one registry snapshot, this needs to accumulate onto the EXISTING
+    // merged capabilities/manifest entries instead of replacing them.
+    pub fn merge_discovered_capability(
+        &self,
+        descriptor: CapabilityDescriptor,
+    ) -> Result<ExtensionRegistry, ExtensionError> {
+        let package = self.existing_package(&descriptor.provider)?;
+        if package
+            .capabilities
+            .iter()
+            .any(|existing| existing.id == descriptor.id)
+        {
+            // Already present (e.g. a second discovery within the same
+            // request) — nothing to merge.
+            return Ok(self.clone());
+        }
+        let manifest_capability = discovered_capability_manifest_entry(package, &descriptor)?;
+        let mut manifest = package.manifest.clone();
+        manifest.capabilities = vec![manifest_capability];
+        let merged_package =
+            ExtensionPackage::from_host_bundled_manifest_with_inline_dynamic_schemas(
+                manifest,
+                package.root.clone(),
+                package.manifest_digest(),
+                vec![descriptor],
+            )?;
+        let mut updated = self.clone();
+        updated.update(merged_package)?;
+        Ok(updated)
+    }
+}
+
+fn discovered_capability_manifest_entry(
+    package: &ExtensionPackage,
+    descriptor: &CapabilityDescriptor,
+) -> Result<CapabilityManifest, ExtensionError> {
+    let provider_prefix = format!("{}.", package.id.as_str());
+    let tool_name = descriptor
+        .id
+        .as_str()
+        .strip_prefix(&provider_prefix)
+        .unwrap_or(descriptor.id.as_str());
+    let schema_path = tool_name.replace('.', "/");
+    let input_schema_ref = CapabilityProfileSchemaRef::new(format!(
+        "schemas/{}/dynamic/{schema_path}.input.v1.json",
+        package.id.as_str()
+    ))
+    .map_err(|error| ExtensionError::InvalidManifest {
+        reason: format!("invalid discovered MCP input schema ref: {error}"),
+    })?;
+    let output_schema_ref = CapabilityProfileSchemaRef::new(format!(
+        "schemas/{}/dynamic/{schema_path}.output.v1.json",
+        package.id.as_str()
+    ))
+    .map_err(|error| ExtensionError::InvalidManifest {
+        reason: format!("invalid discovered MCP output schema ref: {error}"),
+    })?;
+    let required_host_ports = package
+        .manifest
+        .capabilities
+        .first()
+        .map(|capability| capability.required_host_ports.clone())
+        .unwrap_or_default();
+    Ok(CapabilityManifest {
+        id: descriptor.id.clone(),
+        implements: Vec::new(),
+        description: descriptor.description.clone(),
+        effects: descriptor.effects.clone(),
+        default_permission: descriptor.default_permission,
+        visibility: CapabilityVisibility::Model,
+        input_schema_ref,
+        output_schema_ref,
+        prompt_doc_ref: None,
+        required_host_ports,
+        runtime_credentials: descriptor.runtime_credentials.clone(),
+        resource_profile: descriptor.resource_profile.clone(),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -445,6 +561,80 @@ mod tests {
         for id in ["alpha", "beta", "gamma"] {
             assert!(snapshot.get_extension(&extension_id(id)).is_some());
         }
+    }
+
+    fn discovered_descriptor(provider: &ExtensionPackage, tool_name: &str) -> CapabilityDescriptor {
+        CapabilityDescriptor {
+            id: capability_id(&format!("{}.{tool_name}", provider.id.as_str())),
+            provider: provider.id.clone(),
+            runtime: provider.manifest.runtime_kind(),
+            trust_ceiling: provider.manifest.descriptor_trust_default,
+            description: format!("discovered {tool_name}"),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![ironclaw_host_api::EffectKind::Network],
+            default_permission: ironclaw_host_api::PermissionMode::Ask,
+            runtime_credentials: Vec::new(),
+            resource_profile: None,
+        }
+    }
+
+    #[test]
+    fn merge_discovered_capability_makes_it_resolvable_without_mutating_the_base_registry() {
+        let mut base = ExtensionRegistry::new();
+        let provider = test_package("notion", &["template"]);
+        base.insert(provider.clone()).expect("insert provider");
+
+        let discovered = discovered_descriptor(&provider, "notion-search");
+        let merged = base
+            .merge_discovered_capability(discovered.clone())
+            .expect("merge succeeds");
+
+        assert!(merged.get_capability(&discovered.id).is_some());
+        assert_eq!(merged.get_capability(&discovered.id), Some(&discovered));
+        // The base registry (and its provider package) is untouched — this
+        // is a per-request clone, never a mutation of the snapshot it came
+        // from.
+        assert!(base.get_capability(&discovered.id).is_none());
+        assert!(
+            base.get_extension(&provider.id)
+                .expect("provider still present")
+                .capabilities
+                .iter()
+                .any(|capability| capability.id.as_str() == "notion.template")
+        );
+    }
+
+    #[test]
+    fn merge_discovered_capability_is_idempotent_when_already_present() {
+        let mut base = ExtensionRegistry::new();
+        let provider = test_package("notion", &["template"]);
+        base.insert(provider.clone()).expect("insert provider");
+        let discovered = discovered_descriptor(&provider, "notion-search");
+        let merged_once = base
+            .merge_discovered_capability(discovered.clone())
+            .expect("first merge succeeds");
+
+        let merged_twice = merged_once
+            .merge_discovered_capability(discovered.clone())
+            .expect("second merge is a no-op, not an error");
+
+        assert_eq!(
+            merged_twice.get_capability(&discovered.id),
+            merged_once.get_capability(&discovered.id)
+        );
+    }
+
+    #[test]
+    fn merge_discovered_capability_fails_closed_for_unknown_provider() {
+        let base = ExtensionRegistry::new();
+        let orphan_provider = test_package("ghost", &["template"]);
+        let discovered = discovered_descriptor(&orphan_provider, "ghost-search");
+
+        let error = base
+            .merge_discovered_capability(discovered)
+            .expect_err("unknown provider must fail, not silently succeed");
+
+        assert!(matches!(error, ExtensionError::ExtensionNotFound { .. }));
     }
 
     fn test_package(extension_id: &str, capabilities: &[&str]) -> ExtensionPackage {

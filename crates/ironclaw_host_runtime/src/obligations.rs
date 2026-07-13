@@ -524,6 +524,25 @@ impl BuiltinObligationServices {
         )
     }
 
+    /// Builds a [`crate::HostRuntimeHttpEgressPort`] over this service graph's
+    /// shared handoff stores. Host-initiated callers that run outside
+    /// capability dispatch (hosted-MCP per-user discovery) use the port to
+    /// stage `ApplyNetworkPolicy` before sending. The port wraps the same
+    /// egress and shares the same staged-policy/secret stores as
+    /// [`Self::host_http_egress`], so a policy staged through the port is read
+    /// back by that egress.
+    pub fn host_runtime_http_egress_port<N>(&self, network: N) -> crate::HostRuntimeHttpEgressPort
+    where
+        N: NetworkHttpEgress + 'static,
+    {
+        let egress: Arc<dyn RuntimeHttpEgress> = Arc::new(self.host_http_egress(network));
+        crate::HostRuntimeHttpEgressPort::new(
+            egress,
+            Arc::new(self.obligation_handler()),
+            crate::RuntimeSecretMaterialStager::new(self.secret_injections.clone()),
+        )
+    }
+
     pub fn process_obligation_lifecycle_store<S>(
         &self,
         inner: Arc<S>,
@@ -2805,19 +2824,33 @@ mod tests {
 
         // Written at the owner scope (as the user-scoped admin API does).
         store
-            .put(owner_scope.clone(), handle.clone(), SecretMaterial::from("axm_secret"), None)
+            .put(
+                owner_scope.clone(),
+                handle.clone(),
+                SecretMaterial::from("axm_secret"),
+                None,
+            )
             .await
             .unwrap();
 
         // A strict agent-scoped read misses …
-        assert!(store.metadata(&agent_scope, &handle).await.unwrap().is_none());
+        assert!(
+            store
+                .metadata(&agent_scope, &handle)
+                .await
+                .unwrap()
+                .is_none()
+        );
         // … but the resolver falls back to the owner scope, and `secret_present`
         // (both pre-flight and the dispatch backstop) reports it present.
         let resolved = resolve_present_secret_scope(&store, &agent_scope, &handle)
             .await
             .unwrap()
             .expect("owner-scope fallback resolves the secret");
-        assert_eq!(resolved.agent_id, None, "leased at the owner scope for a matching AAD");
+        assert_eq!(
+            resolved.agent_id, None,
+            "leased at the owner scope for a matching AAD"
+        );
         assert_eq!(resolved.user_id, owner_scope.user_id);
         assert!(secret_present(&store, &agent_scope, &handle).await.unwrap());
 
@@ -2825,7 +2858,12 @@ mod tests {
         // directly (no fallback), and a truly-absent handle resolves to None.
         let direct = SecretHandle::new("agent-local-token").unwrap();
         store
-            .put(agent_scope.clone(), direct.clone(), SecretMaterial::from("v"), None)
+            .put(
+                agent_scope.clone(),
+                direct.clone(),
+                SecretMaterial::from("v"),
+                None,
+            )
             .await
             .unwrap();
         let resolved = resolve_present_secret_scope(&store, &agent_scope, &direct)
@@ -2834,7 +2872,12 @@ mod tests {
             .expect("agent-scoped secret resolves directly");
         assert_eq!(resolved.agent_id, agent_scope.agent_id);
         let absent = SecretHandle::new("nope-token").unwrap();
-        assert!(resolve_present_secret_scope(&store, &agent_scope, &absent).await.unwrap().is_none());
+        assert!(
+            resolve_present_secret_scope(&store, &agent_scope, &absent)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(!secret_present(&store, &agent_scope, &absent).await.unwrap());
     }
 

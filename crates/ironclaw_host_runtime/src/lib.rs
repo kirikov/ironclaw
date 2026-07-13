@@ -42,6 +42,7 @@ mod egress;
 mod extension_contracts;
 mod first_party;
 mod first_party_tools;
+mod hosted_mcp_overlay;
 mod http_body;
 mod invocation_services;
 mod latency;
@@ -101,6 +102,7 @@ pub use first_party_tools::{
 pub use first_party_tools::{
     TriggerManagementClock, builtin_first_party_handlers_with_trigger_clock,
 };
+pub use hosted_mcp_overlay::{HireScope, HostedMcpOverlayError, HostedMcpSurfaceOverlay};
 pub use http_body::{RuntimeHttpBodyStore, RuntimeHttpBodyStoreError};
 pub use invocation_services::{
     InvocationServices, InvocationServicesError, InvocationServicesResolutionRequest,
@@ -129,7 +131,10 @@ pub use services::{
     ProductionWiringIssue, ProductionWiringIssueKind, ProductionWiringReport,
     RegisteredRuntimeHealth,
 };
-pub use surface::{CapabilitySurfacePolicy, VisibleCapability, VisibleCapabilityAccess};
+pub use surface::{
+    CapabilitySurfacePolicy, VisibleCapability, VisibleCapabilityAccess,
+    discover_overlay_capabilities_for_hire,
+};
 pub use turn_scheduler::{
     SchedulerTurnRunWakeNotifier, TurnRunExecutor, TurnRunExecutorError, TurnRunScheduler,
     TurnRunSchedulerConfig, TurnRunSchedulerHandle, TurnRunWakeChannel,

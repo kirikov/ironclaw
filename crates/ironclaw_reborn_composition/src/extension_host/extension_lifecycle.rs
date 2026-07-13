@@ -66,8 +66,6 @@ impl ExtensionCredentialCleanup for RebornProductAuthServices {
 }
 
 mod active_publication;
-#[cfg(test)]
-mod hosted_mcp_test_support;
 
 use crate::extension_host::available_extensions::{
     AvailableExtensionCatalog, AvailableExtensionPackage, is_internal_extension_package_ref,
@@ -1704,11 +1702,11 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use super::hosted_mcp_test_support::HostedMcpDiscoveryEgress;
     use super::*;
     use crate::extension_host::available_extensions::{
         AvailableExtensionAsset, AvailableExtensionAssetContent, AvailableExtensionPackage,
     };
+    use crate::extension_host::hosted_mcp_test_support::HostedMcpDiscoveryEgress;
     use async_trait::async_trait;
     use ironclaw_extensions::{
         ExtensionLifecycleEvent, ExtensionLifecycleEventSink, ExtensionLifecycleService,

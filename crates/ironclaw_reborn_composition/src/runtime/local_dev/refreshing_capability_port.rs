@@ -1,10 +1,12 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use ironclaw_authorization::CapabilityLeaseStore;
+use ironclaw_extensions::SharedExtensionRegistry;
 use ironclaw_host_api::{MountView, UserId};
 use ironclaw_host_runtime::HostRuntime;
 use ironclaw_loop_support::{
     HostRuntimeLoopCapabilityPortFactory, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
+    loop_driver_execution_extension_id,
 };
 use ironclaw_product_workflow::{OutboundPreferencesProductFacade, ProjectService};
 use ironclaw_run_state::ApprovalRequestStore;
@@ -21,6 +23,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::local_dev_capability_policy::LocalDevCapabilityPolicy;
 use crate::profile_approval_authorization::ApprovalSettingsProvider;
 use crate::runtime::LocalDevSelectableSkillContextSource;
+use crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource;
 use crate::runtime::local_dev::extension_surface::LocalDevExtensionSurfaceSource;
 use crate::runtime::local_dev::external_tool_capability::wrap_local_dev_external_tools;
 use crate::runtime::local_dev::outbound_delivery::outbound_delivery_capabilities;
@@ -31,7 +34,7 @@ use crate::runtime::local_dev::synthetic_capability::wrap_local_dev_synthetic_ca
 
 use super::{
     LocalDevVisibleCapabilityInputs, capability_io_error, host_api_agent_loop_error,
-    local_dev_visible_capability_request,
+    local_dev_resource_scope_for_run, local_dev_visible_capability_request,
 };
 
 pub(super) struct RefreshingLocalDevCapabilityPortConfig {
@@ -56,6 +59,8 @@ pub(super) struct RefreshingLocalDevCapabilityPortConfig {
     pub(super) approval_requests: Arc<dyn ApprovalRequestStore>,
     pub(super) capability_leases: Arc<dyn CapabilityLeaseStore>,
     pub(super) external_tool_catalog: Arc<dyn ExternalToolCatalog>,
+    pub(super) discovered_capability_grants: DiscoveredCapabilityGrantSource,
+    pub(super) shared_extension_registry: Option<Arc<SharedExtensionRegistry>>,
 }
 
 pub(super) async fn create_refreshing_local_dev_capability_port(
@@ -84,6 +89,8 @@ pub(super) async fn create_refreshing_local_dev_capability_port(
         approval_requests: config.approval_requests,
         capability_leases: config.capability_leases,
         external_tool_catalog: config.external_tool_catalog,
+        discovered_capability_grants: config.discovered_capability_grants,
+        shared_extension_registry: config.shared_extension_registry,
         current: StdMutex::new(None),
         refresh_lock: AsyncMutex::new(()),
     });
@@ -116,6 +123,8 @@ struct RefreshingLocalDevCapabilityPort {
     approval_requests: Arc<dyn ApprovalRequestStore>,
     capability_leases: Arc<dyn CapabilityLeaseStore>,
     external_tool_catalog: Arc<dyn ExternalToolCatalog>,
+    discovered_capability_grants: DiscoveredCapabilityGrantSource,
+    shared_extension_registry: Option<Arc<SharedExtensionRegistry>>,
     current: StdMutex<Option<Arc<dyn LoopCapabilityPort>>>,
     refresh_lock: AsyncMutex<()>,
 }
@@ -127,6 +136,26 @@ impl RefreshingLocalDevCapabilityPort {
             .snapshot()
             .await
             .map_err(host_api_agent_loop_error)?;
+        // Discovers this run's hosted-MCP tools and mints ambient grants for
+        // the Ask-permission ones (`DiscoveredCapabilityGrantSource`) BEFORE
+        // building the visible-capability request, so the SAME context that
+        // request carries already has the grant `HostRuntime::visible_capabilities`
+        // needs to authorize a discovered descriptor past `MissingGrant`.
+        // `loop_driver_execution_extension_id`/`local_dev_resource_scope_for_run`
+        // mirror exactly what `local_dev_visible_capability_request` computes
+        // internally, so the grantee/scope this mints against always matches.
+        let discovered_grants = match self.shared_extension_registry.as_ref() {
+            Some(shared_registry) => {
+                let extension_id = loop_driver_execution_extension_id(&self.run_context)
+                    .map_err(host_api_agent_loop_error)?;
+                let scope =
+                    local_dev_resource_scope_for_run(&self.run_context, &self.fallback_user_id);
+                self.discovered_capability_grants
+                    .grants_for_scope(&shared_registry.snapshot(), &scope, &extension_id)
+                    .await
+            }
+            None => Vec::new(),
+        };
         let visible_request = local_dev_visible_capability_request(
             &self.run_context,
             &self.fallback_user_id,
@@ -137,6 +166,7 @@ impl RefreshingLocalDevCapabilityPort {
                 system_extensions_lifecycle_mounts: &self.system_extensions_lifecycle_mounts,
                 policy: &self.policy,
                 extension_surface: &extension_surface,
+                discovered_grants: &discovered_grants,
             },
         )?;
         let mut factory = HostRuntimeLoopCapabilityPortFactory::new(

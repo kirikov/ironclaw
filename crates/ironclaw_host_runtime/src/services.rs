@@ -80,9 +80,9 @@ use crate::obligations::{
 use crate::{
     BuiltinObligationHandler, CapabilitySurfaceVersion, DefaultHostRuntime,
     FirstPartyCapabilityRegistry, FirstPartyCapabilityRequest, HostRuntimeError,
-    HostRuntimeHttpEgressPort, InvocationServicesResolutionRequest, InvocationServicesResolver,
-    LocalHostProcessPort, LocalInvocationServicesResolver, PlannerError,
-    ProcessObligationLifecycleStore, RuntimeBackendHealth, RuntimeProcessPort,
+    HostRuntimeHttpEgressPort, HostedMcpSurfaceOverlay, InvocationServicesResolutionRequest,
+    InvocationServicesResolver, LocalHostProcessPort, LocalInvocationServicesResolver,
+    PlannerError, ProcessObligationLifecycleStore, RuntimeBackendHealth, RuntimeProcessPort,
     RuntimeSecretMaterialStager, RuntimeSecretStageError, TenantSandboxProcessPort,
     ToolCallHttpEgress, TurnRunExecutor, TurnRunScheduler, TurnRunSchedulerConfig, plan_capability,
 };
@@ -150,6 +150,7 @@ where
     network_policy_store: Arc<NetworkObligationPolicyStore>,
     secret_injection_store: Arc<RuntimeSecretInjectionStore>,
     process_lifecycle_store: Arc<ProcessObligationLifecycleStore>,
+    hosted_mcp_overlay: Option<Arc<dyn HostedMcpSurfaceOverlay>>,
     runtime_http_egress: SharedRuntimeHttpEgress,
     tool_call_http_egress: SharedToolCallHttpEgress,
     process_port: Arc<dyn RuntimeProcessPort>,
@@ -321,6 +322,7 @@ where
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
+            hosted_mcp_overlay: None,
             runtime_http_egress: Arc::new(Mutex::new(None)),
             tool_call_http_egress: Arc::new(Mutex::new(None)),
             process_port: Arc::new(LocalHostProcessPort::new()),
@@ -575,6 +577,9 @@ where
         .with_process_cancellation_registry(self.process_services.cancellation_registry())
         .with_runtime_health(runtime_health);
 
+        if let Some(overlay) = &self.hosted_mcp_overlay {
+            runtime = runtime.with_hosted_mcp_overlay(Arc::clone(overlay));
+        }
         if let Some(run_state) = &self.run_state {
             runtime = runtime.with_run_state(Arc::clone(run_state));
         }

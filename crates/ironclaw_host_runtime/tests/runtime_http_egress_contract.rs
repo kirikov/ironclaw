@@ -2269,6 +2269,7 @@ async fn mcp_http_client_reuses_real_host_staged_network_policy_for_json_rpc_ses
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id: capability_id.clone(),
             scope: scope.clone(),
@@ -2296,6 +2297,88 @@ async fn mcp_http_client_reuses_real_host_staged_network_policy_for_json_rpc_ses
         requests
             .iter()
             .all(|request| request.policy == staged_policy)
+    );
+    drop(requests);
+}
+
+#[tokio::test]
+async fn host_initiated_mcp_egress_stages_network_policy_without_prior_dispatch() {
+    // Regression for the per-user hosted-MCP broker: discovery runs OUTSIDE
+    // capability dispatch, so nothing pre-stages an `ApplyNetworkPolicy`
+    // obligation. Before the fix the shared host egress read an EMPTY staged
+    // policy (`network_policy_for_request` -> `None`) and failed the request
+    // as `network_error` (internally `network_policy_missing`) before it ever
+    // reached transport — matching the live evidence that the discovery
+    // request never arrived at the marketplace host while a dispatched
+    // capability call to the same host in the same turn did. The request-
+    // carried plan policy is deliberately ignored by production egress, so
+    // fixing the planner alone is not enough; the host-initiated egress must
+    // stage the manifest-host policy itself.
+    //
+    // Note: NO `stage_policy(...)` here — the whole point is that the
+    // host-initiated egress stages it. Contrast
+    // `mcp_http_client_reuses_real_host_staged_network_policy_for_json_rpc_session`,
+    // which must stage manually because it drives the raw egress directly.
+    let network = JsonRpcMcpNetwork::new();
+    let network_recorder = network.requests.clone();
+    let services = test_obligation_services();
+    let scope = sample_scope();
+    let capability_id = CapabilityId::new("mcp.search").unwrap();
+    // allowed_targets = [api.example.test]; the manifest host the discovery
+    // request must be allowed to reach.
+    let discovery_policy = sample_policy();
+
+    let egress = services
+        .host_runtime_http_egress_port(network)
+        .into_host_initiated_egress(ExtensionId::new("mcp").unwrap(), TrustClass::Sandbox);
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(egress),
+        StaticMcpHostHttpEgressPlanner::new(McpHostHttpEgressPlan {
+            network_policy: discovery_policy.clone(),
+            credential_injections: vec![],
+            response_body_limit: Some(4096),
+            timeout_ms: Some(1000),
+        }),
+    );
+
+    let output = client
+        .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
+            provider: ExtensionId::new("mcp").unwrap(),
+            capability_id: capability_id.clone(),
+            scope: scope.clone(),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://api.example.test/v1/run".to_string()),
+            input: json!({"query": "ironclaw"}),
+            max_output_bytes: 4096,
+        })
+        .await
+        .expect(
+            "host-initiated egress must stage the network policy so discovery reaches transport",
+        );
+
+    assert_eq!(
+        output.output,
+        json!({"content":[{"type":"text","text":"ok"}],"isError":false})
+    );
+    let requests = network_recorder.lock().unwrap();
+    assert!(
+        !requests.is_empty(),
+        "the discovery request must reach the manifest host, not fail with network_error"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.policy == discovery_policy),
+        "each request must carry the staged discovery policy (allowed_targets = manifest host)"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.starts_with("https://api.example.test/")),
+        "requests must be sent to the manifest host"
     );
     drop(requests);
 }
@@ -2340,6 +2423,7 @@ async fn mcp_http_client_reuses_staged_credential_for_json_rpc_session() {
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id: capability_id.clone(),
             scope: scope.clone(),
@@ -2370,6 +2454,110 @@ async fn mcp_http_client_reuses_staged_credential_for_json_rpc_session() {
             })
         }),
         "every MCP session request must receive the staged credential"
+    );
+    drop(requests);
+}
+
+#[tokio::test]
+async fn host_initiated_mcp_egress_stages_credential_from_owner_scope_without_prior_dispatch() {
+    // Regression for the second discovery obligation layer: with the network
+    // policy staged, discovery failed one layer deeper with
+    // `credential_unavailable` — the planner injects the agent secret via
+    // `StagedObligation`, but nothing leases/stages it outside dispatch. The
+    // host-initiated egress must lease + stage the secret itself, mirroring
+    // dispatch's `InjectSecretOnce`.
+    //
+    // This also pins the managed-agent case: the secret is stored ONLY at the
+    // owner scope (agent_id/project_id cleared), while discovery runs at the
+    // agent sub-scope. It must still resolve via the owner-scope fallback
+    // (`resolve_present_secret_scope`) — the same path that makes the `submit`
+    // capability call authenticate. No `stage_secret(...)`/`stage_policy(...)`
+    // here: discovery has no dispatch to stage either obligation.
+    let network = JsonRpcMcpNetwork::new();
+    let network_recorder = network.requests.clone();
+    let services = test_obligation_services();
+    let owner_scope = sample_scope();
+    let agent_scope = ResourceScope {
+        agent_id: Some(AgentId::new("hire-1").unwrap()),
+        project_id: Some(ProjectId::new("proj-1").unwrap()),
+        ..owner_scope.clone()
+    };
+    let capability_id = CapabilityId::new("agent-market.submit").unwrap();
+    let handle = SecretHandle::new("agent-market-token").unwrap();
+
+    // Secret exists ONLY at the owner scope (how the managed-agent user's
+    // `wk_` worker credential is provisioned), and is NOT pre-staged.
+    services
+        .secret_store()
+        .put(
+            owner_scope.clone(),
+            handle.clone(),
+            SecretMaterial::from("wk-worker-token"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let discovery_policy = sample_policy();
+    let egress = services
+        .host_runtime_http_egress_port(network)
+        .into_host_initiated_egress(
+            ExtensionId::new("agent-market").unwrap(),
+            TrustClass::Sandbox,
+        );
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(egress),
+        StaticMcpHostHttpEgressPlanner::new(McpHostHttpEgressPlan {
+            network_policy: discovery_policy.clone(),
+            credential_injections: vec![RuntimeCredentialInjection {
+                handle: handle.clone(),
+                source: RuntimeCredentialSource::StagedObligation {
+                    capability_id: capability_id.clone(),
+                },
+                target: RuntimeCredentialTarget::Header {
+                    name: "authorization".to_string(),
+                    prefix: Some("Bearer ".to_string()),
+                },
+                required: true,
+            }],
+            response_body_limit: Some(4096),
+            timeout_ms: Some(1000),
+        }),
+    );
+
+    let output = client
+        .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
+            provider: ExtensionId::new("agent-market").unwrap(),
+            capability_id: capability_id.clone(),
+            scope: agent_scope.clone(),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://api.example.test/v1/run".to_string()),
+            input: json!({"query": "ironclaw"}),
+            max_output_bytes: 4096,
+        })
+        .await
+        .expect("host-initiated egress must stage the owner-scoped credential so discovery authenticates");
+
+    assert_eq!(
+        output.output,
+        json!({"content":[{"type":"text","text":"ok"}],"isError":false})
+    );
+    let requests = network_recorder.lock().unwrap();
+    assert!(
+        !requests.is_empty(),
+        "authenticated discovery request must reach the manifest host"
+    );
+    assert!(
+        requests.iter().all(|request| {
+            request
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "Bearer wk-worker-token")
+        }),
+        "the leased owner-scoped secret must be injected on every discovery request"
     );
     drop(requests);
 }
@@ -2523,6 +2711,7 @@ async fn mcp_http_client_reuses_product_auth_staged_credential_for_json_rpc_sess
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id: capability_id.clone(),
             scope: runtime_scope,
@@ -2597,6 +2786,7 @@ async fn mcp_http_client_cannot_use_direct_secret_store_lease_with_production_eg
 
     let error = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id,
             scope,

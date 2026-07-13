@@ -5,7 +5,8 @@ use ironclaw_extensions::{
 };
 use ironclaw_host_api::{
     CapabilityId, ExtensionId, NetworkPolicy, NetworkScheme, NetworkTargetPattern,
-    RuntimeCredentialInjection, RuntimeCredentialSource, RuntimeHttpEgress,
+    RuntimeCredentialInjection, RuntimeCredentialRequirement, RuntimeCredentialSource,
+    RuntimeHttpEgress,
 };
 use ironclaw_mcp::{
     McpHostHttpClient, McpHostHttpEgressPlan, McpHostHttpEgressPlanRequest,
@@ -39,32 +40,69 @@ impl RegistryMcpEgressPlanner {
         Self { registry }
     }
 
+    /// Build the staged credential injections for a hosted-MCP `tools/call`.
+    ///
+    /// The global extension registry is authoritative: when it holds a
+    /// provider-matching descriptor for `capability_id`, its
+    /// `runtime_credentials` alone decide the injections (unchanged behavior for
+    /// registry-published static-floor tools).
+    ///
+    /// A per-user live-discovered hosted-MCP capability is deliberately absent
+    /// from that registry, so the lookup misses and would otherwise yield no
+    /// `Authorization` header (marketplace 401). On a registry miss (or a
+    /// provider mismatch) this falls back to `request_credentials` — the
+    /// host-resolved requirements the dispatcher already threaded onto the
+    /// request — applying the same audience filter and injection shape.
     fn credential_injections(
         &self,
         provider: &ExtensionId,
         capability_id: &CapabilityId,
         endpoint: &HostedMcpEndpoint,
+        request_credentials: &[RuntimeCredentialRequirement],
     ) -> Vec<RuntimeCredentialInjection> {
-        self.registry
+        // `.filter(provider match)` intentionally routes a same-id-different-
+        // provider registry hit into the request-credential fallback below,
+        // same as a genuine miss. This is safe: the actual secret is still
+        // gated by the staged-obligation store keyed on scope + capability_id
+        // + handle, and `injections_from_requirements` re-applies
+        // `endpoint.allows_target` to the fallback credentials, so a mismatch
+        // here can only widen which *audience* gets a staged injection
+        // attempt, never bypass the staged-obligation credential gate itself.
+        if let Some(injections) = self
+            .registry
             .snapshot()
             .get_capability(capability_id)
             .filter(|descriptor| &descriptor.provider == provider)
             .map(|descriptor| {
-                descriptor
-                    .runtime_credentials
-                    .iter()
-                    .filter(|credential| endpoint.allows_target(&credential.audience))
-                    .map(|credential| RuntimeCredentialInjection {
-                        handle: credential.handle.clone(),
-                        source: RuntimeCredentialSource::StagedObligation {
-                            capability_id: capability_id.clone(),
-                        },
-                        target: credential.target.clone(),
-                        required: credential.required,
-                    })
-                    .collect()
+                Self::injections_from_requirements(
+                    capability_id,
+                    endpoint,
+                    &descriptor.runtime_credentials,
+                )
             })
-            .unwrap_or_default()
+        {
+            return injections;
+        }
+        Self::injections_from_requirements(capability_id, endpoint, request_credentials)
+    }
+
+    fn injections_from_requirements(
+        capability_id: &CapabilityId,
+        endpoint: &HostedMcpEndpoint,
+        credentials: &[RuntimeCredentialRequirement],
+    ) -> Vec<RuntimeCredentialInjection> {
+        credentials
+            .iter()
+            .filter(|credential| endpoint.allows_target(&credential.audience))
+            .map(|credential| RuntimeCredentialInjection {
+                handle: credential.handle.clone(),
+                source: RuntimeCredentialSource::StagedObligation {
+                    capability_id: capability_id.clone(),
+                },
+                target: credential.target.clone(),
+                required: credential.required,
+            })
+            .collect()
     }
 
     fn provider_endpoint(&self, provider: &ExtensionId) -> Option<HostedMcpEndpoint> {
@@ -83,8 +121,12 @@ impl McpHostHttpEgressPlanner for RegistryMcpEgressPlanner {
         if !hosted_mcp_url_allowed(request.url, &endpoint) {
             return McpHostHttpEgressPlan::default();
         }
-        let credential_injections =
-            self.credential_injections(request.provider, request.capability_id, &endpoint);
+        let credential_injections = self.credential_injections(
+            request.provider,
+            request.capability_id,
+            &endpoint,
+            request.runtime_credentials,
+        );
         McpHostHttpEgressPlan {
             // Credential-free hosted MCP providers are valid: the manifest may
             // expose a public/unauthenticated server, and host network policy
@@ -212,7 +254,9 @@ mod tests {
         let capability_id = CapabilityId::new("notion.notion-search").unwrap();
         let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).unwrap();
 
-        let injections = planner.credential_injections(&provider, &capability_id, &endpoint);
+        // Registry hit is authoritative: request-provided credentials are
+        // ignored (pass empty) because the registry descriptor supplies them.
+        let injections = planner.credential_injections(&provider, &capability_id, &endpoint, &[]);
 
         assert_eq!(injections.len(), 1);
         assert_eq!(
@@ -227,6 +271,187 @@ mod tests {
             injections[0].target,
             RuntimeCredentialTarget::Header { .. }
         ));
+    }
+
+    // ── discovered-capability credential fallback (the "5th gate") ─────────
+
+    /// A per-user live-discovered hosted-MCP capability is deliberately absent
+    /// from the global registry. Without the request-credential fallback the
+    /// planner emits zero injections and the marketplace `tools/call` egresses
+    /// without its `Authorization` header (401 → BlockedAuth). The fallback
+    /// must reconstruct the same staged injection discovery already used.
+    #[test]
+    fn mcp_planner_falls_back_to_request_credentials_when_capability_absent_from_registry() {
+        let registry = Arc::new(SharedExtensionRegistry::new(registry_with_notion()));
+        let planner = RegistryMcpEgressPlanner::new(registry);
+        let provider = ExtensionId::new("notion").unwrap();
+        let discovered = CapabilityId::new("notion.echo-broker-test__echo_ping").unwrap();
+        let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).unwrap();
+        let request_credentials = vec![
+            request_credential("mcp_notion_access_token", NOTION_MCP_HOST),
+            // Different audience — must be filtered out by `allows_target`.
+            request_credential("wrong_audience_token", "other.example.com"),
+        ];
+
+        let injections =
+            planner.credential_injections(&provider, &discovered, &endpoint, &request_credentials);
+
+        assert_eq!(injections.len(), 1);
+        assert_eq!(
+            injections[0].handle,
+            SecretHandle::new("mcp_notion_access_token").unwrap()
+        );
+        assert_eq!(
+            injections[0].source,
+            RuntimeCredentialSource::StagedObligation {
+                capability_id: discovered
+            }
+        );
+        assert!(matches!(
+            injections[0].target,
+            RuntimeCredentialTarget::Header { .. }
+        ));
+        assert!(injections[0].required);
+    }
+
+    /// Registry hit stays authoritative: a request-provided credential for a
+    /// registry-published (static-floor) capability is ignored so the fallback
+    /// cannot override or shadow the registry descriptor.
+    #[test]
+    fn mcp_planner_registry_hit_overrides_request_credentials() {
+        let registry = Arc::new(SharedExtensionRegistry::new(registry_with_notion()));
+        let planner = RegistryMcpEgressPlanner::new(registry);
+        let provider = ExtensionId::new("notion").unwrap();
+        let registry_cap = CapabilityId::new("notion.notion-search").unwrap();
+        let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).unwrap();
+        let request_credentials = vec![request_credential("request_only_token", NOTION_MCP_HOST)];
+
+        let injections = planner.credential_injections(
+            &provider,
+            &registry_cap,
+            &endpoint,
+            &request_credentials,
+        );
+
+        assert_eq!(injections.len(), 1);
+        assert_eq!(
+            injections[0].handle,
+            SecretHandle::new("mcp_notion_access_token").unwrap(),
+            "registry descriptor must remain authoritative on a hit"
+        );
+    }
+
+    /// Absent from BOTH registry and request → empty (unchanged fail-safe).
+    #[test]
+    fn mcp_planner_absent_from_registry_and_request_yields_no_injections() {
+        let registry = Arc::new(SharedExtensionRegistry::new(registry_with_notion()));
+        let planner = RegistryMcpEgressPlanner::new(registry);
+        let provider = ExtensionId::new("notion").unwrap();
+        let discovered = CapabilityId::new("notion.echo-broker-test__echo_ping").unwrap();
+        let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).unwrap();
+
+        let injections = planner.credential_injections(&provider, &discovered, &endpoint, &[]);
+
+        assert!(injections.is_empty());
+    }
+
+    /// Distinct from the absence case above: `get_capability` returns `Some`
+    /// for `capability_id`, but the descriptor's provider does NOT match the
+    /// requesting provider. This pins the `.filter(provider match)` arm of the
+    /// fallback specifically (see the comment on `credential_injections`) —
+    /// the mismatch must fall through to `request_credentials`, not to empty.
+    #[test]
+    fn mcp_planner_falls_back_to_request_credentials_on_provider_mismatch() {
+        let registry = Arc::new(SharedExtensionRegistry::new(registry_with_notion()));
+        let planner = RegistryMcpEgressPlanner::new(registry);
+        // The registry descriptor for this capability id is owned by "notion";
+        // request as a different provider so `get_capability` hits but the
+        // provider filter rejects it.
+        let wrong_provider = ExtensionId::new("not-notion").unwrap();
+        let registry_cap = CapabilityId::new("notion.notion-search").unwrap();
+        let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).unwrap();
+        let request_credentials = vec![request_credential("fallback_only_token", NOTION_MCP_HOST)];
+
+        let injections = planner.credential_injections(
+            &wrong_provider,
+            &registry_cap,
+            &endpoint,
+            &request_credentials,
+        );
+
+        assert_eq!(injections.len(), 1);
+        assert_eq!(
+            injections[0].handle,
+            SecretHandle::new("fallback_only_token").unwrap(),
+            "provider mismatch on a registry hit must fall through to request credentials"
+        );
+    }
+
+    /// Multiple request-provided credentials: every audience-matching one is
+    /// injected, and the non-matching-audience one is dropped — the fallback
+    /// applies the same per-credential filter as the registry path, not an
+    /// all-or-nothing gate.
+    #[test]
+    fn mcp_planner_fallback_injects_all_audience_matching_request_credentials() {
+        let registry = Arc::new(SharedExtensionRegistry::new(registry_with_notion()));
+        let planner = RegistryMcpEgressPlanner::new(registry);
+        let provider = ExtensionId::new("notion").unwrap();
+        let discovered = CapabilityId::new("notion.echo-broker-test__echo_ping").unwrap();
+        let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).unwrap();
+        let request_credentials = vec![
+            request_credential("mcp_notion_access_token", NOTION_MCP_HOST),
+            request_credential("mcp_notion_secondary_token", NOTION_MCP_HOST),
+            request_credential("wrong_audience_token", "other.example.com"),
+        ];
+
+        let injections =
+            planner.credential_injections(&provider, &discovered, &endpoint, &request_credentials);
+
+        let handles: Vec<_> = injections
+            .iter()
+            .map(|injection| injection.handle.clone())
+            .collect();
+        assert_eq!(injections.len(), 2, "both matching-audience creds inject");
+        assert!(handles.contains(&SecretHandle::new("mcp_notion_access_token").unwrap()));
+        assert!(handles.contains(&SecretHandle::new("mcp_notion_secondary_token").unwrap()));
+        assert!(
+            !handles.contains(&SecretHandle::new("wrong_audience_token").unwrap()),
+            "non-matching-audience credential must be dropped"
+        );
+    }
+
+    /// Test-through-the-caller: the public `plan` seam a discovered `tools/call`
+    /// actually hits must carry the staged injection built from the request's
+    /// runtime credentials, with the provider network policy still locked.
+    #[test]
+    fn planner_injects_request_credentials_for_discovered_capability_via_plan() {
+        let registry = Arc::new(SharedExtensionRegistry::new(registry_with_notion()));
+        let planner = RegistryMcpEgressPlanner::new(registry);
+        let provider = ExtensionId::new("notion").unwrap();
+        let discovered = CapabilityId::new("notion.echo-broker-test__echo_ping").unwrap();
+        let scope = sample_scope();
+        let request_credentials = vec![request_credential(
+            "mcp_notion_access_token",
+            NOTION_MCP_HOST,
+        )];
+
+        let plan = planner.plan(sample_plan_request(
+            &provider,
+            &discovered,
+            NOTION_MCP_URL,
+            &scope,
+            &request_credentials,
+        ));
+
+        assert_eq!(plan.credential_injections.len(), 1);
+        assert_eq!(
+            plan.credential_injections[0].handle,
+            SecretHandle::new("mcp_notion_access_token").unwrap()
+        );
+        assert_eq!(
+            plan.network_policy.allowed_targets[0].host_pattern,
+            NOTION_MCP_HOST
+        );
     }
 
     // ── provider scoping ───────────────────────────────────────────────────
@@ -244,6 +469,7 @@ mod tests {
             &cap,
             "https://mcp.notion.com/mcp",
             &scope,
+            &[],
         ));
 
         assert!(plan.credential_injections.is_empty());
@@ -268,6 +494,7 @@ mod tests {
             &cap,
             "https://fixture.example.com/mcp",
             &scope,
+            &[],
         ));
 
         assert_eq!(plan.credential_injections.len(), 1);
@@ -290,6 +517,7 @@ mod tests {
             &cap,
             "https://evil.example.com/mcp",
             &scope,
+            &[],
         ));
 
         assert!(plan.credential_injections.is_empty());
@@ -309,6 +537,7 @@ mod tests {
             &cap,
             "http://mcp.notion.com/mcp",
             &scope,
+            &[],
         ));
 
         assert!(plan.credential_injections.is_empty());
@@ -327,6 +556,7 @@ mod tests {
             &cap,
             "https://mcp.notion.com/other",
             &scope,
+            &[],
         ));
 
         assert!(plan.credential_injections.is_empty());
@@ -347,6 +577,7 @@ mod tests {
             &cap,
             "https://mcp.notion.com/mcp",
             &scope,
+            &[],
         ));
 
         assert_eq!(plan.credential_injections.len(), 1);
@@ -445,6 +676,7 @@ mod tests {
         capability_id: &'a CapabilityId,
         url: &'a str,
         scope: &'a ResourceScope,
+        runtime_credentials: &'a [RuntimeCredentialRequirement],
     ) -> McpHostHttpEgressPlanRequest<'a> {
         McpHostHttpEgressPlanRequest {
             provider,
@@ -455,6 +687,31 @@ mod tests {
             url,
             headers: &[],
             body: &[],
+            runtime_credentials,
+        }
+    }
+
+    /// A host-resolved credential requirement as the dispatcher threads it onto
+    /// the request for a discovered capability (mirrors the shape
+    /// `registry_with_provider` publishes into the registry descriptor).
+    fn request_credential(handle: &str, audience_host: &str) -> RuntimeCredentialRequirement {
+        RuntimeCredentialRequirement {
+            handle: SecretHandle::new(handle).unwrap(),
+            source: RuntimeCredentialRequirementSource::ProductAuthAccount {
+                provider: RuntimeCredentialAccountProviderId::new("notion").unwrap(),
+                setup: Default::default(),
+            },
+            provider_scopes: Vec::new(),
+            audience: NetworkTargetPattern {
+                scheme: Some(NetworkScheme::Https),
+                host_pattern: audience_host.to_string(),
+                port: None,
+            },
+            target: RuntimeCredentialTarget::Header {
+                name: "authorization".to_string(),
+                prefix: Some("Bearer ".to_string()),
+            },
+            required: true,
         }
     }
 

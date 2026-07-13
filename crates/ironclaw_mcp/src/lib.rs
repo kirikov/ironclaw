@@ -20,12 +20,12 @@ use ironclaw_extensions::{
     ExtensionPackage, ExtensionRuntime, HostedMcpDiscoveredTool, HostedMcpDiscoveredToolAnnotations,
 };
 use ironclaw_host_api::{
-    CapabilityHostHttpRequest, CapabilityHostResult, CapabilityId, ExtensionId, NetworkMethod,
-    NetworkPolicy, ResourceEstimate, ResourceReservation, ResourceReservationId, ResourceScope,
-    ResourceUsage, RuntimeCredentialAuthRequirement, RuntimeCredentialInjection,
-    RuntimeCredentialRequirement, RuntimeCredentialRequirementSource, RuntimeCredentialSource,
-    RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressResponse, RuntimeKind,
-    SecretHandle,
+    CapabilityDescriptor, CapabilityHostHttpRequest, CapabilityHostResult, CapabilityId,
+    ExtensionId, NetworkMethod, NetworkPolicy, ResourceEstimate, ResourceReservation,
+    ResourceReservationId, ResourceScope, ResourceUsage, RuntimeCredentialAuthRequirement,
+    RuntimeCredentialInjection, RuntimeCredentialRequirement, RuntimeCredentialRequirementSource,
+    RuntimeCredentialSource, RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressResponse,
+    RuntimeKind, SecretHandle,
 };
 use ironclaw_resources::{ResourceError, ResourceGovernor, ResourceReceipt};
 use serde_json::Value;
@@ -67,6 +67,16 @@ pub struct McpInvocation {
 pub struct McpExecutionRequest<'a> {
     pub package: &'a ExtensionPackage,
     pub capability_id: &'a CapabilityId,
+    /// The dispatcher-resolved descriptor for `capability_id`, when available.
+    ///
+    /// Used only as a fallback when `capability_id` is NOT one of the static
+    /// manifest package's declared capabilities: a per-user live-discovered
+    /// hosted-MCP tool is granted, approved, and routed here on the dispatch
+    /// request's descriptor, but is absent from `package.capabilities`, so a
+    /// package-only lookup would reject it as `CapabilityNotDeclared` even
+    /// though the host already authorized it. `None` (or a descriptor whose id
+    /// does not match) preserves the strict package-declared behavior.
+    pub descriptor: Option<&'a CapabilityDescriptor>,
     pub scope: ResourceScope,
     pub estimate: ResourceEstimate,
     pub resource_reservation: Option<ResourceReservation>,
@@ -85,6 +95,18 @@ pub struct McpClientRequest {
     pub url: Option<String>,
     pub input: Value,
     pub max_output_bytes: u64,
+    /// The host-resolved credential requirements for this capability, taken
+    /// verbatim from the dispatcher-resolved `CapabilityDescriptor`.
+    ///
+    /// `ironclaw_mcp` never resolves, stages, or injects credentials — it only
+    /// forwards these host-provided requirements to the egress planner
+    /// ([`McpHostHttpEgressPlanRequest::runtime_credentials`]). The planner is
+    /// the sole owner of credential injection. This lane exists so a per-user
+    /// live-discovered hosted-MCP capability (absent from the host's global
+    /// extension registry) still carries the same requirements a
+    /// registry-published capability would, rather than egressing without its
+    /// `Authorization` header.
+    pub runtime_credentials: Vec<RuntimeCredentialRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +310,14 @@ pub struct McpHostHttpEgressPlanRequest<'a> {
     pub url: &'a str,
     pub headers: &'a [(String, String)],
     pub body: &'a [u8],
+    /// Host-resolved credential requirements for this capability, forwarded
+    /// unchanged from [`McpClientRequest::runtime_credentials`].
+    ///
+    /// The planner may use these to build credential injections when the
+    /// capability is absent from the host's global extension registry (a
+    /// per-user live-discovered hosted-MCP tool). `ironclaw_mcp` neither reads
+    /// nor mutates these — it only threads the host's handoff data through.
+    pub runtime_credentials: &'a [RuntimeCredentialRequirement],
 }
 
 /// Host-owned egress planner for MCP HTTP/SSE requests.
@@ -477,6 +507,7 @@ where
             url,
             headers: &policy_headers,
             body: &body,
+            runtime_credentials: &request.runtime_credentials,
         });
         Ok(PlannedMcpJsonRpc {
             id,
@@ -1533,6 +1564,19 @@ where
             .iter()
             .find(|descriptor| &descriptor.id == request.capability_id)
             .cloned()
+            // Fall back to the dispatcher-resolved descriptor for a per-user
+            // live-discovered hosted-MCP capability: it is not in the static
+            // manifest package, but was granted, approved, and routed here on
+            // the dispatch request. Without this the execute lane rejects it as
+            // `CapabilityNotDeclared` and the tools/call to the marketplace
+            // broker never fires. Absent/mismatched descriptor keeps the strict
+            // package-declared behavior (fail-safe `CapabilityNotDeclared`).
+            .or_else(|| {
+                request
+                    .descriptor
+                    .filter(|descriptor| &descriptor.id == request.capability_id)
+                    .cloned()
+            })
             .ok_or_else(|| McpError::CapabilityNotDeclared {
                 capability: request.capability_id.clone(),
             })?;
@@ -1594,6 +1638,11 @@ where
                 url: url.clone(),
                 input: request.invocation.input.clone(),
                 max_output_bytes: self.config.max_output_bytes,
+                // Forward the host-resolved requirements (including the
+                // dispatcher-supplied descriptor fallback for a live-discovered
+                // capability) to the egress planner. Injection stays the
+                // planner's job; this crate only carries the handoff data.
+                runtime_credentials: descriptor.runtime_credentials.clone(),
             },
             auth_context,
         })

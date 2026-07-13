@@ -60,6 +60,7 @@ async fn runtime_dispatcher_routes_already_authorized_request_through_public_tra
 
     let result = dispatch_port
         .dispatch_json(CapabilityDispatchRequest {
+            descriptor: None,
             capability_id: CapabilityId::new("echo.say").unwrap(),
             scope: scope.clone(),
             estimate: ResourceEstimate {
@@ -126,6 +127,7 @@ async fn runtime_dispatcher_forwards_configured_runtime_policy_to_adapter() {
 
     dispatcher
         .dispatch_json(CapabilityDispatchRequest {
+            descriptor: None,
             capability_id: CapabilityId::new("echo.say").unwrap(),
             scope: sample_scope(),
             estimate: ResourceEstimate::default(),
@@ -156,6 +158,7 @@ async fn runtime_dispatcher_fails_closed_for_missing_backend_before_reservation_
 
     let err = dispatch_port
         .dispatch_json(CapabilityDispatchRequest {
+            descriptor: None,
             capability_id: CapabilityId::new("script.echo").unwrap(),
             scope,
             estimate: ResourceEstimate {

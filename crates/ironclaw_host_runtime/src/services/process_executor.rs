@@ -215,6 +215,11 @@ impl ProcessExecutor for RuntimeDispatchProcessExecutor {
         let result = self
             .dispatcher
             .dispatch_json(CapabilityDispatchRequest {
+                // The spawn/process lane never carries a resolved descriptor
+                // (M1): discovered hosted-MCP capabilities are `runtime =
+                // Mcp`, dispatch-only, and never reach this executor — see
+                // `discovered_hosted_mcp_capability_never_reaches_process_lane`.
+                descriptor: None,
                 capability_id: request.capability_id,
                 scope: request.scope,
                 estimate: request.estimate,

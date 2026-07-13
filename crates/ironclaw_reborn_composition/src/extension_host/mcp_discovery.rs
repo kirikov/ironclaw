@@ -71,10 +71,26 @@ pub(crate) async fn discover_hosted_mcp_package(
             url,
             input: serde_json::Value::Null,
             max_output_bytes: MCP_RESPONSE_BODY_LIMIT,
+            // Discovery runs against a temporary registry with the provider
+            // package upserted, so the planner's registry-hit path supplies
+            // credentials; no request-provided fallback requirements are needed.
+            runtime_credentials: Vec::new(),
         })
         .await
         .map_err(|error| HostedMcpDiscoveryError::Transient(error.stable_reason().to_string()))?;
     if output.tools.is_empty() {
+        // follow-up: a successful-but-empty `tools/list` (a real, valid
+        // "this hire currently has zero grants" state) is mapped to
+        // `Transient` here, same as a network/backend failure — the caller
+        // (`CompositionHostedMcpOverlay`) only caches `Ok` results, so this
+        // never gets cached and a zero-tool hire re-pays the full discovery
+        // round trip (up to the surface budget) on every turn, forever. A
+        // successful-but-empty discovery is distinguishable from an outage
+        // (the round trip succeeded) and could be cached as a valid
+        // negative without violating error-handling.md's "don't cache
+        // failures" rule. Deferred — this call site would need a third
+        // outcome variant threaded through `HostedMcpDiscoveryError`/
+        // `HostedMcpOverlayError`, not a mechanical fix.
         return Err(HostedMcpDiscoveryError::Transient(format!(
             "hosted MCP provider {} returned no discoverable tools",
             package.id

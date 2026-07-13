@@ -143,6 +143,9 @@ use crate::default_system_prompt::seed_default_system_prompt;
 use crate::extension_host::available_extensions::{
     slack_bot_manifest_digest, slack_manifest_digest,
 };
+use crate::extension_host::hosted_mcp_overlay::{
+    CompositionHostedMcpOverlay, StagingDiscoveryEgressProvider,
+};
 use crate::extension_host::lifecycle::{
     RebornLocalSkillManagementPort, build_local_skill_management_port,
 };
@@ -398,6 +401,41 @@ where
         registry,
         runtime_http_egress,
     ))))
+}
+
+/// Attaches the per-user hosted-MCP capability-surface overlay (see
+/// `ironclaw_host_runtime::hosted_mcp_overlay`). Gated on the same host
+/// runtime HTTP egress as [`attach_hosted_mcp_runtime`] and soft-disables the
+/// same way: builds without egress must still succeed, with hosted-MCP
+/// per-user discovery going dark rather than failing composition. Does not
+/// touch the boot-time global registry publish — this only supplies the
+/// per-request overlay `CapabilityCatalog::visible_capabilities` unions onto
+/// the static floor.
+fn attach_hosted_mcp_overlay<F, G, S, R>(
+    services: HostRuntimeServices<F, G, S, R>,
+) -> Result<HostRuntimeServices<F, G, S, R>, RebornBuildError>
+where
+    F: ironclaw_filesystem::RootFilesystem + 'static,
+    G: ironclaw_resources::ResourceGovernor + 'static,
+    S: ironclaw_processes::ProcessStore + 'static,
+    R: ironclaw_processes::ProcessResultStore + 'static,
+{
+    // Discovery runs outside capability dispatch, so it must stage its own
+    // `ApplyNetworkPolicy` obligation before sending — otherwise the shared
+    // host egress reads an empty staged policy and fails discovery with
+    // `network_error` before the request leaves the host. The port owns that
+    // staging; the overlay wraps it per package.
+    let Some(egress_port) = services.host_runtime_http_egress_port() else {
+        tracing::debug!(
+            "skipping hosted MCP overlay: host runtime HTTP egress absent \
+             (only affects per-user hosted MCP discovery)"
+        );
+        return Ok(services);
+    };
+    let overlay = Arc::new(CompositionHostedMcpOverlay::new(Arc::new(
+        StagingDiscoveryEgressProvider::new(egress_port),
+    )));
+    Ok(services.with_hosted_mcp_overlay(overlay))
 }
 
 fn attach_wasm_runtime<F, G, S, R>(
@@ -911,6 +949,15 @@ pub(crate) struct RebornLocalRuntimeServices {
     /// Canonical registry shared by capability dispatch and hook activation.
     pub(crate) extension_registry: Arc<ExtensionRegistry>,
     pub(crate) shared_extension_registry: Option<Arc<SharedExtensionRegistry>>,
+    /// SAME overlay instance attached to `HostRuntime` (`attach_hosted_mcp_overlay`
+    /// in this file), reused by `DiscoveredCapabilityGrantSource` so its
+    /// discovery call is a cache hit in the common case rather than a second
+    /// live round-trip against the marketplace `/mcp` broker. `None` when
+    /// host runtime HTTP egress is absent (soft-disabled, matching
+    /// `attach_hosted_mcp_overlay`'s own fail-open-to-dark posture) — the
+    /// grant source then mints nothing, so discovered tools stay
+    /// surfaced-but-not-invocable rather than breaking the turn.
+    pub(crate) hosted_mcp_overlay: Option<Arc<dyn ironclaw_host_runtime::HostedMcpSurfaceOverlay>>,
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -1490,6 +1537,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     }
     services = apply_runtime_process_binding(services, runtime_process_binding);
     services = attach_hosted_mcp_runtime(services)?;
+    services = attach_hosted_mcp_overlay(services)?;
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let provider_composition = compose_provider_client(
         oauth_provider_configs,
@@ -1682,6 +1730,11 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         local_runtime.runtime_http_egress = Some(product_auth_runtime_ports.runtime_http_egress());
         local_runtime.extension_registry = Arc::clone(&extension_registry);
         local_runtime.shared_extension_registry = Some(services.shared_extension_registry());
+        // Reuse the SAME overlay instance `attach_hosted_mcp_overlay` (above)
+        // attached to `HostRuntime`, so `DiscoveredCapabilityGrantSource`'s
+        // discovery call shares its TTL cache/single-flight instead of
+        // doubling live marketplace `/mcp` discovery traffic.
+        local_runtime.hosted_mcp_overlay = services.hosted_mcp_overlay();
         let host_runtime_http_egress = services.host_runtime_http_egress_port();
         #[cfg(all(test, feature = "slack-v2-host-beta"))]
         let host_runtime_http_egress =
@@ -2258,6 +2311,10 @@ async fn build_local_dev_store_graph(
         audit_log,
         extension_registry: Arc::new(ExtensionRegistry::new()),
         shared_extension_registry: None,
+        // Attached post-construction below via `Arc::get_mut`, once
+        // `attach_hosted_mcp_overlay` has run — mirrors
+        // `shared_extension_registry`'s own two-step wiring.
+        hosted_mcp_overlay: None,
     });
     let process_services = ProcessServices::filesystem(Arc::clone(&scoped_filesystem));
 
@@ -2401,6 +2458,10 @@ async fn build_local_dev_store_graph(
         audit_log,
         extension_registry: Arc::new(ExtensionRegistry::new()),
         shared_extension_registry: None,
+        // Attached post-construction below via `Arc::get_mut`, once
+        // `attach_hosted_mcp_overlay` has run — mirrors
+        // `shared_extension_registry`'s own two-step wiring.
+        hosted_mcp_overlay: None,
     });
     let process_services = ProcessServices::in_memory();
 
@@ -4586,6 +4647,7 @@ where
     .with_turn_run_wake_notifier_dyn(production_wiring.turn_run_wake_notifier);
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let services = attach_hosted_mcp_runtime(services)?;
+    let services = attach_hosted_mcp_overlay(services)?;
     let provider_composition = compose_provider_client(
         oauth_provider_configs,
         oauth_dcr_provider_configs,
@@ -5217,6 +5279,7 @@ mod tests {
             audit_log: Arc::clone(&base_runtime.audit_log),
             extension_registry: Arc::clone(&base_runtime.extension_registry),
             shared_extension_registry: base_runtime.shared_extension_registry.clone(),
+            hosted_mcp_overlay: base_runtime.hosted_mcp_overlay.clone(),
         })
     }
 

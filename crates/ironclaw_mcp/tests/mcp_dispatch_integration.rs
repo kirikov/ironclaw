@@ -219,6 +219,7 @@ fn mcp_request_from_manifest(
     McpExecutionRequest {
         package,
         capability_id,
+        descriptor: None,
         scope: sample_scope(),
         estimate: ResourceEstimate {
             concurrency_slots: Some(1),

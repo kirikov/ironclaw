@@ -250,6 +250,11 @@ where
                 McpExecutionRequest {
                     package: request.package,
                     capability_id: request.capability_id,
+                    // The dispatcher already resolved and routed on this
+                    // descriptor; the MCP execute lane uses it to accept a
+                    // live-discovered hosted-MCP capability that is not in the
+                    // static manifest package.
+                    descriptor: Some(request.descriptor),
                     scope: request.scope,
                     estimate: request.estimate,
                     resource_reservation: request.resource_reservation,

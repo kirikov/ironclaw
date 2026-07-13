@@ -10,14 +10,14 @@ use super::{
     ApprovalRequestStore, AuditSink, CapabilityLeaseStore, CoalescingEventSink, DurableAuditLog,
     DurableAuditSink, DurableEventLog, DurableEventSink, EffectiveRuntimePolicy, EventBatchConfig,
     EventSink, FilesystemApprovalRequestStore, FilesystemResourceGovernor, FilesystemRunStateStore,
-    FilesystemTurnStateStore, FirstPartyCapabilityRegistry, HostRuntimeServices, McpExecutor,
-    NetworkHttpEgress, ProcessBackendKind, ProcessExecutor, ProcessObligationLifecycleStore,
-    ProcessResultStore, ProcessStore, ProductionComponentType, ProductionImplementationReadiness,
-    ProductionWiringComponent, ProductionWiringIssueKind, ProductionWiringReport,
-    RebornEventStoreConfig, RebornEventStoreError, RebornEventStores, RebornProfile,
-    ResourceGovernor, RootFilesystem, RunProfileResolver, RunStateApprovalStore, RunStateStore,
-    RuntimeBackendHealth, RuntimeCredentialAccountResolver, RuntimeHttpEgress, RuntimeKind,
-    RuntimeProcessPort, ScopedFilesystem, ScriptExecutor, SecretMode, SecretStore,
+    FilesystemTurnStateStore, FirstPartyCapabilityRegistry, HostRuntimeServices,
+    HostedMcpSurfaceOverlay, McpExecutor, NetworkHttpEgress, ProcessBackendKind, ProcessExecutor,
+    ProcessObligationLifecycleStore, ProcessResultStore, ProcessStore, ProductionComponentType,
+    ProductionImplementationReadiness, ProductionWiringComponent, ProductionWiringIssueKind,
+    ProductionWiringReport, RebornEventStoreConfig, RebornEventStoreError, RebornEventStores,
+    RebornProfile, ResourceGovernor, RootFilesystem, RunProfileResolver, RunStateApprovalStore,
+    RunStateStore, RuntimeBackendHealth, RuntimeCredentialAccountResolver, RuntimeHttpEgress,
+    RuntimeKind, RuntimeProcessPort, ScopedFilesystem, ScriptExecutor, SecretMode, SecretStore,
     SecurityAuditSink, SharedSecretStore, TenantSandboxProcessPort, TrustPolicy,
     TurnRunTransitionPort, TurnRunWakeNotifier, TurnStateStore, WasmError, WasmRuntimeAdapter,
     WasmRuntimeCredentialProvider, WasmStagedRuntimeCredentials, WitToolHost, WitToolRuntimeConfig,
@@ -66,6 +66,7 @@ where
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
+            hosted_mcp_overlay,
             runtime_http_egress,
             tool_call_http_egress,
             process_port,
@@ -110,6 +111,7 @@ where
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
+            hosted_mcp_overlay,
             runtime_http_egress,
             tool_call_http_egress,
             process_port,
@@ -175,6 +177,7 @@ where
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store: _,
+            hosted_mcp_overlay,
             runtime_http_egress,
             tool_call_http_egress,
             process_port,
@@ -229,6 +232,7 @@ where
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
+            hosted_mcp_overlay,
             runtime_http_egress,
             tool_call_http_egress,
             process_port,
@@ -942,6 +946,28 @@ where
         self.component_types.mcp_runtime = Some(ProductionComponentType::of::<T>());
         self.mcp_runtime = Some(runtime);
         self
+    }
+
+    /// Attaches the per-user hosted-MCP capability-surface overlay carried
+    /// through to [`DefaultHostRuntime`] by `build_host_runtime`. Left unset
+    /// in minimal/test graphs — see `attach_hosted_mcp_runtime`'s
+    /// soft-disable in composition for why this is legitimately optional.
+    pub fn with_hosted_mcp_overlay<T>(mut self, overlay: Arc<T>) -> Self
+    where
+        T: HostedMcpSurfaceOverlay + 'static,
+    {
+        self.hosted_mcp_overlay = Some(overlay);
+        self
+    }
+
+    /// Returns the attached hosted-MCP overlay, if any — mirrors
+    /// [`shared_extension_registry`](Self::shared_extension_registry).
+    /// Composition uses this to reuse the SAME overlay instance (its
+    /// TTL-cache/single-flight is keyed per-instance) for the ambient
+    /// discovered-capability grant source, instead of constructing a
+    /// second overlay that would double the live discovery traffic.
+    pub fn hosted_mcp_overlay(&self) -> Option<Arc<dyn HostedMcpSurfaceOverlay>> {
+        self.hosted_mcp_overlay.clone()
     }
 
     pub fn with_first_party_capabilities(
