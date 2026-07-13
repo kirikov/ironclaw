@@ -35,6 +35,7 @@ async fn mcp_runtime_reserves_calls_adapter_and_reconciles_success() {
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope,
                 estimate: ResourceEstimate {
                     concurrency_slots: Some(1),
@@ -82,6 +83,119 @@ async fn mcp_runtime_reserves_calls_adapter_and_reconciles_success() {
 }
 
 #[tokio::test]
+async fn mcp_runtime_accepts_discovered_capability_via_request_descriptor() {
+    // Regression: a per-user live-discovered hosted-MCP tool is granted,
+    // approved, and routed to the MCP execute lane on the dispatch request's
+    // descriptor, but is NOT one of the static manifest package's declared
+    // capabilities (here the package declares only `github-mcp.search`). The
+    // execute lane must accept it via `McpExecutionRequest.descriptor` and
+    // issue the tools/call to the marketplace broker, instead of rejecting it
+    // as `CapabilityNotDeclared` before any request fires. The dispatcher-
+    // routing spy test does not cover this — it stops at RuntimeSelected.
+    let package = package_from_manifest(MCP_MANIFEST);
+    let client = RecordingMcpClient::new(Ok(McpClientOutput::json(json!({"ok": true}))));
+    let runtime = McpRuntime::new(McpRuntimeConfig::for_testing(), client.clone());
+    let governor = InMemoryResourceGovernor::new();
+    let scope = sample_scope();
+    let account = ResourceAccount::tenant(scope.tenant_id.clone());
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                max_process_count: Some(1),
+                max_output_bytes: Some(10_000),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+
+    let discovered_id = CapabilityId::new("github-mcp.echo-broker-test__echo_ping").unwrap();
+    let discovered = CapabilityDescriptor {
+        id: discovered_id.clone(),
+        provider: ExtensionId::new("github-mcp").unwrap(),
+        runtime: RuntimeKind::Mcp,
+        trust_ceiling: TrustClass::Sandbox,
+        description: "live-discovered marketplace tool".to_string(),
+        parameters_schema: json!({"type": "object"}),
+        effects: vec![EffectKind::Network, EffectKind::DispatchCapability],
+        default_permission: PermissionMode::Ask,
+        runtime_credentials: Vec::new(),
+        resource_profile: None,
+    };
+
+    let result = runtime
+        .execute_extension_json(
+            &governor,
+            McpExecutionRequest {
+                package: &package,
+                capability_id: &discovered_id,
+                descriptor: Some(&discovered),
+                scope: scope.clone(),
+                estimate: ResourceEstimate {
+                    concurrency_slots: Some(1),
+                    process_count: Some(1),
+                    output_bytes: Some(10_000),
+                    ..ResourceEstimate::default()
+                },
+                resource_reservation: None,
+                invocation: McpInvocation {
+                    input: json!({"message": "ping"}),
+                },
+            },
+        )
+        .await
+        .expect("a discovered capability routed on the request descriptor must dispatch");
+
+    // Fail-safe guard: a descriptor whose id does NOT match the invoked
+    // capability must not smuggle an undeclared capability through — the strict
+    // `CapabilityNotDeclared` behavior stands. Run both awaits before locking
+    // the recorder so no MutexGuard is held across an await point.
+    let mismatched_id = CapabilityId::new("github-mcp.other-undeclared").unwrap();
+    let mismatched_err = runtime
+        .execute_extension_json(
+            &governor,
+            McpExecutionRequest {
+                package: &package,
+                capability_id: &mismatched_id,
+                descriptor: Some(&discovered),
+                scope,
+                estimate: ResourceEstimate {
+                    concurrency_slots: Some(1),
+                    ..ResourceEstimate::default()
+                },
+                resource_reservation: None,
+                invocation: McpInvocation { input: json!({}) },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(result.result.output, json!({"ok": true}));
+    assert!(matches!(
+        mismatched_err,
+        McpError::CapabilityNotDeclared { .. }
+    ));
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the matching discovered capability issues a tools/call to the broker"
+    );
+    assert_eq!(requests[0].capability_id, discovered_id);
+    assert_eq!(
+        requests[0].provider,
+        ExtensionId::new("github-mcp").unwrap()
+    );
+    // The transport/url still come from the static manifest package (the
+    // marketplace /mcp endpoint), not the descriptor.
+    assert_eq!(
+        requests[0].url.as_deref(),
+        Some("https://mcp.example.test/mcp")
+    );
+}
+
+#[tokio::test]
 async fn mcp_runtime_requires_host_mediated_egress_for_http_transports() {
     let package = package_from_manifest(MCP_MANIFEST);
     let client = RecordingMcpClient::direct_network(Ok(McpClientOutput::json(json!({
@@ -96,6 +210,7 @@ async fn mcp_runtime_requires_host_mediated_egress_for_http_transports() {
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
@@ -742,6 +857,7 @@ async fn mcp_runtime_with_concrete_http_client_consumes_shared_egress_end_to_end
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
@@ -1047,6 +1163,7 @@ async fn mcp_runtime_fails_closed_for_external_stdio_process_egress() {
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope: sample_scope(),
                 estimate: ResourceEstimate::default(),
                 resource_reservation: None,
@@ -1084,6 +1201,7 @@ async fn mcp_runtime_denies_budget_before_adapter_call() {
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope,
                 estimate: ResourceEstimate {
                     output_bytes: Some(10_000),
@@ -1116,6 +1234,7 @@ async fn mcp_runtime_releases_reservation_when_adapter_fails() {
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope,
                 estimate: ResourceEstimate {
                     concurrency_slots: Some(1),
@@ -1147,6 +1266,7 @@ async fn mcp_runtime_preserves_adapter_error_when_release_cleanup_fails() {
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope: sample_scope(),
                 estimate: ResourceEstimate {
                     concurrency_slots: Some(1),
@@ -1187,6 +1307,7 @@ async fn mcp_runtime_rejects_non_mcp_or_undeclared_capability_before_reserving()
             McpExecutionRequest {
                 package: &non_mcp,
                 capability_id: &CapabilityId::new("script.echo").unwrap(),
+                descriptor: None,
                 scope: scope.clone(),
                 estimate: ResourceEstimate {
                     concurrency_slots: Some(1),
@@ -1212,6 +1333,7 @@ async fn mcp_runtime_rejects_non_mcp_or_undeclared_capability_before_reserving()
             McpExecutionRequest {
                 package: &mcp,
                 capability_id: &CapabilityId::new("github-mcp.missing").unwrap(),
+                descriptor: None,
                 scope,
                 estimate: ResourceEstimate {
                     concurrency_slots: Some(1),
@@ -1253,6 +1375,7 @@ async fn mcp_runtime_enforces_output_limit_and_releases_reservation() {
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope,
                 estimate: ResourceEstimate {
                     concurrency_slots: Some(1),
@@ -1295,6 +1418,7 @@ async fn mcp_runtime_can_enforce_client_reported_output_size_without_serializing
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope,
                 estimate: ResourceEstimate {
                     concurrency_slots: Some(1),
@@ -1340,6 +1464,7 @@ async fn mcp_runtime_rejects_output_when_adapter_under_reports_size() {
             McpExecutionRequest {
                 package: &package,
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
+                descriptor: None,
                 scope,
                 estimate: ResourceEstimate {
                     concurrency_slots: Some(1),
