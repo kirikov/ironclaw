@@ -71,6 +71,10 @@ pub(crate) async fn discover_hosted_mcp_package(
             url,
             input: serde_json::Value::Null,
             max_output_bytes: MCP_RESPONSE_BODY_LIMIT,
+            // Discovery runs against a temporary registry with the provider
+            // package upserted, so the planner's registry-hit path supplies
+            // credentials; no request-provided fallback requirements are needed.
+            runtime_credentials: Vec::new(),
         })
         .await
         .map_err(|error| HostedMcpDiscoveryError::Transient(error.stable_reason().to_string()))?;

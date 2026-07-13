@@ -95,6 +95,18 @@ pub struct McpClientRequest {
     pub url: Option<String>,
     pub input: Value,
     pub max_output_bytes: u64,
+    /// The host-resolved credential requirements for this capability, taken
+    /// verbatim from the dispatcher-resolved `CapabilityDescriptor`.
+    ///
+    /// `ironclaw_mcp` never resolves, stages, or injects credentials — it only
+    /// forwards these host-provided requirements to the egress planner
+    /// ([`McpHostHttpEgressPlanRequest::runtime_credentials`]). The planner is
+    /// the sole owner of credential injection. This lane exists so a per-user
+    /// live-discovered hosted-MCP capability (absent from the host's global
+    /// extension registry) still carries the same requirements a
+    /// registry-published capability would, rather than egressing without its
+    /// `Authorization` header.
+    pub runtime_credentials: Vec<RuntimeCredentialRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +310,14 @@ pub struct McpHostHttpEgressPlanRequest<'a> {
     pub url: &'a str,
     pub headers: &'a [(String, String)],
     pub body: &'a [u8],
+    /// Host-resolved credential requirements for this capability, forwarded
+    /// unchanged from [`McpClientRequest::runtime_credentials`].
+    ///
+    /// The planner may use these to build credential injections when the
+    /// capability is absent from the host's global extension registry (a
+    /// per-user live-discovered hosted-MCP tool). `ironclaw_mcp` neither reads
+    /// nor mutates these — it only threads the host's handoff data through.
+    pub runtime_credentials: &'a [RuntimeCredentialRequirement],
 }
 
 /// Host-owned egress planner for MCP HTTP/SSE requests.
@@ -487,6 +507,7 @@ where
             url,
             headers: &policy_headers,
             body: &body,
+            runtime_credentials: &request.runtime_credentials,
         });
         Ok(PlannedMcpJsonRpc {
             id,
@@ -1617,6 +1638,11 @@ where
                 url: url.clone(),
                 input: request.invocation.input.clone(),
                 max_output_bytes: self.config.max_output_bytes,
+                // Forward the host-resolved requirements (including the
+                // dispatcher-supplied descriptor fallback for a live-discovered
+                // capability) to the egress planner. Injection stays the
+                // planner's job; this crate only carries the handoff data.
+                runtime_credentials: descriptor.runtime_credentials.clone(),
             },
             auth_context,
         })

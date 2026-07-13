@@ -295,6 +295,7 @@ async fn concrete_mcp_http_client_stamps_sep414_meta_on_thread_scoped_tools_call
 
     client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: scope.clone(),
@@ -353,6 +354,7 @@ async fn concrete_mcp_http_client_routes_json_rpc_through_shared_egress() {
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: scope.clone(),
@@ -466,6 +468,71 @@ async fn concrete_mcp_http_client_routes_json_rpc_through_shared_egress() {
     assert_eq!(planner_calls[0].json_rpc_id, json_rpc_id(&requests[2].body));
 }
 
+/// Seam regression (the "5th gate"): `plan_json_rpc` must forward the request's
+/// host-resolved `runtime_credentials` into every `McpHostHttpEgressPlanRequest`.
+/// This is the data lane a per-user discovered hosted-MCP `tools/call` relies on
+/// to reach the egress planner — `ironclaw_mcp` only carries the handoff data,
+/// the planner performs the injection. Without this forwarding a discovered
+/// capability egresses to the marketplace without its `Authorization` header.
+#[tokio::test]
+async fn concrete_mcp_http_client_forwards_request_runtime_credentials_into_plan() {
+    let scope = sample_scope();
+    let egress = RecordingRuntimeEgress::json_rpc();
+    let planner = RecordingEgressPlanner::new(host_http_plan());
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(egress.clone())),
+        planner.clone(),
+    );
+
+    let runtime_credentials = vec![RuntimeCredentialRequirement {
+        handle: SecretHandle::new("agent-market-token").unwrap(),
+        source: RuntimeCredentialRequirementSource::ProductAuthAccount {
+            provider: RuntimeCredentialAccountProviderId::new("agent-market").unwrap(),
+            setup: Default::default(),
+        },
+        provider_scopes: Vec::new(),
+        audience: NetworkTargetPattern {
+            scheme: Some(NetworkScheme::Https),
+            host_pattern: "mcp.example.test".to_string(),
+            port: None,
+        },
+        target: RuntimeCredentialTarget::Header {
+            name: "authorization".to_string(),
+            prefix: Some("Bearer ".to_string()),
+        },
+        required: true,
+    }];
+
+    client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("agent-market").unwrap(),
+            capability_id: CapabilityId::new("agent-market.echo-broker-test__echo_ping").unwrap(),
+            scope: scope.clone(),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example.test/mcp".to_string()),
+            input: json!({"message": "ping"}),
+            max_output_bytes: 4096,
+            runtime_credentials: runtime_credentials.clone(),
+        })
+        .await
+        .unwrap();
+
+    let planner_calls = planner.calls();
+    assert_eq!(
+        planner_calls.len(),
+        3,
+        "initialize, initialized notification, tools/call"
+    );
+    assert!(
+        planner_calls
+            .iter()
+            .all(|call| call.runtime_credentials == runtime_credentials),
+        "host-resolved requirements must reach the planner on every planned request"
+    );
+}
+
 #[tokio::test]
 async fn concrete_mcp_http_client_maps_upstream_auth_status_to_auth_required() {
     let egress = RecordingRuntimeEgress::auth_required();
@@ -476,6 +543,7 @@ async fn concrete_mcp_http_client_maps_upstream_auth_status_to_auth_required() {
 
     let error = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -505,6 +573,7 @@ async fn concrete_mcp_http_client_uses_negotiated_protocol_version_header() {
 
     client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -543,6 +612,7 @@ async fn concrete_mcp_http_client_reuses_rotated_session_id_after_initialized() 
 
     client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -581,6 +651,7 @@ async fn concrete_mcp_http_client_rejects_missing_or_unsafe_initialize_protocol_
 
         let error = client
             .call_tool(McpClientRequest {
+                runtime_credentials: Vec::new(),
                 provider: ExtensionId::new("github-mcp").unwrap(),
                 capability_id: CapabilityId::new("github-mcp.search").unwrap(),
                 scope: sample_scope(),
@@ -621,6 +692,7 @@ async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange(
 
     let error = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: scope.clone(),
@@ -644,6 +716,7 @@ async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange(
     planner.set_plan(host_http_plan());
     client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope,
@@ -685,6 +758,7 @@ async fn concrete_mcp_http_client_scopes_session_ids_per_invocation() {
     for user in ["user1", "user2"] {
         client
             .call_tool(McpClientRequest {
+                runtime_credentials: Vec::new(),
                 provider: ExtensionId::new("github-mcp").unwrap(),
                 capability_id: CapabilityId::new("github-mcp.search").unwrap(),
                 scope: sample_scope_for_user(user),
@@ -734,6 +808,7 @@ async fn concrete_mcp_http_client_clears_session_ids_between_calls() {
     for query in ["first", "second"] {
         client
             .call_tool(McpClientRequest {
+                runtime_credentials: Vec::new(),
                 provider: ExtensionId::new("github-mcp").unwrap(),
                 capability_id: CapabilityId::new("github-mcp.search").unwrap(),
                 scope: scope.clone(),
@@ -773,6 +848,7 @@ async fn concrete_mcp_http_client_does_not_reuse_session_from_failed_initialize(
 
     let error = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: scope.clone(),
@@ -789,6 +865,7 @@ async fn concrete_mcp_http_client_does_not_reuse_session_from_failed_initialize(
 
     client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope,
@@ -824,6 +901,7 @@ async fn concrete_mcp_http_client_rejects_json_rpc_response_without_matching_id(
 
     let error = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -893,6 +971,7 @@ async fn concrete_mcp_sse_client_parses_event_stream_through_shared_egress() {
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -924,6 +1003,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_through_shared_egress()
 
     let output = client
         .discover_tools(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -1001,6 +1081,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_over_sse_framing() {
 
     let sse_output = sse_client
         .discover_tools(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -1020,6 +1101,7 @@ async fn concrete_mcp_http_client_discovers_tool_schemas_over_sse_framing() {
     );
     let json_output = json_client
         .discover_tools(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -1049,6 +1131,7 @@ async fn concrete_mcp_http_client_maps_discovery_auth_status_to_auth_required() 
 
     let error = client
         .discover_tools(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -1077,6 +1160,7 @@ async fn concrete_mcp_http_client_caps_missing_plan_limit_to_client_output_limit
 
     client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -1107,6 +1191,7 @@ async fn concrete_mcp_http_client_rejects_invalid_session_id_before_reuse() {
 
     let error = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -1132,6 +1217,7 @@ async fn concrete_mcp_http_client_sanitizes_shared_egress_failures() {
 
     let error = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("github-mcp").unwrap(),
             capability_id: CapabilityId::new("github-mcp.search").unwrap(),
             scope: sample_scope(),
@@ -1703,6 +1789,7 @@ struct RecordedPlanCall {
     url: String,
     json_rpc_method: String,
     json_rpc_id: Option<u64>,
+    runtime_credentials: Vec<RuntimeCredentialRequirement>,
 }
 
 #[derive(Debug, Clone)]
@@ -1736,6 +1823,7 @@ impl McpHostHttpEgressPlanner for RecordingEgressPlanner {
             url: request.url.to_string(),
             json_rpc_method: json_rpc_method(request.body),
             json_rpc_id: json_rpc_id(request.body),
+            runtime_credentials: request.runtime_credentials.to_vec(),
         });
         self.plan.lock().unwrap().clone()
     }

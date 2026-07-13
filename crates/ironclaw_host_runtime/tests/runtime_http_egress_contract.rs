@@ -2269,6 +2269,7 @@ async fn mcp_http_client_reuses_real_host_staged_network_policy_for_json_rpc_ses
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id: capability_id.clone(),
             scope: scope.clone(),
@@ -2342,6 +2343,7 @@ async fn host_initiated_mcp_egress_stages_network_policy_without_prior_dispatch(
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id: capability_id.clone(),
             scope: scope.clone(),
@@ -2421,6 +2423,7 @@ async fn mcp_http_client_reuses_staged_credential_for_json_rpc_session() {
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id: capability_id.clone(),
             scope: scope.clone(),
@@ -2524,6 +2527,7 @@ async fn host_initiated_mcp_egress_stages_credential_from_owner_scope_without_pr
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("agent-market").unwrap(),
             capability_id: capability_id.clone(),
             scope: agent_scope.clone(),
@@ -2707,6 +2711,7 @@ async fn mcp_http_client_reuses_product_auth_staged_credential_for_json_rpc_sess
 
     let output = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id: capability_id.clone(),
             scope: runtime_scope,
@@ -2781,6 +2786,7 @@ async fn mcp_http_client_cannot_use_direct_secret_store_lease_with_production_eg
 
     let error = client
         .call_tool(McpClientRequest {
+            runtime_credentials: Vec::new(),
             provider: ExtensionId::new("mcp").unwrap(),
             capability_id,
             scope,
