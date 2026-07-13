@@ -211,7 +211,7 @@ rust_decimal_macros = "1"
 sha2 = "0.11"
 tempfile = "3"
 testcontainers-modules = { version = "0.12", features = ["postgres"] }
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "test-util", "time"] }
 # Real WebSocket client for the v2 stream-events-ws caller-level test.
 # Oneshot via `tower::ServiceExt::oneshot` cannot complete a true WS
 # upgrade (no underlying TCP stream → axum's WebSocketUpgrade extractor

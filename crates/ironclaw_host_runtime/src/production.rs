@@ -99,13 +99,13 @@ fn trace_capability_latency_error<E: ?Sized>(
 use crate::{
     BuiltinObligationHandler, BuiltinObligationServices, CancelRuntimeWorkOutcome,
     CancelRuntimeWorkRequest, CapabilitySurfaceVersion, HostRuntime, HostRuntimeError,
-    HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalGate, RuntimeAuthGate,
-    RuntimeBackendHealth, RuntimeBlockedReason, RuntimeCapabilityAuthResumeRequest,
-    RuntimeCapabilityCompleted, RuntimeCapabilityFailure, RuntimeCapabilityOutcome,
-    RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest, RuntimeFailureKind, RuntimeGateId,
-    RuntimeStatusRequest, RuntimeWorkId, RuntimeWorkSummary, VisibleCapabilityRequest,
-    VisibleCapabilitySurface, obligations::secret_present, plan_capability,
-    surface::CapabilityCatalog,
+    HostRuntimeHealth, HostRuntimeStatus, HostedMcpSurfaceOverlay, RuntimeApprovalGate,
+    RuntimeAuthGate, RuntimeBackendHealth, RuntimeBlockedReason,
+    RuntimeCapabilityAuthResumeRequest, RuntimeCapabilityCompleted, RuntimeCapabilityFailure,
+    RuntimeCapabilityOutcome, RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest,
+    RuntimeFailureKind, RuntimeGateId, RuntimeStatusRequest, RuntimeWorkId, RuntimeWorkSummary,
+    VisibleCapabilityRequest, VisibleCapabilitySurface, obligations::secret_present,
+    plan_capability, surface::CapabilityCatalog,
 };
 
 /// Default production wiring for [`HostRuntime`].
@@ -127,6 +127,10 @@ pub struct DefaultHostRuntime {
     process_result_store: Option<Arc<dyn ProcessResultStore>>,
     process_cancellation_registry: Option<Arc<ProcessCancellationRegistry>>,
     surface_filesystem: Option<Arc<dyn RootFilesystem>>,
+    // arch-exempt: optional_arc, hosted-MCP overlay discovery requires HTTP
+    // egress + a secret store; minimal/test host-runtime graphs legitimately
+    // ship without it (see `attach_hosted_mcp_runtime` soft-disable), plan #4539
+    hosted_mcp_overlay: Option<Arc<dyn HostedMcpSurfaceOverlay>>,
     runtime_health: Option<Arc<dyn RuntimeBackendHealth>>,
     obligation_handler: Option<Arc<dyn CapabilityObligationHandler>>,
     /// Optional secret store used for pre-flight credential presence checks.
@@ -205,6 +209,7 @@ impl DefaultHostRuntime {
             process_result_store: None,
             process_cancellation_registry: None,
             surface_filesystem: None,
+            hosted_mcp_overlay: None,
             runtime_health: None,
             obligation_handler: None,
             credential_preflight_store: None,
@@ -238,6 +243,14 @@ impl DefaultHostRuntime {
 
     pub fn with_surface_filesystem(mut self, filesystem: Arc<dyn RootFilesystem>) -> Self {
         self.surface_filesystem = Some(filesystem);
+        self
+    }
+
+    /// Attaches the per-user hosted-MCP capability-surface overlay. Absent,
+    /// `visible_capabilities` serves the static registry floor only — see
+    /// `crate::hosted_mcp_overlay` for the leak-gate this depends on.
+    pub fn with_hosted_mcp_overlay(mut self, overlay: Arc<dyn HostedMcpSurfaceOverlay>) -> Self {
+        self.hosted_mcp_overlay = Some(overlay);
         self
     }
 
@@ -1060,6 +1073,10 @@ impl HostRuntime for DefaultHostRuntime {
         );
         let catalog = match self.surface_filesystem.as_deref() {
             Some(filesystem) => catalog.with_filesystem(filesystem),
+            None => catalog,
+        };
+        let catalog = match self.hosted_mcp_overlay.as_deref() {
+            Some(overlay) => catalog.with_hosted_mcp_overlay(overlay),
             None => catalog,
         };
         catalog.visible_capabilities(request).await
@@ -2400,6 +2417,288 @@ mod tests {
 
     fn cap() -> CapabilityId {
         CapabilityId::new("test.cap").unwrap()
+    }
+
+    /// Regression for the wiring in `DefaultHostRuntime::visible_capabilities`
+    /// (this file, ~:1050): a `with_hosted_mcp_overlay` attachment must
+    /// actually reach `CapabilityCatalog`, not just compile. Drives the real
+    /// production entry point end to end — `DefaultHostRuntime` +
+    /// `HostRuntime::visible_capabilities` — with a spy overlay, so a
+    /// regression that drops the `self.hosted_mcp_overlay.as_deref()`
+    /// pass-through fails loudly here instead of silently no-opping.
+    mod hosted_mcp_overlay_wiring {
+        use super::*;
+        use crate::{CapabilitySurfacePolicy, HireScope, HostedMcpOverlayError, SurfaceKind};
+        use ironclaw_host_api::{
+            AgentId, CapabilityDescriptor, CapabilityDispatchRequest, CapabilityDispatchResult,
+            DispatchError, EffectKind, ExecutionContext, Obligations, ProjectId, TenantId, UserId,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct UnusedDispatcher;
+
+        #[async_trait]
+        impl CapabilityDispatcher for UnusedDispatcher {
+            async fn dispatch_json(
+                &self,
+                _request: CapabilityDispatchRequest,
+            ) -> Result<CapabilityDispatchResult, DispatchError> {
+                unreachable!("visible_capabilities must never dispatch a capability")
+            }
+        }
+
+        struct AllowAllAuthorizer;
+
+        #[async_trait]
+        impl TrustAwareCapabilityDispatchAuthorizer for AllowAllAuthorizer {
+            async fn authorize_dispatch_with_trust(
+                &self,
+                _context: &ExecutionContext,
+                _descriptor: &CapabilityDescriptor,
+                _estimate: &ResourceEstimate,
+                _trust_decision: &ironclaw_trust::TrustDecision,
+            ) -> Decision {
+                Decision::Allow {
+                    obligations: Obligations::default(),
+                }
+            }
+        }
+
+        struct SpyOverlay {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl HostedMcpSurfaceOverlay for SpyOverlay {
+            async fn overlay_capabilities(
+                &self,
+                _hire: &HireScope,
+                _package: &ExtensionPackage,
+            ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+
+        fn hosted_mcp_registry() -> ExtensionRegistry {
+            const MANIFEST: &str = r#"
+schema_version = "reborn.extension_manifest.v2"
+id = "notion"
+name = "Notion"
+version = "1.0.0"
+description = "test hosted mcp"
+trust = "third_party"
+
+[runtime]
+kind = "mcp"
+transport = "http"
+url = "https://mcp.notion.com/mcp"
+
+[[capabilities]]
+id = "notion.notion-fetch"
+description = "floor capability"
+effects = ["dispatch_capability", "network"]
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/notion/fetch.input.json"
+output_schema_ref = "schemas/notion/fetch.output.json"
+"#;
+            let manifest = ExtensionManifest::parse(
+                MANIFEST,
+                ManifestSource::HostBundled,
+                &HostPortCatalog::default(),
+            )
+            .unwrap();
+            let package = ExtensionPackage::from_manifest(
+                manifest,
+                VirtualPath::new("/system/extensions/notion").unwrap(),
+            )
+            .unwrap();
+            let mut registry = ExtensionRegistry::new();
+            registry.insert(package).unwrap();
+            registry
+        }
+
+        fn test_runtime_policy() -> EffectiveRuntimePolicy {
+            EffectiveRuntimePolicy {
+                deployment: ironclaw_host_api::runtime_policy::DeploymentMode::LocalSingleUser,
+                requested_profile: ironclaw_host_api::runtime_policy::RuntimeProfile::SecureDefault,
+                resolved_profile: ironclaw_host_api::runtime_policy::RuntimeProfile::SecureDefault,
+                filesystem_backend:
+                    ironclaw_host_api::runtime_policy::FilesystemBackendKind::ScopedVirtual,
+                process_backend: ironclaw_host_api::runtime_policy::ProcessBackendKind::None,
+                network_mode: ironclaw_host_api::runtime_policy::NetworkMode::Brokered,
+                secret_mode: ironclaw_host_api::runtime_policy::SecretMode::BrokeredHandles,
+                approval_policy: ironclaw_host_api::runtime_policy::ApprovalPolicy::AskAlways,
+                audit_mode: ironclaw_host_api::runtime_policy::AuditMode::LocalMinimal,
+            }
+        }
+
+        /// Builds a request scoped to `agent`, independently from any other
+        /// call — no shared `hire()`-style object between two calls of this
+        /// function, so a multi-tenant test built from two independent
+        /// invocations proves isolation along the real
+        /// `ExecutionContext`/`ResourceScope` construction path, not just
+        /// two hand-built structs that happen to differ in one field.
+        fn agent_scoped_request(agent: &str) -> VisibleCapabilityRequest {
+            let user_id = UserId::new("buyer-1").unwrap();
+            let mut context = ExecutionContext::local_default(
+                user_id,
+                ExtensionId::new("notion").unwrap(),
+                RuntimeKind::Mcp,
+                ironclaw_host_api::TrustClass::UserTrusted,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+            let tenant_id = TenantId::new("acme").unwrap();
+            let agent_id = Some(AgentId::new(agent).unwrap());
+            let project_id = Some(ProjectId::new("proj-1").unwrap());
+            context.tenant_id = tenant_id.clone();
+            context.agent_id = agent_id.clone();
+            context.project_id = project_id.clone();
+            context.resource_scope.tenant_id = tenant_id;
+            context.resource_scope.agent_id = agent_id;
+            context.resource_scope.project_id = project_id;
+            context.validate().unwrap();
+
+            let mut provider_trust = std::collections::BTreeMap::new();
+            provider_trust.insert(
+                ExtensionId::new("notion").unwrap(),
+                ironclaw_trust::TrustDecision {
+                    effective_trust: ironclaw_trust::EffectiveTrustClass::user_trusted(),
+                    authority_ceiling: ironclaw_trust::AuthorityCeiling {
+                        allowed_effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
+                        max_resource_ceiling: None,
+                    },
+                    provenance: ironclaw_trust::TrustProvenance::AdminConfig,
+                    evaluated_at: chrono::Utc::now(),
+                },
+            );
+
+            VisibleCapabilityRequest::new(context, SurfaceKind::new("test").unwrap())
+                .with_policy(CapabilitySurfacePolicy::allow_all())
+                .with_provider_trust(provider_trust)
+        }
+
+        #[tokio::test]
+        async fn attached_overlay_is_consulted_through_default_host_runtime() {
+            let registry = Arc::new(hosted_mcp_registry());
+            let dispatcher: Arc<dyn CapabilityDispatcher> = Arc::new(UnusedDispatcher);
+            let authorizer: Arc<dyn TrustAwareCapabilityDispatchAuthorizer> =
+                Arc::new(AllowAllAuthorizer);
+            let overlay = Arc::new(SpyOverlay {
+                calls: AtomicUsize::new(0),
+            });
+            let runtime = DefaultHostRuntime::new(
+                registry,
+                dispatcher,
+                authorizer,
+                CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+                test_runtime_policy(),
+            )
+            .with_hosted_mcp_overlay(overlay.clone());
+
+            runtime
+                .visible_capabilities(agent_scoped_request("agent-1"))
+                .await
+                .expect("visible_capabilities succeeds");
+
+            assert_eq!(
+                overlay.calls.load(Ordering::SeqCst),
+                1,
+                "an attached overlay must be consulted for an agent-scoped turn \
+                 — if this is 0, the DefaultHostRuntime -> CapabilityCatalog \
+                 wiring dropped the overlay"
+            );
+        }
+
+        /// C (multi-tenant isolation) regression, required by review item 4:
+        /// two turns differing ONLY in `agent_id`, each built from an
+        /// independently-constructed `ExecutionContext` (not a shared
+        /// `hire()`-style helper), driven through the real
+        /// `DefaultHostRuntime::visible_capabilities`. This is the layer
+        /// where a regression that accidentally coalesced scope fields
+        /// upstream of `HireScope::from_scope` would first be visible — the
+        /// composition-tier cache test starts from a hand-built
+        /// `ResourceScope`, not this production construction path.
+        #[tokio::test]
+        async fn multi_tenant_turns_see_only_their_own_overlay_capabilities() {
+            struct PerAgentOverlay;
+
+            #[async_trait]
+            impl HostedMcpSurfaceOverlay for PerAgentOverlay {
+                async fn overlay_capabilities(
+                    &self,
+                    hire: &HireScope,
+                    _package: &ExtensionPackage,
+                ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+                    let agent = hire.agent_id().as_str();
+                    Ok(vec![CapabilityDescriptor {
+                        id: CapabilityId::new(format!("notion.tool-for-{agent}")).unwrap(),
+                        provider: ExtensionId::new("notion").unwrap(),
+                        runtime: RuntimeKind::Mcp,
+                        trust_ceiling: ironclaw_host_api::TrustClass::UserTrusted,
+                        description: format!("tool discovered for {agent}"),
+                        parameters_schema: serde_json::json!({"type": "object"}),
+                        effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
+                        default_permission: ironclaw_host_api::PermissionMode::Ask,
+                        runtime_credentials: Vec::new(),
+                        resource_profile: None,
+                    }])
+                }
+            }
+
+            let registry = Arc::new(hosted_mcp_registry());
+            let dispatcher: Arc<dyn CapabilityDispatcher> = Arc::new(UnusedDispatcher);
+            let authorizer: Arc<dyn TrustAwareCapabilityDispatchAuthorizer> =
+                Arc::new(AllowAllAuthorizer);
+            let runtime = DefaultHostRuntime::new(
+                registry,
+                dispatcher,
+                authorizer,
+                CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+                test_runtime_policy(),
+            )
+            .with_hosted_mcp_overlay(Arc::new(PerAgentOverlay));
+
+            let surface_a = runtime
+                .visible_capabilities(agent_scoped_request("agent-a"))
+                .await
+                .expect("agent-a surface builds");
+            let surface_b = runtime
+                .visible_capabilities(agent_scoped_request("agent-b"))
+                .await
+                .expect("agent-b surface builds");
+
+            let has_id = |surface: &VisibleCapabilitySurface, id: &str| {
+                surface
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.descriptor.id.as_str() == id)
+            };
+            assert!(
+                has_id(&surface_a, "notion.tool-for-agent-a"),
+                "agent-a must see its own discovered tool"
+            );
+            assert!(
+                !has_id(&surface_a, "notion.tool-for-agent-b"),
+                "agent-a must NOT see agent-b's discovered tool"
+            );
+            assert!(
+                has_id(&surface_b, "notion.tool-for-agent-b"),
+                "agent-b must see its own discovered tool"
+            );
+            assert!(
+                !has_id(&surface_b, "notion.tool-for-agent-a"),
+                "agent-b must NOT see agent-a's discovered tool"
+            );
+            assert!(
+                has_id(&surface_a, "notion.notion-fetch")
+                    && has_id(&surface_b, "notion.notion-fetch"),
+                "the static floor must still be present for both agents"
+            );
+        }
     }
 
     fn dispatch(kind: DispatchFailureKind) -> CapabilityInvocationError {

@@ -1,19 +1,33 @@
+use std::{collections::HashSet, time::Duration};
+
 use ironclaw_authorization::TrustAwareCapabilityDispatchAuthorizer;
-use ironclaw_extensions::{CapabilityVisibility, ExtensionPackage, ExtensionRegistry};
+use ironclaw_extensions::{
+    CapabilityVisibility, ExtensionPackage, ExtensionRegistry, is_hosted_http_mcp_package,
+};
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
-    CapabilityDescriptor, CapabilityGrant, Decision, EffectKind, ResourceEstimate, RuntimeKind,
-    canonical_json_v1, runtime_policy::EffectiveRuntimePolicy, sha256_digest_token,
+    CapabilityDescriptor, CapabilityGrant, CapabilityId, Decision, EffectKind, ExecutionContext,
+    ResourceEstimate, RuntimeKind, canonical_json_v1, runtime_policy::EffectiveRuntimePolicy,
+    sha256_digest_token,
 };
 use ironclaw_trust::TrustDecision;
 use serde_json::{Value, json};
 
 use crate::{
-    CapabilitySurfaceVersion, HostRuntimeError, VisibleCapabilityRequest, VisibleCapabilitySurface,
+    CapabilitySurfaceVersion, HireScope, HostRuntimeError, HostedMcpSurfaceOverlay,
+    VisibleCapabilityRequest, VisibleCapabilitySurface,
     capability_catalog::read_json_ref,
     first_party_tools::{BUILTIN_FIRST_PARTY_PROVIDER, resolve_builtin_input_schema_ref},
     plan_capability,
 };
+
+/// Wall-clock budget for the hosted-MCP overlay discovery fan-out on one
+/// turn's capability-surface build. Independent of the (much larger)
+/// per-transport MCP request timeout: this bounds how long a turn will wait
+/// on live discovery before falling back to the static floor. Elapsing this
+/// budget is treated exactly like a discovery failure — floor only, not
+/// cached, never fails the turn.
+const OVERLAY_SURFACE_BUDGET: Duration = Duration::from_secs(3);
 
 const ALL_RUNTIME_KINDS: &[RuntimeKind] = &[
     RuntimeKind::Wasm,
@@ -115,12 +129,24 @@ pub struct VisibleCapability {
     pub estimated_resources: ResourceEstimate,
 }
 
+/// Which loop populated a descriptor being run through
+/// [`CapabilityCatalog::evaluate_descriptor`] — governs whether a schema
+/// resolution failure omits the capability (`Overlay`, untrusted
+/// marketplace input) or fails the whole surface build (`Floor`, a host
+/// bug: the manifest declaration is supposed to always be present).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescriptorSource {
+    Floor,
+    Overlay,
+}
+
 pub(crate) struct CapabilityCatalog<'a> {
     registry: &'a ExtensionRegistry,
     authorizer: &'a dyn TrustAwareCapabilityDispatchAuthorizer,
     base_version: &'a CapabilitySurfaceVersion,
     runtime_policy: &'a EffectiveRuntimePolicy,
     filesystem: Option<&'a dyn RootFilesystem>,
+    hosted_mcp_overlay: Option<&'a dyn HostedMcpSurfaceOverlay>,
 }
 
 impl<'a> CapabilityCatalog<'a> {
@@ -136,11 +162,20 @@ impl<'a> CapabilityCatalog<'a> {
             base_version,
             runtime_policy,
             filesystem: None,
+            hosted_mcp_overlay: None,
         }
     }
 
     pub(crate) fn with_filesystem(mut self, filesystem: &'a dyn RootFilesystem) -> Self {
         self.filesystem = Some(filesystem);
+        self
+    }
+
+    pub(crate) fn with_hosted_mcp_overlay(
+        mut self,
+        overlay: &'a dyn HostedMcpSurfaceOverlay,
+    ) -> Self {
+        self.hosted_mcp_overlay = Some(overlay);
         self
     }
 
@@ -155,46 +190,57 @@ impl<'a> CapabilityCatalog<'a> {
         let max_capabilities = request.policy.max_capabilities.unwrap_or(usize::MAX);
         let mut capabilities = Vec::new();
         let mut context = request.context.clone();
+
+        // Static floor: unconditional, always runs first. This publishes the
+        // globally-registered capabilities (including host-bundled tools
+        // like `marketplace.submit_deliverable`) regardless of caller scope.
         for descriptor in self.registry.capabilities() {
             if capabilities.len() >= max_capabilities {
                 break;
             }
-            if !self.is_model_visible(descriptor)
-                || !request.policy.allows_runtime(descriptor.runtime)
-                || !request.policy.allows_effects(&descriptor.effects)
+            if let Some(visible) = self
+                .evaluate_descriptor(descriptor, DescriptorSource::Floor, &mut context, &request)
+                .await?
             {
-                continue;
+                capabilities.push(visible);
             }
-            if plan_capability(descriptor, self.runtime_policy).is_err() {
-                continue;
-            }
-            let Some(trust_decision) = request.provider_trust.get(&descriptor.provider) else {
-                continue;
-            };
-            let estimate = descriptor
-                .resource_profile
-                .as_ref()
-                .map(|profile| profile.default_estimate.clone())
-                .unwrap_or_default();
-            context.trust = trust_decision.effective_trust.class();
+        }
 
-            let access = match self
-                .authorizer
-                .authorize_dispatch_with_trust(&context, descriptor, &estimate, trust_decision)
-                .await
-            {
-                Decision::Allow { .. } => VisibleCapabilityAccess::Available,
-                Decision::RequireApproval { .. } if request.policy.include_requires_approval => {
-                    VisibleCapabilityAccess::RequiresApproval
+        // Per-user hosted-MCP overlay: gated on both an attached overlay
+        // provider AND the turn scope carrying an agent_id (`HireScope`).
+        // Absent either, this block is skipped entirely — zero discovery
+        // calls, zero caching — which is what makes it safe for
+        // buyer/operator/system/cli turns. Overlaid descriptors run through
+        // the SAME per-descriptor pipeline as the floor above, and floor
+        // entries win any `CapabilityId` collision.
+        if let (Some(overlay), Some(hire)) = (
+            self.hosted_mcp_overlay,
+            HireScope::from_scope(&request.context.resource_scope),
+        ) && capabilities.len() < max_capabilities
+        {
+            let seen: HashSet<CapabilityId> = capabilities
+                .iter()
+                .map(|capability| capability.descriptor.id.clone())
+                .collect();
+            for descriptor in self.discover_overlay_capabilities(overlay, &hire).await {
+                if capabilities.len() >= max_capabilities {
+                    break;
                 }
-                Decision::RequireApproval { .. } | Decision::Deny { .. } => continue,
-            };
-
-            capabilities.push(VisibleCapability {
-                descriptor: self.surface_descriptor(descriptor).await?,
-                access,
-                estimated_resources: estimate,
-            });
+                if seen.contains(&descriptor.id) {
+                    continue;
+                }
+                if let Some(visible) = self
+                    .evaluate_descriptor(
+                        &descriptor,
+                        DescriptorSource::Overlay,
+                        &mut context,
+                        &request,
+                    )
+                    .await?
+                {
+                    capabilities.push(visible);
+                }
+            }
         }
 
         let version = surface_version(
@@ -207,6 +253,127 @@ impl<'a> CapabilityCatalog<'a> {
             version,
             capabilities,
         })
+    }
+
+    /// Runs one descriptor through the visibility/policy/plan/authorize
+    /// pipeline shared by the static floor and the hosted-MCP overlay.
+    /// `Ok(None)` means "not visible under this request" (filtered, denied,
+    /// or requires approval without that being allowed) — never an error.
+    async fn evaluate_descriptor(
+        &self,
+        descriptor: &CapabilityDescriptor,
+        source: DescriptorSource,
+        context: &mut ExecutionContext,
+        request: &VisibleCapabilityRequest,
+    ) -> Result<Option<VisibleCapability>, HostRuntimeError> {
+        if !self.is_model_visible(descriptor)
+            || !request.policy.allows_runtime(descriptor.runtime)
+            || !request.policy.allows_effects(&descriptor.effects)
+        {
+            return Ok(None);
+        }
+        if plan_capability(descriptor, self.runtime_policy).is_err() {
+            return Ok(None);
+        }
+        let Some(trust_decision) = request.provider_trust.get(&descriptor.provider) else {
+            return Ok(None);
+        };
+        let estimate = descriptor
+            .resource_profile
+            .as_ref()
+            .map(|profile| profile.default_estimate.clone())
+            .unwrap_or_default();
+        context.trust = trust_decision.effective_trust.class();
+
+        let access = match self
+            .authorizer
+            .authorize_dispatch_with_trust(context, descriptor, &estimate, trust_decision)
+            .await
+        {
+            Decision::Allow { .. } => VisibleCapabilityAccess::Available,
+            Decision::RequireApproval { .. } if request.policy.include_requires_approval => {
+                VisibleCapabilityAccess::RequiresApproval
+            }
+            Decision::RequireApproval { .. } | Decision::Deny { .. } => return Ok(None),
+        };
+
+        let descriptor = match self.surface_descriptor(descriptor).await {
+            Ok(descriptor) => descriptor,
+            // An overlay-sourced descriptor is untrusted marketplace input:
+            // a discovered capability id is never in the static manifest, so
+            // any schema-resolution failure here (including a root-level
+            // `$ref` a hosted MCP server should never send, per the trait's
+            // inline-schema contract) omits just this one malformed
+            // capability instead of failing the whole surface build. A
+            // floor descriptor's resolution failure is a genuine host bug
+            // and still propagates as `Err` below.
+            Err(error) if source == DescriptorSource::Overlay => {
+                tracing::debug!(
+                    capability_id = %descriptor.id,
+                    error = %error,
+                    "omitting malformed hosted-MCP overlay capability from the surface"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(Some(VisibleCapability {
+            descriptor,
+            access,
+            estimated_resources: estimate,
+        }))
+    }
+
+    /// Fetches the per-hire hosted-MCP capability surface across every
+    /// hosted-http-mcp package in the registry, budget-bounded and run
+    /// concurrently. Failure, an empty result, or the budget elapsing all
+    /// resolve to an empty `Vec` — the caller then serves the static floor
+    /// only, and (by construction, since nothing here writes state) nothing
+    /// is cached and the turn never fails.
+    async fn discover_overlay_capabilities(
+        &self,
+        overlay: &dyn HostedMcpSurfaceOverlay,
+        hire: &HireScope,
+    ) -> Vec<CapabilityDescriptor> {
+        let packages: Vec<&ExtensionPackage> = self
+            .registry
+            .extensions()
+            .filter(|package| is_hosted_http_mcp_package(package))
+            .collect();
+        if packages.is_empty() {
+            return Vec::new();
+        }
+
+        let fanout = futures_util::future::join_all(
+            packages
+                .iter()
+                .map(|package| overlay.overlay_capabilities(hire, package)),
+        );
+        match tokio::time::timeout(OVERLAY_SURFACE_BUDGET, fanout).await {
+            Ok(results) => results
+                .into_iter()
+                .zip(packages.iter())
+                .flat_map(|(result, package)| match result {
+                    Ok(descriptors) => descriptors,
+                    Err(error) => {
+                        tracing::debug!(
+                            extension_id = %package.id,
+                            error = ?error,
+                            "hosted MCP overlay discovery failed; serving static floor only"
+                        );
+                        Vec::new()
+                    }
+                })
+                .collect(),
+            Err(_) => {
+                tracing::debug!(
+                    budget_secs = OVERLAY_SURFACE_BUDGET.as_secs(),
+                    "hosted MCP overlay discovery exceeded budget; serving static floor only"
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn is_model_visible(&self, descriptor: &CapabilityDescriptor) -> bool {
@@ -530,6 +697,422 @@ mod tests {
             matches!(error, HostRuntimeError::InvalidRequest { ref reason }
                 if reason.contains("must publish from an input schema ref")),
             "unexpected error: {error:?}"
+        );
+    }
+
+    // ---- hosted-MCP overlay union/gate regression coverage ----
+    //
+    // These drive `CapabilityCatalog::visible_capabilities` directly, which
+    // is the entire body of `DefaultHostRuntime::visible_capabilities`
+    // (production.rs:1050) — there is no branching logic between the two, so
+    // this is "through the real caller" for the merge/gate/dedup/budget
+    // behavior under test. Multi-tenant isolation and the composition-owned
+    // cache/single-flight behavior are covered separately in
+    // `ironclaw_reborn_composition::extension_host::hosted_mcp_overlay`
+    // against the real fake egress.
+
+    use crate::{HostedMcpOverlayError, SurfaceKind};
+    use ironclaw_host_api::{AgentId, Obligations, ProjectId, TenantId, UserId};
+    use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AllowAllAuthorizer;
+
+    #[async_trait::async_trait]
+    impl TrustAwareCapabilityDispatchAuthorizer for AllowAllAuthorizer {
+        async fn authorize_dispatch_with_trust(
+            &self,
+            _context: &ExecutionContext,
+            _descriptor: &CapabilityDescriptor,
+            _estimate: &ResourceEstimate,
+            _trust_decision: &TrustDecision,
+        ) -> Decision {
+            Decision::Allow {
+                obligations: Obligations::default(),
+            }
+        }
+    }
+
+    struct NeverCalledOverlay {
+        calls: AtomicUsize,
+    }
+
+    impl NeverCalledOverlay {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostedMcpSurfaceOverlay for NeverCalledOverlay {
+        async fn overlay_capabilities(
+            &self,
+            _hire: &HireScope,
+            _package: &ExtensionPackage,
+        ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    struct StaticOverlay {
+        descriptors: Vec<CapabilityDescriptor>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostedMcpSurfaceOverlay for StaticOverlay {
+        async fn overlay_capabilities(
+            &self,
+            _hire: &HireScope,
+            _package: &ExtensionPackage,
+        ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+            Ok(self.descriptors.clone())
+        }
+    }
+
+    struct FailingOverlay;
+
+    #[async_trait::async_trait]
+    impl HostedMcpSurfaceOverlay for FailingOverlay {
+        async fn overlay_capabilities(
+            &self,
+            _hire: &HireScope,
+            _package: &ExtensionPackage,
+        ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+            Err(HostedMcpOverlayError::Transient(
+                "simulated backend failure".to_string(),
+            ))
+        }
+    }
+
+    struct SlowOverlay;
+
+    #[async_trait::async_trait]
+    impl HostedMcpSurfaceOverlay for SlowOverlay {
+        async fn overlay_capabilities(
+            &self,
+            _hire: &HireScope,
+            _package: &ExtensionPackage,
+        ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+            tokio::time::sleep(OVERLAY_SURFACE_BUDGET * 10).await;
+            Ok(Vec::new())
+        }
+    }
+
+    /// Registers one hosted-http-mcp package (`notion`) with a single
+    /// manifest-declared floor capability `notion.notion-fetch`, so both the
+    /// static-floor loop and the overlay's package fan-out have something to
+    /// act on.
+    fn registry_with_hosted_mcp_floor() -> ExtensionRegistry {
+        const MANIFEST: &str = r#"
+schema_version = "reborn.extension_manifest.v2"
+id = "notion"
+name = "Notion"
+version = "1.0.0"
+description = "test hosted mcp"
+trust = "third_party"
+
+[runtime]
+kind = "mcp"
+transport = "http"
+url = "https://mcp.notion.com/mcp"
+
+[[capabilities]]
+id = "notion.notion-fetch"
+description = "floor capability"
+effects = ["dispatch_capability", "network"]
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/notion/fetch.input.json"
+output_schema_ref = "schemas/notion/fetch.output.json"
+"#;
+        let manifest = ironclaw_extensions::ExtensionManifest::parse(
+            MANIFEST,
+            ironclaw_extensions::ManifestSource::HostBundled,
+            &ironclaw_host_api::HostPortCatalog::default(),
+        )
+        .expect("valid manifest");
+        let package = ExtensionPackage::from_manifest(
+            manifest,
+            ironclaw_host_api::VirtualPath::new("/system/extensions/notion").expect("valid root"),
+        )
+        .expect("valid package");
+        let mut registry = ExtensionRegistry::new();
+        registry.insert(package).expect("insert notion package");
+        registry
+    }
+
+    fn overlay_capability_descriptor(id: &str, description: &str) -> CapabilityDescriptor {
+        CapabilityDescriptor {
+            id: CapabilityId::new(id).unwrap(),
+            provider: ExtensionId::new("notion").unwrap(),
+            runtime: RuntimeKind::Mcp,
+            trust_ceiling: TrustClass::UserTrusted,
+            description: description.to_string(),
+            parameters_schema: json!({"type": "object"}),
+            effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
+            default_permission: PermissionMode::Ask,
+            runtime_credentials: Vec::new(),
+            resource_profile: None,
+        }
+    }
+
+    fn overlay_test_runtime_policy() -> EffectiveRuntimePolicy {
+        EffectiveRuntimePolicy {
+            deployment: DeploymentMode::LocalSingleUser,
+            requested_profile: RuntimeProfile::SecureDefault,
+            resolved_profile: RuntimeProfile::SecureDefault,
+            filesystem_backend: FilesystemBackendKind::ScopedVirtual,
+            process_backend: ProcessBackendKind::None,
+            network_mode: NetworkMode::Brokered,
+            secret_mode: SecretMode::BrokeredHandles,
+            approval_policy: ApprovalPolicy::AskAlways,
+            audit_mode: AuditMode::LocalMinimal,
+        }
+    }
+
+    fn overlay_request(agent_id: Option<&str>) -> VisibleCapabilityRequest {
+        let user_id = UserId::new("buyer-1").unwrap();
+        let mut context = ExecutionContext::local_default(
+            user_id.clone(),
+            ExtensionId::new("notion").unwrap(),
+            RuntimeKind::Mcp,
+            TrustClass::UserTrusted,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let tenant_id = TenantId::new("acme").unwrap();
+        let agent_id = agent_id.map(|id| AgentId::new(id).unwrap());
+        let project_id = Some(ProjectId::new("proj-1").unwrap());
+        context.tenant_id = tenant_id.clone();
+        context.agent_id = agent_id.clone();
+        context.project_id = project_id.clone();
+        context.resource_scope.tenant_id = tenant_id;
+        context.resource_scope.agent_id = agent_id;
+        context.resource_scope.project_id = project_id;
+        context.validate().expect("valid execution context");
+
+        let mut provider_trust = std::collections::BTreeMap::new();
+        provider_trust.insert(
+            ExtensionId::new("notion").unwrap(),
+            TrustDecision {
+                effective_trust: EffectiveTrustClass::user_trusted(),
+                authority_ceiling: AuthorityCeiling {
+                    allowed_effects: ALL_EFFECT_KINDS.to_vec(),
+                    max_resource_ceiling: None,
+                },
+                provenance: TrustProvenance::AdminConfig,
+                evaluated_at: chrono::Utc::now(),
+            },
+        );
+
+        VisibleCapabilityRequest::new(context, SurfaceKind::new("test").unwrap())
+            .with_policy(CapabilitySurfacePolicy::allow_all())
+            .with_provider_trust(provider_trust)
+    }
+
+    #[tokio::test]
+    async fn visible_capabilities_none_agent_turn_serves_floor_only_and_never_calls_overlay() {
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        let authorizer = AllowAllAuthorizer;
+        let overlay = NeverCalledOverlay::new();
+        let catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_hosted_mcp_overlay(&overlay);
+
+        let surface = catalog
+            .visible_capabilities(overlay_request(None))
+            .await
+            .expect("floor-only surface succeeds");
+
+        assert_eq!(surface.capabilities.len(), 1);
+        assert_eq!(
+            surface.capabilities[0].descriptor.id.as_str(),
+            "notion.notion-fetch"
+        );
+        assert_eq!(
+            overlay.calls.load(Ordering::SeqCst),
+            0,
+            "a None-agent turn must never call hosted-MCP discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_capabilities_unions_overlay_with_floor_and_floor_wins_id_collisions() {
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        let authorizer = AllowAllAuthorizer;
+        let overlay = StaticOverlay {
+            descriptors: vec![
+                // Colliding id: floor must win, this description must not surface.
+                overlay_capability_descriptor("notion.notion-fetch", "overlay collision"),
+                overlay_capability_descriptor("notion.live-search", "discovered tool"),
+            ],
+        };
+        let catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_hosted_mcp_overlay(&overlay);
+
+        let surface = catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("union surface succeeds");
+
+        assert_eq!(
+            surface.capabilities.len(),
+            2,
+            "floor + one new overlay capability"
+        );
+        let fetch = surface
+            .capabilities
+            .iter()
+            .find(|capability| capability.descriptor.id.as_str() == "notion.notion-fetch")
+            .expect("floor capability present");
+        assert_eq!(
+            fetch.descriptor.description, "floor capability",
+            "floor descriptor must win the id collision, not the overlay's"
+        );
+        assert!(
+            surface
+                .capabilities
+                .iter()
+                .any(|capability| capability.descriptor.id.as_str() == "notion.live-search"),
+            "new overlay capability must be surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_capabilities_falls_back_to_floor_when_overlay_discovery_fails() {
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        let authorizer = AllowAllAuthorizer;
+        let overlay = FailingOverlay;
+        let catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_hosted_mcp_overlay(&overlay);
+
+        let surface = catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("discovery failure must not fail the turn");
+
+        assert_eq!(surface.capabilities.len(), 1);
+        assert_eq!(
+            surface.capabilities[0].descriptor.id.as_str(),
+            "notion.notion-fetch"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn visible_capabilities_falls_back_to_floor_when_overlay_discovery_exceeds_budget() {
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        let authorizer = AllowAllAuthorizer;
+        let overlay = SlowOverlay;
+        let catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_hosted_mcp_overlay(&overlay);
+
+        let surface = catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("budget timeout must not fail the turn");
+
+        assert_eq!(surface.capabilities.len(), 1);
+        assert_eq!(
+            surface.capabilities[0].descriptor.id.as_str(),
+            "notion.notion-fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_capabilities_omits_overlay_when_no_overlay_is_attached() {
+        // Absent-overlay path (e.g. minimal/test host runtimes that never
+        // attach one): must behave exactly like the pre-overlay code path.
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        let authorizer = AllowAllAuthorizer;
+        let catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy);
+
+        let surface = catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("no-overlay surface succeeds");
+
+        assert_eq!(surface.capabilities.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn visible_capabilities_omits_overlay_descriptor_with_unresolvable_ref_instead_of_failing_the_turn()
+     {
+        // F1 regression: a discovered tool is untrusted marketplace input. A
+        // root-level `$ref` (valid JSON Schema, but never in the static
+        // manifest since discovered capability ids are dynamic) must not
+        // terminalize the whole surface build — it must simply be omitted.
+        //
+        // `with_filesystem` is required to reach the resolution branch at
+        // all (unset, a `$ref` descriptor passes through unresolved and the
+        // bug is unreachable), which means the FLOOR's own `notion.notion-fetch`
+        // descriptor also resolves its `$ref` for real here — so a real file
+        // is mounted for it. The overlay's `notion.live-search` id is never
+        // in the static manifest, so its resolution fails at the
+        // `manifest.capabilities.iter().find(..)` step (before any file
+        // read), which is the exact failure this test targets.
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        let authorizer = AllowAllAuthorizer;
+
+        let host_root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(host_root.path().join("schemas/notion"))
+            .expect("create schema dir");
+        std::fs::write(
+            host_root.path().join("schemas/notion/fetch.input.json"),
+            r#"{"type":"object"}"#,
+        )
+        .expect("write floor schema file");
+        let mut filesystem = ironclaw_filesystem::LocalFilesystem::new();
+        filesystem
+            .mount_local(
+                ironclaw_host_api::VirtualPath::new("/system/extensions/notion").unwrap(),
+                ironclaw_host_api::HostPath::from_path_buf(host_root.path().to_path_buf()),
+            )
+            .expect("mount floor schema root");
+
+        let mut malformed = overlay_capability_descriptor("notion.live-search", "discovered tool");
+        malformed.parameters_schema =
+            json!({"$ref": "schemas/notion/dynamic/live-search.input.v1.json"});
+        let overlay = StaticOverlay {
+            descriptors: vec![malformed],
+        };
+        let catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_filesystem(&filesystem)
+                .with_hosted_mcp_overlay(&overlay);
+
+        let surface = catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("a malformed overlay descriptor must not fail the surface build");
+
+        assert_eq!(
+            surface.capabilities.len(),
+            1,
+            "floor must still be present; the malformed overlay capability is simply omitted"
+        );
+        assert_eq!(
+            surface.capabilities[0].descriptor.id.as_str(),
+            "notion.notion-fetch"
         );
     }
 }

@@ -143,6 +143,7 @@ use crate::default_system_prompt::seed_default_system_prompt;
 use crate::extension_host::available_extensions::{
     slack_bot_manifest_digest, slack_manifest_digest,
 };
+use crate::extension_host::hosted_mcp_overlay::CompositionHostedMcpOverlay;
 use crate::extension_host::lifecycle::{
     RebornLocalSkillManagementPort, build_local_skill_management_port,
 };
@@ -398,6 +399,36 @@ where
         registry,
         runtime_http_egress,
     ))))
+}
+
+/// Attaches the per-user hosted-MCP capability-surface overlay (see
+/// `ironclaw_host_runtime::hosted_mcp_overlay`). Gated on the same host
+/// runtime HTTP egress as [`attach_hosted_mcp_runtime`] and soft-disables the
+/// same way: builds without egress must still succeed, with hosted-MCP
+/// per-user discovery going dark rather than failing composition. Does not
+/// touch the boot-time global registry publish — this only supplies the
+/// per-request overlay `CapabilityCatalog::visible_capabilities` unions onto
+/// the static floor.
+fn attach_hosted_mcp_overlay<F, G, S, R>(
+    services: HostRuntimeServices<F, G, S, R>,
+) -> Result<HostRuntimeServices<F, G, S, R>, RebornBuildError>
+where
+    F: ironclaw_filesystem::RootFilesystem + 'static,
+    G: ironclaw_resources::ResourceGovernor + 'static,
+    S: ironclaw_processes::ProcessStore + 'static,
+    R: ironclaw_processes::ProcessResultStore + 'static,
+{
+    let Some(runtime_ports) = services.product_auth_provider_runtime_ports() else {
+        tracing::debug!(
+            "skipping hosted MCP overlay: host runtime HTTP egress absent \
+             (only affects per-user hosted MCP discovery)"
+        );
+        return Ok(services);
+    };
+    let overlay = Arc::new(CompositionHostedMcpOverlay::new(
+        runtime_ports.runtime_http_egress(),
+    ));
+    Ok(services.with_hosted_mcp_overlay(overlay))
 }
 
 fn attach_wasm_runtime<F, G, S, R>(
@@ -1490,6 +1521,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     }
     services = apply_runtime_process_binding(services, runtime_process_binding);
     services = attach_hosted_mcp_runtime(services)?;
+    services = attach_hosted_mcp_overlay(services)?;
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let provider_composition = compose_provider_client(
         oauth_provider_configs,
@@ -4586,6 +4618,7 @@ where
     .with_turn_run_wake_notifier_dyn(production_wiring.turn_run_wake_notifier);
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let services = attach_hosted_mcp_runtime(services)?;
+    let services = attach_hosted_mcp_overlay(services)?;
     let provider_composition = compose_provider_client(
         oauth_provider_configs,
         oauth_dcr_provider_configs,

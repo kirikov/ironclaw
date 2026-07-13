@@ -191,6 +191,19 @@ pub(super) fn capability_is_visible(
     surface: &CapabilitySurfaceIndex<'_>,
     call: &CapabilityCallCandidate,
 ) -> bool {
+    // Hosted-MCP capabilities (host_runtime's per-user overlay) default to
+    // `PermissionMode::Ask`, so approval-gating is their primary path, not a
+    // corner case. `surface_version` is a content hash of the whole rendered
+    // surface, which now legitimately varies with overlay discovery health
+    // for a fixed scope (see `ironclaw_host_runtime::surface::surface_version`).
+    // If discovery health differs between gate-raise time and approval time,
+    // the version check below drops the call as no-longer-visible even
+    // though the user approved it — fails safe (never runs an invisible
+    // tool), but is a real functionality regression, not just cache churn.
+    // Tracked as a known follow-up in the per-user hosted-MCP broker
+    // overlay PR description (not a GitHub issue — issues are disabled on
+    // this repo); design notes at
+    // docs/plans/2026-07-13-decouple-hosted-mcp-approval-resume-visibility.md
     if &call.surface_version != surface.version {
         return false;
     }
