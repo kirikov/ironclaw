@@ -12,13 +12,25 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    CapabilityId, ExtensionId, MountView, ResourceEstimate, ResourceReceipt, ResourceReservation,
-    ResourceScope, ResourceUsage, RuntimeCredentialAuthRequirement, RuntimeKind, SecretHandle,
+    CapabilityDescriptor, CapabilityId, ExtensionId, MountView, ResourceEstimate, ResourceReceipt,
+    ResourceReservation, ResourceScope, ResourceUsage, RuntimeCredentialAuthRequirement,
+    RuntimeKind, SecretHandle,
 };
 
 /// Request for one already-authorized declared capability dispatch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapabilityDispatchRequest {
+    /// The descriptor the caller already resolved and authorized against,
+    /// when known. Optional so spawn/process dispatch (which has no
+    /// registry-resolved descriptor in scope, see
+    /// `ironclaw_host_runtime::services::process_executor`) keeps
+    /// constructing this request unchanged. When present, the dispatcher
+    /// prefers it over re-resolving `capability_id` from its own registry
+    /// snapshot — this is what makes a per-request-only discovered
+    /// hosted-MCP capability (never written into the shared registry)
+    /// dispatchable: the caller resolved it from a per-request merged
+    /// registry the dispatcher never sees.
+    pub descriptor: Option<CapabilityDescriptor>,
     pub capability_id: CapabilityId,
     pub scope: ResourceScope,
     pub estimate: ResourceEstimate,

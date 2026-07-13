@@ -805,6 +805,9 @@ pub(crate) fn build_local_dev_approval_interaction_service_with_turn_run_source(
                 local_dev::extension_surface::LocalDevExtensionSurfaceSource::new(
                     local_runtime.extension_management.clone(),
                 ),
+                local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(
+                    local_runtime.hosted_mcp_overlay.clone(),
+                ),
             )),
             approval_resolver,
             turn_coordinator,

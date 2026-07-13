@@ -193,17 +193,27 @@ pub(super) fn capability_is_visible(
 ) -> bool {
     // Hosted-MCP capabilities (host_runtime's per-user overlay) default to
     // `PermissionMode::Ask`, so approval-gating is their primary path, not a
-    // corner case. `surface_version` is a content hash of the whole rendered
-    // surface, which now legitimately varies with overlay discovery health
-    // for a fixed scope (see `ironclaw_host_runtime::surface::surface_version`).
-    // If discovery health differs between gate-raise time and approval time,
-    // the version check below drops the call as no-longer-visible even
-    // though the user approved it — fails safe (never runs an invisible
-    // tool), but is a real functionality regression, not just cache churn.
-    // Tracked as a known follow-up in the per-user hosted-MCP broker
-    // overlay PR description (not a GitHub issue — issues are disabled on
-    // this repo); design notes at
+    // corner case. F4 (version-hash decoupling) LANDED:
+    // `ironclaw_host_runtime::surface::surface_version` excludes
+    // overlay-sourced entries from the hash entirely, so a discovered tool
+    // appearing/disappearing/flipping `access` between gate-raise and resume
+    // no longer flips this `surface_version` check on its own — an approval
+    // survives an overlay-SET change while the tool stays discoverable.
+    // RESIDUAL (accepted as fail-safe, not a bug): resume still re-runs LIVE
+    // discovery at two independent layers — this presence check (via
+    // `surface.descriptors`/`surface.callable`, rebuilt from a fresh
+    // `visible_capabilities` call) and `resolve_invocation_registry`
+    // (`ironclaw_host_runtime::production`, the per-request registry merge
+    // resume threads through preflight) — so a discovery backend that is
+    // transiently DOWN at resume time (not merely a set/access change, but
+    // discovery failing to return the tool at all) still drops the call.
+    // This fails CLOSED (never runs an invisible/unresolvable tool) and is
+    // bounded by the overlay's TTL window; it is not proven to survive a
+    // resume that lands during a discovery outage. See
     // docs/plans/2026-07-13-decouple-hosted-mcp-approval-resume-visibility.md
+    // for the accepted residual and the per-user-store target architecture
+    // where the full fix (cache the descriptor at gate-raise, honor it at
+    // resume) would live.
     if &call.surface_version != surface.version {
         return false;
     }

@@ -131,7 +131,10 @@ pub use services::{
     ProductionWiringIssue, ProductionWiringIssueKind, ProductionWiringReport,
     RegisteredRuntimeHealth,
 };
-pub use surface::{CapabilitySurfacePolicy, VisibleCapability, VisibleCapabilityAccess};
+pub use surface::{
+    CapabilitySurfacePolicy, VisibleCapability, VisibleCapabilityAccess,
+    discover_overlay_capabilities_for_hire,
+};
 pub use turn_scheduler::{
     SchedulerTurnRunWakeNotifier, TurnRunExecutor, TurnRunExecutorError, TurnRunScheduler,
     TurnRunSchedulerConfig, TurnRunSchedulerHandle, TurnRunWakeChannel,

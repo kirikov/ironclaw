@@ -960,6 +960,16 @@ where
         self
     }
 
+    /// Returns the attached hosted-MCP overlay, if any — mirrors
+    /// [`shared_extension_registry`](Self::shared_extension_registry).
+    /// Composition uses this to reuse the SAME overlay instance (its
+    /// TTL-cache/single-flight is keyed per-instance) for the ambient
+    /// discovered-capability grant source, instead of constructing a
+    /// second overlay that would double the live discovery traffic.
+    pub fn hosted_mcp_overlay(&self) -> Option<Arc<dyn HostedMcpSurfaceOverlay>> {
+        self.hosted_mcp_overlay.clone()
+    }
+
     pub fn with_first_party_capabilities(
         mut self,
         registry: Arc<FirstPartyCapabilityRegistry>,

@@ -7,6 +7,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use ironclaw_authorization::CapabilityLeaseStore;
+use ironclaw_extensions::SharedExtensionRegistry;
 use ironclaw_host_api::{
     CapabilityId, EffectKind, ExecutionContext, ExtensionId, InvocationId, MountView,
     ResourceScope, RuntimeKind, TrustClass, UserId,
@@ -50,6 +51,7 @@ use crate::{
     runtime::LocalDevSelectableSkillContextSource,
 };
 
+pub(super) mod discovered_capability_grants;
 pub(super) mod extension_surface;
 mod external_tool_capability;
 mod outbound_delivery;
@@ -128,6 +130,11 @@ pub(super) fn capability_wiring(
     );
     let extension_surface_source =
         LocalDevExtensionSurfaceSource::new(local_runtime.extension_management.clone());
+    let discovered_capability_grants =
+        discovered_capability_grants::DiscoveredCapabilityGrantSource::new(
+            local_runtime.hosted_mcp_overlay.clone(),
+        );
+    let shared_extension_registry = local_runtime.shared_extension_registry.clone();
     // First-class project creation reuses the same access-controlled
     // `ProjectService` facade the WebUI v2 surface wires (composition owns the
     // service, never the raw repository), so an agent-created project is a real
@@ -170,6 +177,8 @@ pub(super) fn capability_wiring(
             approval_requests,
             capability_leases,
             external_tool_catalog,
+            discovered_capability_grants,
+            shared_extension_registry,
         });
     let model_gateway: Arc<dyn HostManagedModelGateway> = Arc::new(
         LocalDevResultHydratingModelGateway::new(model_gateway, capability_io),
@@ -208,6 +217,8 @@ struct LocalDevLoopCapabilityPortFactory {
     /// all runs in this runtime so a parked external-tool call and its later
     /// client-submitted output (across a pause/resume) hit the same store.
     external_tool_catalog: Arc<dyn ExternalToolCatalog>,
+    discovered_capability_grants: discovered_capability_grants::DiscoveredCapabilityGrantSource,
+    shared_extension_registry: Option<Arc<SharedExtensionRegistry>>,
 }
 
 #[async_trait::async_trait]
@@ -247,6 +258,8 @@ impl LoopCapabilityPortFactory for LocalDevLoopCapabilityPortFactory {
             approval_requests: Arc::clone(&self.approval_requests),
             capability_leases: Arc::clone(&self.capability_leases),
             external_tool_catalog: Arc::clone(&self.external_tool_catalog),
+            discovered_capability_grants: self.discovered_capability_grants.clone(),
+            shared_extension_registry: self.shared_extension_registry.clone(),
         })
         .await
     }
@@ -953,6 +966,15 @@ struct LocalDevVisibleCapabilityInputs<'a> {
     system_extensions_lifecycle_mounts: &'a MountView,
     policy: &'a LocalDevCapabilityPolicy,
     extension_surface: &'a LocalDevExtensionSurface,
+    /// Ambient grants for this hire's discovered hosted-MCP tools
+    /// (`DiscoveredCapabilityGrantSource::grants_for_scope`), pre-computed
+    /// by the async caller (`RefreshingLocalDevCapabilityPort::build_inner`)
+    /// since this function itself is sync. Unioned exactly like
+    /// `extension_surface.grants` — same grantee shape, same
+    /// `Principal::HostRuntime` issuer — so a discovered `Ask`-permission
+    /// tool becomes askable via the SAME `Allow -> RequireApproval` path an
+    /// installed extension's capability uses.
+    discovered_grants: &'a [ironclaw_host_api::CapabilityGrant],
 }
 
 fn local_dev_visible_capability_request(
@@ -971,6 +993,9 @@ fn local_dev_visible_capability_request(
     grants
         .grants
         .extend(inputs.extension_surface.grants(&extension_id));
+    grants
+        .grants
+        .extend(inputs.discovered_grants.iter().cloned());
     let user_id = run_context
         .scope
         .explicit_owner_user_id()

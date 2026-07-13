@@ -949,6 +949,15 @@ pub(crate) struct RebornLocalRuntimeServices {
     /// Canonical registry shared by capability dispatch and hook activation.
     pub(crate) extension_registry: Arc<ExtensionRegistry>,
     pub(crate) shared_extension_registry: Option<Arc<SharedExtensionRegistry>>,
+    /// SAME overlay instance attached to `HostRuntime` (`attach_hosted_mcp_overlay`
+    /// in this file), reused by `DiscoveredCapabilityGrantSource` so its
+    /// discovery call is a cache hit in the common case rather than a second
+    /// live round-trip against the marketplace `/mcp` broker. `None` when
+    /// host runtime HTTP egress is absent (soft-disabled, matching
+    /// `attach_hosted_mcp_overlay`'s own fail-open-to-dark posture) — the
+    /// grant source then mints nothing, so discovered tools stay
+    /// surfaced-but-not-invocable rather than breaking the turn.
+    pub(crate) hosted_mcp_overlay: Option<Arc<dyn ironclaw_host_runtime::HostedMcpSurfaceOverlay>>,
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -1721,6 +1730,11 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         local_runtime.runtime_http_egress = Some(product_auth_runtime_ports.runtime_http_egress());
         local_runtime.extension_registry = Arc::clone(&extension_registry);
         local_runtime.shared_extension_registry = Some(services.shared_extension_registry());
+        // Reuse the SAME overlay instance `attach_hosted_mcp_overlay` (above)
+        // attached to `HostRuntime`, so `DiscoveredCapabilityGrantSource`'s
+        // discovery call shares its TTL cache/single-flight instead of
+        // doubling live marketplace `/mcp` discovery traffic.
+        local_runtime.hosted_mcp_overlay = services.hosted_mcp_overlay();
         let host_runtime_http_egress = services.host_runtime_http_egress_port();
         #[cfg(all(test, feature = "slack-v2-host-beta"))]
         let host_runtime_http_egress =
@@ -2297,6 +2311,10 @@ async fn build_local_dev_store_graph(
         audit_log,
         extension_registry: Arc::new(ExtensionRegistry::new()),
         shared_extension_registry: None,
+        // Attached post-construction below via `Arc::get_mut`, once
+        // `attach_hosted_mcp_overlay` has run — mirrors
+        // `shared_extension_registry`'s own two-step wiring.
+        hosted_mcp_overlay: None,
     });
     let process_services = ProcessServices::filesystem(Arc::clone(&scoped_filesystem));
 
@@ -2440,6 +2458,10 @@ async fn build_local_dev_store_graph(
         audit_log,
         extension_registry: Arc::new(ExtensionRegistry::new()),
         shared_extension_registry: None,
+        // Attached post-construction below via `Arc::get_mut`, once
+        // `attach_hosted_mcp_overlay` has run — mirrors
+        // `shared_extension_registry`'s own two-step wiring.
+        hosted_mcp_overlay: None,
     });
     let process_services = ProcessServices::in_memory();
 
@@ -5257,6 +5279,7 @@ mod tests {
             audit_log: Arc::clone(&base_runtime.audit_log),
             extension_registry: Arc::clone(&base_runtime.extension_registry),
             shared_extension_registry: base_runtime.shared_extension_registry.clone(),
+            hosted_mcp_overlay: base_runtime.hosted_mcp_overlay.clone(),
         })
     }
 

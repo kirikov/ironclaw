@@ -6,9 +6,9 @@ use ironclaw_extensions::{
 };
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
-    CapabilityDescriptor, CapabilityGrant, CapabilityId, Decision, DenyReason, EffectKind,
-    ExecutionContext, ResourceEstimate, RuntimeKind, canonical_json_v1,
-    runtime_policy::EffectiveRuntimePolicy, sha256_digest_token,
+    CapabilityDescriptor, CapabilityGrant, CapabilityId, Decision, EffectKind, ExecutionContext,
+    ResourceEstimate, RuntimeKind, canonical_json_v1, runtime_policy::EffectiveRuntimePolicy,
+    sha256_digest_token,
 };
 use ironclaw_trust::TrustDecision;
 use serde_json::{Value, json};
@@ -213,6 +213,11 @@ impl<'a> CapabilityCatalog<'a> {
         // buyer/operator/system/cli turns. Overlaid descriptors run through
         // the SAME per-descriptor pipeline as the floor above, and floor
         // entries win any `CapabilityId` collision.
+        // F4: which pushed entries came from the overlay, so `surface_version`
+        // below can hash them scope-stably instead of folding in
+        // discovery-health variance (`access`/presence). Populated only in
+        // this block; empty (no special-casing) for a turn with no overlay.
+        let mut overlay_capability_ids: HashSet<CapabilityId> = HashSet::new();
         if let (Some(overlay), Some(hire)) = (
             self.hosted_mcp_overlay,
             HireScope::from_scope(&request.context.resource_scope),
@@ -229,6 +234,7 @@ impl<'a> CapabilityCatalog<'a> {
                 if seen.contains(&descriptor.id) {
                     continue;
                 }
+                let capability_id = descriptor.id.clone();
                 if let Some(visible) = self
                     .evaluate_descriptor(
                         &descriptor,
@@ -239,6 +245,7 @@ impl<'a> CapabilityCatalog<'a> {
                     .await?
                 {
                     capabilities.push(visible);
+                    overlay_capability_ids.insert(capability_id);
                 }
             }
         }
@@ -248,6 +255,7 @@ impl<'a> CapabilityCatalog<'a> {
             &request,
             self.runtime_policy,
             &capabilities,
+            &overlay_capability_ids,
         )?;
         Ok(VisibleCapabilitySurface {
             version,
@@ -291,29 +299,18 @@ impl<'a> CapabilityCatalog<'a> {
             .await
         {
             Decision::Allow { .. } => VisibleCapabilityAccess::Available,
+            // A discovered hosted-MCP capability reaches `Allow` here (and
+            // then `RequireApproval` below via the profile approval gate,
+            // since it carries `default_permission = Ask` by construction —
+            // `ironclaw_extensions::hosted_mcp_discovery`) IFF composition's
+            // `DiscoveredCapabilityGrantSource` minted a real ambient grant
+            // for it into `context.grants` before this call. Askable is
+            // therefore truthful by construction from ONE source (the
+            // ambient grant) rather than a second overlay-only fail-safe
+            // arm: a discovered capability with no ambient grant hits
+            // `Deny { MissingGrant }` below and drops — visible iff
+            // invocable-after-approval, never a phantom askable affordance.
             Decision::RequireApproval { .. } if request.policy.include_requires_approval => {
-                VisibleCapabilityAccess::RequiresApproval
-            }
-            // A freshly discovered hosted-MCP capability of an already-trusted,
-            // installed provider (its `provider_trust` check passed above) has
-            // no pre-provisioned static grant: `ironclaw_authorization` matches
-            // grants by exact `CapabilityId`, and a discovered id only exists
-            // after this turn's live overlay discovery, so the grant authorizer
-            // returns `MissingGrant`. Surface it as requires-approval instead of
-            // dropping it — the visible surface is a visibility affordance, not
-            // authority (see `VisibleCapability`/`VisibleCapabilityAccess`):
-            // direct invocation re-runs host-owned trust, grants, and approval,
-            // and discovered hosted-MCP tools carry `default_permission = Ask`
-            // by construction (`ironclaw_extensions::hosted_mcp_discovery`), so
-            // "askable" is the correct affordance. Overlay-only, MissingGrant-
-            // only, and only when the surface renders askable entries; a
-            // genuinely policy-denied (`PolicyDenied`) discovered capability
-            // still drops.
-            Decision::Deny {
-                reason: DenyReason::MissingGrant,
-            } if source == DescriptorSource::Overlay
-                && request.policy.include_requires_approval =>
-            {
                 VisibleCapabilityAccess::RequiresApproval
             }
             Decision::RequireApproval { .. } | Decision::Deny { .. } => return Ok(None),
@@ -348,54 +345,15 @@ impl<'a> CapabilityCatalog<'a> {
     }
 
     /// Fetches the per-hire hosted-MCP capability surface across every
-    /// hosted-http-mcp package in the registry, budget-bounded and run
-    /// concurrently. Failure, an empty result, or the budget elapsing all
-    /// resolve to an empty `Vec` — the caller then serves the static floor
-    /// only, and (by construction, since nothing here writes state) nothing
-    /// is cached and the turn never fails.
+    /// hosted-http-mcp package in the registry. Thin wrapper over
+    /// [`discover_overlay_capabilities_for_hire`] using this catalog's own
+    /// registry — see that function for the fan-out/budget/fail-safe shape.
     async fn discover_overlay_capabilities(
         &self,
         overlay: &dyn HostedMcpSurfaceOverlay,
         hire: &HireScope,
     ) -> Vec<CapabilityDescriptor> {
-        let packages: Vec<&ExtensionPackage> = self
-            .registry
-            .extensions()
-            .filter(|package| is_hosted_http_mcp_package(package))
-            .collect();
-        if packages.is_empty() {
-            return Vec::new();
-        }
-
-        let fanout = futures_util::future::join_all(
-            packages
-                .iter()
-                .map(|package| overlay.overlay_capabilities(hire, package)),
-        );
-        match tokio::time::timeout(OVERLAY_SURFACE_BUDGET, fanout).await {
-            Ok(results) => results
-                .into_iter()
-                .zip(packages.iter())
-                .flat_map(|(result, package)| match result {
-                    Ok(descriptors) => descriptors,
-                    Err(error) => {
-                        tracing::debug!(
-                            extension_id = %package.id,
-                            error = ?error,
-                            "hosted MCP overlay discovery failed; serving static floor only"
-                        );
-                        Vec::new()
-                    }
-                })
-                .collect(),
-            Err(_) => {
-                tracing::debug!(
-                    budget_secs = OVERLAY_SURFACE_BUDGET.as_secs(),
-                    "hosted MCP overlay discovery exceeded budget; serving static floor only"
-                );
-                Vec::new()
-            }
-        }
+        discover_overlay_capabilities_for_hire(self.registry, overlay, hire).await
     }
 
     fn is_model_visible(&self, descriptor: &CapabilityDescriptor) -> bool {
@@ -449,6 +407,66 @@ impl<'a> CapabilityCatalog<'a> {
     }
 }
 
+/// Fetches the per-hire hosted-MCP capability surface across every
+/// hosted-http-mcp package in `registry`, budget-bounded and run
+/// concurrently. Failure, an empty result, or the budget elapsing all
+/// resolve to an empty `Vec` — the caller then serves the static floor
+/// only, and (by construction, since nothing here writes state) nothing is
+/// cached and the turn never fails.
+///
+/// Shared between [`CapabilityCatalog::visible_capabilities`] (this file)
+/// and `ironclaw_reborn_composition`'s `DiscoveredCapabilityGrantSource`
+/// (which needs the SAME per-hire discovered descriptors to mint ambient
+/// grants before the surface authorizer runs) and
+/// `ironclaw_host_runtime::production::resolve_invocation_registry` (which
+/// needs them to merge a discovered descriptor into a per-request registry
+/// at invoke/resume time) — one discovery call shape, three consumers, so a
+/// future change to the fan-out/budget/error-handling can't drift between
+/// them.
+pub async fn discover_overlay_capabilities_for_hire(
+    registry: &ExtensionRegistry,
+    overlay: &dyn HostedMcpSurfaceOverlay,
+    hire: &HireScope,
+) -> Vec<CapabilityDescriptor> {
+    let packages: Vec<&ExtensionPackage> = registry
+        .extensions()
+        .filter(|package| is_hosted_http_mcp_package(package))
+        .collect();
+    if packages.is_empty() {
+        return Vec::new();
+    }
+
+    let fanout = futures_util::future::join_all(
+        packages
+            .iter()
+            .map(|package| overlay.overlay_capabilities(hire, package)),
+    );
+    match tokio::time::timeout(OVERLAY_SURFACE_BUDGET, fanout).await {
+        Ok(results) => results
+            .into_iter()
+            .zip(packages.iter())
+            .flat_map(|(result, package)| match result {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    tracing::debug!(
+                        extension_id = %package.id,
+                        error = ?error,
+                        "hosted MCP overlay discovery failed; serving static floor only"
+                    );
+                    Vec::new()
+                }
+            })
+            .collect(),
+        Err(_) => {
+            tracing::debug!(
+                budget_secs = OVERLAY_SURFACE_BUDGET.as_secs(),
+                "hosted MCP overlay discovery exceeded budget; serving static floor only"
+            );
+            Vec::new()
+        }
+    }
+}
+
 async fn resolve_package_input_schema_ref(
     filesystem: &dyn RootFilesystem,
     package: &ExtensionPackage,
@@ -485,10 +503,22 @@ fn surface_version(
     request: &VisibleCapabilityRequest,
     runtime_policy: &EffectiveRuntimePolicy,
     capabilities: &[VisibleCapability],
+    overlay_capability_ids: &HashSet<CapabilityId>,
 ) -> Result<CapabilitySurfaceVersion, HostRuntimeError> {
     let context_payload = context_version_payload(request)?;
+    // F4: overlay-sourced entries are excluded from the version hash
+    // entirely — not merely reduced to their id — because their SET
+    // (which discovered ids happen to be present right now) is exactly
+    // the discovery-health-dependent state that must NOT flip the surface
+    // version between an approval gate raise and its later resume. The
+    // per-id presence check in
+    // `ironclaw_agent_loop::executor::capability_helpers::capability_is_visible`
+    // against the CURRENT surface remains the real "is this specific tool
+    // still there" authority; a genuinely revoked/removed discovered
+    // capability still fails that check and drops (fail-closed unchanged).
     let mut capability_payload = capabilities
         .iter()
+        .filter(|capability| !overlay_capability_ids.contains(&capability.descriptor.id))
         .map(|capability| {
             let descriptor = canonical_descriptor_for_version(&capability.descriptor);
             let trust = request
@@ -668,7 +698,7 @@ mod tests {
     use super::*;
     use ironclaw_authorization::GrantAuthorizer;
     use ironclaw_host_api::{
-        CapabilityId, ExtensionId, PermissionMode, TrustClass,
+        CapabilityId, DenyReason, ExtensionId, PermissionMode, TrustClass,
         runtime_policy::{
             ApprovalPolicy, AuditMode, DeploymentMode, EffectiveRuntimePolicy,
             FilesystemBackendKind, NetworkMode, ProcessBackendKind, RuntimeProfile, SecretMode,
@@ -1039,21 +1069,25 @@ output_schema_ref = "schemas/notion/fetch.output.json"
     }
 
     #[tokio::test]
-    async fn visible_capabilities_surfaces_ungranted_discovered_tool_as_requires_approval() {
-        // Regression: a genuinely-new discovered tool under a provider that
-        // already has floor grants must appear in the unioned surface. The live
-        // grant authorizer denies the discovered id with `MissingGrant` (grants
-        // are keyed by exact CapabilityId; discovered ids are never granted), so
-        // before the fix `evaluate_descriptor` dropped it — the model saw only
-        // the floor tools (visible_capability_count unchanged). It must instead
-        // surface as requires-approval (the surface is a visibility affordance;
-        // invocation re-authorizes).
+    async fn visible_capabilities_drops_ungranted_discovered_tool_instead_of_a_phantom_askable_entry()
+     {
+        // S2 regression (supersedes the deleted overlay-only MissingGrant
+        // fail-safe arm): a discovered tool with NO real ambient grant must
+        // NOT surface as askable. Before S2, `evaluate_descriptor` special-
+        // cased `Deny{MissingGrant}` for overlay-sourced descriptors into
+        // `RequiresApproval` — visible-but-uninvocable, since nothing had
+        // minted a matching grant, so an "approved" call on it would still
+        // hard-deny at invoke (`AuthorizationDenied`) instead of proceeding.
+        // Deleting that arm makes askable IFF a real ambient grant exists —
+        // the discovered tool now drops (fail-closed) exactly like an
+        // ungranted floor capability, closing the phantom-affordance gap.
         let registry = registry_with_hosted_mcp_floor();
         let runtime_policy = overlay_test_runtime_policy();
         let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
-        // Floor capability granted; the discovered `notion.live-search` is not —
-        // exactly the live shape where agent-market floor tools have grants and
-        // the discovered `echo_ping` does not.
+        // Floor capability granted; the discovered `notion.live-search` is
+        // not — no `DiscoveredCapabilityGrantSource` grant was minted into
+        // this context, matching a real turn where discovery surfaced a
+        // tool the hire was never actually granted.
         let authorizer = GrantGatedAuthorizer {
             granted: vec![CapabilityId::new("notion.notion-fetch").unwrap()],
         };
@@ -1074,18 +1108,71 @@ output_schema_ref = "schemas/notion/fetch.output.json"
 
         assert_eq!(
             surface.capabilities.len(),
-            2,
-            "floor tool + the ungranted discovered tool must both surface"
+            1,
+            "only the granted floor tool surfaces; the ungranted discovered tool drops"
         );
-        let discovered = surface
-            .capabilities
-            .iter()
-            .find(|capability| capability.descriptor.id.as_str() == "notion.live-search")
-            .expect("discovered tool must be surfaced, not dropped for MissingGrant");
+        assert!(
+            surface
+                .capabilities
+                .iter()
+                .all(|capability| capability.descriptor.id.as_str() != "notion.live-search"),
+            "an ungranted discovered tool must not appear as a phantom askable entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_version_is_stable_across_an_overlay_discovery_health_flip() {
+        // F4 regression: `surface_version` must not fold overlay-discovered
+        // content into its hash, because a fixed scope's discovered set
+        // legitimately varies with live discovery health (a transient
+        // outage, a TTL-cache miss, a marketplace revocation not yet
+        // reflected). Before the fix, an approval gate raised while the
+        // discovered tool was present would silently no-op at resume if
+        // discovery returned something different (or nothing) moments
+        // later, because `capability_is_visible`'s
+        // `call.surface_version != surface.version` check would fire on the
+        // unrelated overlay-set change. The per-id presence check downstream
+        // remains the real "is this tool still there" authority — this test
+        // only pins that the version itself is scope-stable.
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        let authorizer = AllowAllAuthorizer;
+
+        let healthy_overlay = StaticOverlay {
+            descriptors: vec![overlay_capability_descriptor(
+                "notion.live-search",
+                "discovered tool",
+            )],
+        };
+        let healthy_catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_hosted_mcp_overlay(&healthy_overlay);
+        let healthy_surface = healthy_catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("healthy discovery surface succeeds");
+        assert_eq!(healthy_surface.capabilities.len(), 2);
+
+        // Simulates a discovery-health flip: a DIFFERENT set of discovered
+        // tools (here: none at all, the discovery-failure/timeout shape) for
+        // the exact same scope/policy/floor.
+        let degraded_overlay = StaticOverlay {
+            descriptors: Vec::new(),
+        };
+        let degraded_catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_hosted_mcp_overlay(&degraded_overlay);
+        let degraded_surface = degraded_catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("degraded discovery surface succeeds");
+        assert_eq!(degraded_surface.capabilities.len(), 1);
+
         assert_eq!(
-            discovered.access,
-            VisibleCapabilityAccess::RequiresApproval,
-            "an ungranted discovered tool surfaces as askable, not directly available"
+            healthy_surface.version, degraded_surface.version,
+            "surface_version must not flip when only the overlay-discovered \
+             set changes for an unchanged floor/context/policy"
         );
     }
 

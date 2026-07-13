@@ -17,6 +17,7 @@ use ironclaw_turns::{
 
 use super::{
     LocalDevCapabilityIo, LocalDevExtensionSurfaceSource, LocalDevLoopCapabilityPortFactory,
+    discovered_capability_grants::DiscoveredCapabilityGrantSource,
 };
 
 async fn run_context(label: &str) -> LoopRunContext {
@@ -90,6 +91,8 @@ async fn local_dev_yolo_shell_translates_workspace_workdir_without_scoped_mounts
     let result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
     let factory = LocalDevLoopCapabilityPortFactory {
         runtime,
+        discovered_capability_grants: DiscoveredCapabilityGrantSource::new(None),
+        shared_extension_registry: None,
         fallback_user_id: UserId::new("local-dev-shell-user").expect("user id"),
         policy,
         workspace_mounts,

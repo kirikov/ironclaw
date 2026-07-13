@@ -450,7 +450,17 @@ impl HostRuntime for DefaultHostRuntime {
             );
         }
 
-        if let Err(error) = self.enforce_runtime_policy(&capability_id) {
+        // Per-request registry resolution (P1): the plain boot-published
+        // snapshot satisfies every floor capability at zero extra cost; only
+        // on a miss does this re-discover the caller's per-hire hosted-MCP
+        // surface and merge the matching descriptor into a throwaway,
+        // per-request clone — never written back to `self.registry`. See
+        // `resolve_invocation_registry` for the fail-safe conditions.
+        let registry = self
+            .resolve_invocation_registry(&scope, &capability_id)
+            .await;
+
+        if let Err(error) = self.enforce_runtime_policy(&registry, &capability_id) {
             tracing::debug!(
                 capability_id = %capability_id,
                 runtime_policy_error_kind = error.kind(),
@@ -465,7 +475,7 @@ impl HostRuntime for DefaultHostRuntime {
             return Ok(runtime_policy_failure(capability_id, error));
         }
 
-        let trust_decision = match self.evaluate_invocation_trust(&capability_id) {
+        let trust_decision = match self.evaluate_invocation_trust(&registry, &capability_id) {
             Ok(host_decision) => host_decision,
             Err(error) => {
                 tracing::debug!(
@@ -483,8 +493,6 @@ impl HostRuntime for DefaultHostRuntime {
             }
         };
         context.trust = trust_decision.effective_trust.class();
-
-        let registry = self.registry.snapshot();
 
         // Validate the execution context before the credential pre-flight queries
         // the secret store. Without this guard a malformed RuntimeCapabilityRequest
@@ -648,7 +656,14 @@ impl HostRuntime for DefaultHostRuntime {
             );
         }
 
-        if let Err(error) = self.enforce_runtime_policy(&capability_id) {
+        // M1: the spawn/process lane deliberately stays on the PLAIN
+        // registry snapshot, never `resolve_invocation_registry`. Discovered
+        // hosted-MCP capabilities are `runtime = Mcp`, dispatch-only, and
+        // must never become reachable by spawn — see
+        // `discovered_hosted_mcp_capability_never_reaches_spawn_lane`.
+        let registry = self.registry.snapshot();
+
+        if let Err(error) = self.enforce_runtime_policy(&registry, &capability_id) {
             tracing::debug!(
                 capability_id = %capability_id,
                 runtime_policy_error_kind = error.kind(),
@@ -657,7 +672,7 @@ impl HostRuntime for DefaultHostRuntime {
             return Ok(runtime_policy_failure(capability_id, error));
         }
 
-        let trust_decision = match self.evaluate_invocation_trust(&capability_id) {
+        let trust_decision = match self.evaluate_invocation_trust(&registry, &capability_id) {
             Ok(host_decision) => host_decision,
             Err(error) => {
                 tracing::debug!(
@@ -669,8 +684,6 @@ impl HostRuntime for DefaultHostRuntime {
             }
         };
         context.trust = trust_decision.effective_trust.class();
-
-        let registry = self.registry.snapshot();
 
         // Validate the execution context before the credential pre-flight queries
         // the secret store. Without this guard a malformed RuntimeCapabilityRequest
@@ -749,7 +762,18 @@ impl HostRuntime for DefaultHostRuntime {
             );
         }
 
-        if let Err(error) = self.enforce_runtime_policy(&capability_id) {
+        // Per-request registry resolution (C1/P1): the approve→resume path
+        // IS the success path for a discovered hosted-MCP capability (the
+        // invoke-time gate raised precisely because it needed approval).
+        // Without re-resolving here, resume dies `UnknownCapability` against
+        // the plain registry even though invoke correctly gated it. See
+        // `resolve_invocation_registry`.
+        let scope = context.resource_scope.clone();
+        let registry = self
+            .resolve_invocation_registry(&scope, &capability_id)
+            .await;
+
+        if let Err(error) = self.enforce_runtime_policy(&registry, &capability_id) {
             tracing::debug!(
                 capability_id = %capability_id,
                 runtime_policy_error_kind = error.kind(),
@@ -765,7 +789,7 @@ impl HostRuntime for DefaultHostRuntime {
             return Ok(runtime_policy_failure(capability_id, error));
         }
 
-        let trust_decision = match self.evaluate_invocation_trust(&capability_id) {
+        let trust_decision = match self.evaluate_invocation_trust(&registry, &capability_id) {
             Ok(host_decision) => host_decision,
             Err(error) => {
                 tracing::debug!(
@@ -785,7 +809,6 @@ impl HostRuntime for DefaultHostRuntime {
         };
         context.trust = trust_decision.effective_trust.class();
 
-        let registry = self.registry.snapshot();
         let host = self.capability_host(&registry);
         let resume = CapabilityResumeRequest {
             context,
@@ -852,7 +875,16 @@ impl HostRuntime for DefaultHostRuntime {
             );
         }
 
-        if let Err(error) = self.enforce_runtime_policy(&capability_id) {
+        // Per-request registry resolution (C1/P1): see `resume_capability`
+        // above — a discovered hosted-MCP capability can equally block on a
+        // credential gate (`AuthRequired`) before its approval gate, so
+        // auth-resume needs the same per-request merge.
+        let scope = context.resource_scope.clone();
+        let registry = self
+            .resolve_invocation_registry(&scope, &capability_id)
+            .await;
+
+        if let Err(error) = self.enforce_runtime_policy(&registry, &capability_id) {
             tracing::debug!(
                 capability_id = %capability_id,
                 runtime_policy_error_kind = error.kind(),
@@ -867,7 +899,7 @@ impl HostRuntime for DefaultHostRuntime {
             return Ok(runtime_policy_failure(capability_id, error));
         }
 
-        let trust_decision = match self.evaluate_invocation_trust(&capability_id) {
+        let trust_decision = match self.evaluate_invocation_trust(&registry, &capability_id) {
             Ok(host_decision) => host_decision,
             Err(error) => {
                 tracing::debug!(
@@ -886,7 +918,6 @@ impl HostRuntime for DefaultHostRuntime {
         };
         context.trust = trust_decision.effective_trust.class();
 
-        let registry = self.registry.snapshot();
         // Re-apply the persistent-approval grant on the auth-resume preflight,
         // mirroring `dispatch_capability`. The original dispatch injected this
         // grant so the authorizer returned `Allow`; the loop re-dispatches the
@@ -980,7 +1011,11 @@ impl HostRuntime for DefaultHostRuntime {
             );
         }
 
-        if let Err(error) = self.enforce_runtime_policy(&capability_id) {
+        // M1: plain registry, matching `spawn_capability` — the spawn/process
+        // lane never resolves a discovered hosted-MCP capability.
+        let registry = self.registry.snapshot();
+
+        if let Err(error) = self.enforce_runtime_policy(&registry, &capability_id) {
             tracing::debug!(
                 capability_id = %capability_id,
                 runtime_policy_error_kind = error.kind(),
@@ -996,7 +1031,7 @@ impl HostRuntime for DefaultHostRuntime {
             return Ok(runtime_policy_failure(capability_id, error));
         }
 
-        let trust_decision = match self.evaluate_invocation_trust(&capability_id) {
+        let trust_decision = match self.evaluate_invocation_trust(&registry, &capability_id) {
             Ok(host_decision) => host_decision,
             Err(error) => {
                 tracing::debug!(
@@ -1016,7 +1051,6 @@ impl HostRuntime for DefaultHostRuntime {
         };
         context.trust = trust_decision.effective_trust.class();
 
-        let registry = self.registry.snapshot();
         let host = self.capability_host(&registry);
         let resume = CapabilityResumeRequest {
             context,
@@ -1271,13 +1305,70 @@ impl DefaultHostRuntime {
         host
     }
 
+    /// Resolves the [`ExtensionRegistry`] snapshot used for one dispatch
+    /// entrypoint (invoke, resume, auth-resume). The plain boot-published
+    /// registry snapshot satisfies every floor capability at zero extra
+    /// cost — only an `Arc` refcount bump, never a struct clone. Only on a
+    /// registry MISS — and only when the scope carries an `agent_id`
+    /// (`HireScope::from_scope`) and a hosted-MCP overlay is attached —
+    /// this re-discovers the caller's per-hire hosted-MCP surface and
+    /// merges the matching descriptor into a PER-REQUEST clone. That clone
+    /// is never written back to `self.registry` (the shared boot
+    /// registry): each call gets its own throwaway `ExtensionRegistry`, so
+    /// a discovered capability is resolvable for this dispatch only, never
+    /// leaks across tenants, and never touches the global registry commit
+    /// path.
+    ///
+    /// Fail-safe: overlay absent, scope has no `agent_id`, discovery times
+    /// out/errors, no discovered descriptor matches `capability_id`, or the
+    /// merge itself fails consistency validation — all fall through to the
+    /// unchanged plain snapshot, i.e. the existing `UnknownCapability` path.
+    /// Deliberately NOT called from the spawn/resume-spawn lane (M1):
+    /// discovered hosted-MCP capabilities are `runtime = Mcp`,
+    /// dispatch-only, and must stay unreachable by spawn.
+    async fn resolve_invocation_registry(
+        &self,
+        scope: &ResourceScope,
+        capability_id: &CapabilityId,
+    ) -> Arc<ExtensionRegistry> {
+        let registry = self.registry.snapshot();
+        if registry.get_capability(capability_id).is_some() {
+            return registry;
+        }
+        let Some(overlay) = self.hosted_mcp_overlay.as_deref() else {
+            return registry;
+        };
+        let Some(hire) = crate::HireScope::from_scope(scope) else {
+            return registry;
+        };
+        let discovered =
+            crate::discover_overlay_capabilities_for_hire(&registry, overlay, &hire).await;
+        let Some(descriptor) = discovered
+            .into_iter()
+            .find(|descriptor| &descriptor.id == capability_id)
+        else {
+            return registry;
+        };
+        match registry.merge_discovered_capability(descriptor) {
+            Ok(merged) => Arc::new(merged),
+            Err(error) => {
+                tracing::debug!(
+                    capability_id = %capability_id,
+                    error = %error,
+                    "discovered hosted-MCP capability could not be merged into the per-request registry"
+                );
+                registry
+            }
+        }
+    }
+
     fn evaluate_invocation_trust(
         &self,
+        registry: &ExtensionRegistry,
         capability_id: &CapabilityId,
     ) -> Result<TrustDecision, TrustEvaluationError> {
         let policy = self.trust_policy.as_ref();
 
-        let registry = self.registry.snapshot();
         let descriptor = registry
             .get_capability(capability_id)
             .ok_or(TrustEvaluationError::UnknownCapability)?;
@@ -1311,9 +1402,9 @@ impl DefaultHostRuntime {
 
     fn enforce_runtime_policy(
         &self,
+        registry: &ExtensionRegistry,
         capability_id: &CapabilityId,
     ) -> Result<(), RuntimePolicyEvaluationError> {
-        let registry = self.registry.snapshot();
         let descriptor = registry
             .get_capability(capability_id)
             .ok_or(RuntimePolicyEvaluationError::UnknownCapability)?;
@@ -2430,9 +2521,13 @@ mod tests {
         use super::*;
         use crate::{CapabilitySurfacePolicy, HireScope, HostedMcpOverlayError, SurfaceKind};
         use ironclaw_host_api::{
-            AgentId, CapabilityDescriptor, CapabilityDispatchRequest, CapabilityDispatchResult,
-            DispatchError, EffectKind, ExecutionContext, Obligations, ProjectId, TenantId, UserId,
+            Action, AgentId, ApprovalRequest, CapabilityDescriptor, CapabilityDispatchRequest,
+            CapabilityDispatchResult, DispatchError, EffectKind, ExecutionContext,
+            GrantConstraints, MountView, NetworkPolicy, Obligations, ProjectId, ReservationStatus,
+            ResourceReceipt, ResourceReservationId, ResourceUsage, TenantId, UserId,
         };
+        use ironclaw_run_state::{InMemoryApprovalRequestStore, InMemoryRunStateStore};
+        use std::sync::Mutex as StdMutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct UnusedDispatcher;
@@ -2698,6 +2793,581 @@ output_schema_ref = "schemas/notion/fetch.output.json"
                     && has_id(&surface_b, "notion.notion-fetch"),
                 "the static floor must still be present for both agents"
             );
+        }
+
+        fn discovered_descriptor(id: &str) -> CapabilityDescriptor {
+            CapabilityDescriptor {
+                id: CapabilityId::new(id).unwrap(),
+                provider: ExtensionId::new("notion").unwrap(),
+                runtime: RuntimeKind::Mcp,
+                trust_ceiling: ironclaw_host_api::TrustClass::UserTrusted,
+                description: "discovered tool".to_string(),
+                parameters_schema: serde_json::json!({"type": "object"}),
+                effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
+                default_permission: ironclaw_host_api::PermissionMode::Ask,
+                runtime_credentials: Vec::new(),
+                resource_profile: None,
+            }
+        }
+
+        fn runtime_with_overlay(overlay: Arc<dyn HostedMcpSurfaceOverlay>) -> DefaultHostRuntime {
+            let registry = Arc::new(hosted_mcp_registry());
+            let dispatcher: Arc<dyn CapabilityDispatcher> = Arc::new(UnusedDispatcher);
+            let authorizer: Arc<dyn TrustAwareCapabilityDispatchAuthorizer> =
+                Arc::new(AllowAllAuthorizer);
+            DefaultHostRuntime::new(
+                registry,
+                dispatcher,
+                authorizer,
+                CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+                test_runtime_policy(),
+            )
+            .with_hosted_mcp_overlay(overlay)
+        }
+
+        fn agent_scope(agent: &str) -> ResourceScope {
+            agent_scoped_request(agent).context.resource_scope
+        }
+
+        /// P1 unit coverage for `resolve_invocation_registry`: a floor
+        /// capability resolves via the plain snapshot at zero extra cost —
+        /// same `Arc` pointer, not a clone.
+        #[tokio::test]
+        async fn resolve_invocation_registry_returns_plain_snapshot_for_a_floor_hit() {
+            let overlay = Arc::new(SpyOverlay {
+                calls: AtomicUsize::new(0),
+            });
+            let runtime = runtime_with_overlay(overlay.clone());
+
+            let resolved = runtime
+                .resolve_invocation_registry(
+                    &agent_scope("agent-1"),
+                    &CapabilityId::new("notion.notion-fetch").unwrap(),
+                )
+                .await;
+
+            assert!(
+                Arc::ptr_eq(&resolved, &runtime.registry.snapshot()),
+                "a floor hit must return the SAME registry Arc — zero clone cost"
+            );
+            assert_eq!(
+                overlay.calls.load(Ordering::SeqCst),
+                0,
+                "a floor hit must never consult the overlay"
+            );
+        }
+
+        /// P1 unit coverage: a discovered capability id (registry miss) is
+        /// resolved into a per-request merged registry, without ever
+        /// mutating the shared boot registry.
+        #[tokio::test]
+        async fn resolve_invocation_registry_merges_a_discovered_capability_on_miss() {
+            struct OneToolOverlay;
+
+            #[async_trait]
+            impl HostedMcpSurfaceOverlay for OneToolOverlay {
+                async fn overlay_capabilities(
+                    &self,
+                    _hire: &HireScope,
+                    _package: &ExtensionPackage,
+                ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+                    Ok(vec![discovered_descriptor("notion.live-search")])
+                }
+            }
+
+            let runtime = runtime_with_overlay(Arc::new(OneToolOverlay));
+            let capability_id = CapabilityId::new("notion.live-search").unwrap();
+
+            let resolved = runtime
+                .resolve_invocation_registry(&agent_scope("agent-1"), &capability_id)
+                .await;
+
+            assert!(
+                resolved.get_capability(&capability_id).is_some(),
+                "the discovered capability must be resolvable in the merged registry"
+            );
+            assert!(
+                runtime
+                    .registry
+                    .snapshot()
+                    .get_capability(&capability_id)
+                    .is_none(),
+                "the shared boot registry must never be mutated by resolution"
+            );
+        }
+
+        /// Fail-safe: no `agent_id` on scope (`HireScope::from_scope` is
+        /// `None`) must fall through to the plain snapshot without
+        /// consulting the overlay — the existing `UnknownCapability` path.
+        #[tokio::test]
+        async fn resolve_invocation_registry_falls_back_without_an_agent_scope() {
+            let overlay = Arc::new(SpyOverlay {
+                calls: AtomicUsize::new(0),
+            });
+            let runtime = runtime_with_overlay(overlay.clone());
+            let mut scope = agent_scope("agent-1");
+            scope.agent_id = None;
+
+            let resolved = runtime
+                .resolve_invocation_registry(
+                    &scope,
+                    &CapabilityId::new("notion.live-search").unwrap(),
+                )
+                .await;
+
+            assert!(
+                resolved
+                    .get_capability(&CapabilityId::new("notion.live-search").unwrap())
+                    .is_none()
+            );
+            assert_eq!(
+                overlay.calls.load(Ordering::SeqCst),
+                0,
+                "no agent_id must never consult the overlay (leak gate)"
+            );
+        }
+
+        /// Fail-safe: a genuinely-unknown capability id (not in the floor,
+        /// not returned by discovery) falls back to the plain snapshot —
+        /// still `UnknownCapability`, never a hang or a panic.
+        #[tokio::test]
+        async fn resolve_invocation_registry_falls_back_when_nothing_matches() {
+            let runtime = runtime_with_overlay(Arc::new(SpyOverlay {
+                calls: AtomicUsize::new(0),
+            }));
+
+            let resolved = runtime
+                .resolve_invocation_registry(
+                    &agent_scope("agent-1"),
+                    &CapabilityId::new("notion.hallucinated-tool").unwrap(),
+                )
+                .await;
+
+            assert!(
+                resolved
+                    .get_capability(&CapabilityId::new("notion.hallucinated-tool").unwrap())
+                    .is_none()
+            );
+        }
+
+        /// Multi-tenant isolation AT INVOKE (not just at surface build):
+        /// worker A's `resolve_invocation_registry` never resolves worker
+        /// B's discovered tool, and vice versa, each built from an
+        /// independently-constructed scope — matching
+        /// `multi_tenant_turns_see_only_their_own_overlay_capabilities`'s
+        /// discipline but for the invoke-time resolution path this slice
+        /// adds. Isolation here is structural: `PerAgentOverlay` keys its
+        /// response purely off `hire.agent_id()`, so a leak would mean
+        /// `HireScope`/`resource_scope.agent_id` itself was coalesced
+        /// upstream — exactly the regression this test would catch first.
+        #[tokio::test]
+        async fn resolve_invocation_registry_isolates_discovered_capabilities_across_agents() {
+            struct PerAgentOverlay;
+
+            #[async_trait]
+            impl HostedMcpSurfaceOverlay for PerAgentOverlay {
+                async fn overlay_capabilities(
+                    &self,
+                    hire: &HireScope,
+                    _package: &ExtensionPackage,
+                ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+                    let agent = hire.agent_id().as_str();
+                    Ok(vec![discovered_descriptor(&format!(
+                        "notion.tool-for-{agent}"
+                    ))])
+                }
+            }
+
+            let runtime = runtime_with_overlay(Arc::new(PerAgentOverlay));
+
+            let resolved_a = runtime
+                .resolve_invocation_registry(
+                    &agent_scope("agent-a"),
+                    &CapabilityId::new("notion.tool-for-agent-a").unwrap(),
+                )
+                .await;
+            let resolved_b = runtime
+                .resolve_invocation_registry(
+                    &agent_scope("agent-b"),
+                    &CapabilityId::new("notion.tool-for-agent-b").unwrap(),
+                )
+                .await;
+
+            assert!(
+                resolved_a
+                    .get_capability(&CapabilityId::new("notion.tool-for-agent-a").unwrap())
+                    .is_some(),
+                "agent-a must resolve its own discovered tool"
+            );
+            assert!(
+                resolved_a
+                    .get_capability(&CapabilityId::new("notion.tool-for-agent-b").unwrap())
+                    .is_none(),
+                "agent-a's registry must NOT resolve agent-b's discovered tool id, \
+                 even though agent-a's own resolution ran against the SAME base \
+                 registry/overlay pair"
+            );
+            assert!(
+                resolved_b
+                    .get_capability(&CapabilityId::new("notion.tool-for-agent-b").unwrap())
+                    .is_some(),
+                "agent-b must resolve its own discovered tool"
+            );
+            assert!(
+                resolved_b
+                    .get_capability(&CapabilityId::new("notion.tool-for-agent-a").unwrap())
+                    .is_none(),
+                "agent-b's registry must NOT resolve agent-a's discovered tool id"
+            );
+            // Cross-check: worker A attempting to invoke worker B's id directly
+            // (not just omitted from A's own successful resolution) also
+            // fails to resolve — this is the actual invoke-time attack shape.
+            let cross_attempt = runtime
+                .resolve_invocation_registry(
+                    &agent_scope("agent-a"),
+                    &CapabilityId::new("notion.tool-for-agent-b").unwrap(),
+                )
+                .await;
+            assert!(
+                cross_attempt
+                    .get_capability(&CapabilityId::new("notion.tool-for-agent-b").unwrap())
+                    .is_none(),
+                "worker A must not be able to resolve worker B's discovered \
+                 capability id even by naming it directly"
+            );
+        }
+
+        /// M1 negative: a discovered hosted-MCP capability is `runtime =
+        /// Mcp`, dispatch-only, and must never become reachable by
+        /// `spawn_capability` — that lane deliberately stays on the plain
+        /// registry snapshot (never calls `resolve_invocation_registry`),
+        /// so a discovered id is `UnknownCapability` there regardless of
+        /// what invoke/resume can resolve.
+        #[tokio::test]
+        async fn discovered_hosted_mcp_capability_never_reaches_spawn_lane() {
+            struct OneToolOverlay;
+
+            #[async_trait]
+            impl HostedMcpSurfaceOverlay for OneToolOverlay {
+                async fn overlay_capabilities(
+                    &self,
+                    _hire: &HireScope,
+                    _package: &ExtensionPackage,
+                ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+                    Ok(vec![discovered_descriptor("notion.live-search")])
+                }
+            }
+
+            let runtime = runtime_with_overlay(Arc::new(OneToolOverlay));
+            let capability_id = CapabilityId::new("notion.live-search").unwrap();
+
+            // Sanity: invoke-side resolution DOES find it (proves the overlay
+            // wiring itself is live, so the spawn-lane negative below is
+            // meaningful rather than vacuous).
+            let invoke_side = runtime
+                .resolve_invocation_registry(&agent_scope("agent-1"), &capability_id)
+                .await;
+            assert!(invoke_side.get_capability(&capability_id).is_some());
+
+            // Spawn's own plain snapshot never sees it.
+            assert!(
+                runtime
+                    .registry
+                    .snapshot()
+                    .get_capability(&capability_id)
+                    .is_none(),
+                "the plain registry snapshot spawn_capability/resume_spawn_capability \
+                 use must never resolve a discovered hosted-MCP capability"
+            );
+        }
+
+        /// Records every `CapabilityDispatchRequest` it receives and returns a
+        /// canned success — the "did the dispatcher actually see the merged
+        /// descriptor" probe for the C1 regression below.
+        struct SpyDispatcher {
+            recorded: StdMutex<Vec<CapabilityDispatchRequest>>,
+        }
+
+        impl SpyDispatcher {
+            fn new() -> Self {
+                Self {
+                    recorded: StdMutex::new(Vec::new()),
+                }
+            }
+
+            fn last_request(&self) -> CapabilityDispatchRequest {
+                self.recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .last()
+                    .cloned()
+                    .expect("dispatch_json must have been called")
+            }
+        }
+
+        #[async_trait]
+        impl CapabilityDispatcher for SpyDispatcher {
+            async fn dispatch_json(
+                &self,
+                request: CapabilityDispatchRequest,
+            ) -> Result<CapabilityDispatchResult, DispatchError> {
+                let capability_id = request.capability_id.clone();
+                let scope = request.scope.clone();
+                self.recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(request);
+                Ok(CapabilityDispatchResult {
+                    capability_id,
+                    provider: ExtensionId::new("notion").unwrap(),
+                    runtime: RuntimeKind::Mcp,
+                    output: serde_json::json!({"result": "ok"}),
+                    display_preview: None,
+                    usage: ResourceUsage::default(),
+                    receipt: ResourceReceipt {
+                        id: ResourceReservationId::new(),
+                        scope,
+                        status: ReservationStatus::Reconciled,
+                        estimate: ResourceEstimate::default(),
+                        actual: None,
+                    },
+                })
+            }
+        }
+
+        /// Gates the FIRST dispatch attempt on an empty grant set (the shape
+        /// invoke sees, before approval) and delegates to the real
+        /// `GrantAuthorizer` once a grant is present (the shape resume sees,
+        /// after `CapabilityHost::resume_json` injects the approved lease's
+        /// grant into the authorized context) — mirrors
+        /// `reborn_e2e_gate.rs`'s `ApprovalThenGrantAuthorizer` for the
+        /// discovered-capability path.
+        struct GateThenGrantAuthorizer;
+
+        #[async_trait]
+        impl TrustAwareCapabilityDispatchAuthorizer for GateThenGrantAuthorizer {
+            async fn authorize_dispatch_with_trust(
+                &self,
+                context: &ExecutionContext,
+                descriptor: &CapabilityDescriptor,
+                estimate: &ResourceEstimate,
+                trust_decision: &ironclaw_trust::TrustDecision,
+            ) -> Decision {
+                if context.grants.grants.is_empty() {
+                    Decision::RequireApproval {
+                        request: ApprovalRequest {
+                            id: ApprovalRequestId::new(),
+                            correlation_id: context.correlation_id,
+                            requested_by: Principal::Extension(context.extension_id.clone()),
+                            action: Box::new(Action::Dispatch {
+                                capability: descriptor.id.clone(),
+                                estimated_resources: estimate.clone(),
+                            }),
+                            invocation_fingerprint: None,
+                            reason: "approval required".to_string(),
+                            reusable_scope: None,
+                        },
+                    }
+                } else {
+                    ironclaw_authorization::GrantAuthorizer::new()
+                        .authorize_dispatch_with_trust(
+                            context,
+                            descriptor,
+                            estimate,
+                            trust_decision,
+                        )
+                        .await
+                }
+            }
+        }
+
+        fn discovered_capability_trust_policy() -> ironclaw_trust::HostTrustPolicy {
+            ironclaw_trust::HostTrustPolicy::new(vec![Box::new(
+                ironclaw_trust::AdminConfig::with_entries(vec![
+                    ironclaw_trust::AdminEntry::for_local_manifest(
+                        ironclaw_host_api::PackageId::new("notion").unwrap(),
+                        "/system/extensions/notion/manifest.toml".to_string(),
+                        None,
+                        ironclaw_trust::HostTrustAssignment::user_trusted(),
+                        vec![EffectKind::DispatchCapability],
+                        None,
+                    ),
+                ]),
+            )])
+            .unwrap()
+        }
+
+        fn discovered_capability_trust_decision() -> ironclaw_trust::TrustDecision {
+            ironclaw_trust::TrustDecision {
+                effective_trust: ironclaw_trust::EffectiveTrustClass::user_trusted(),
+                authority_ceiling: ironclaw_trust::AuthorityCeiling {
+                    allowed_effects: vec![EffectKind::DispatchCapability],
+                    max_resource_ceiling: None,
+                },
+                provenance: ironclaw_trust::TrustProvenance::Default,
+                evaluated_at: chrono::Utc::now(),
+            }
+        }
+
+        /// C1 wired regression (review item 1): drives the REAL
+        /// invoke -> approve -> resume sequence for a DISCOVERED hosted-MCP
+        /// capability through `DefaultHostRuntime` end to end — the exact bug
+        /// this slice fixes (`UnknownCapability` at both preflights) is
+        /// provable only by driving the caller, not by reading
+        /// `resolve_invocation_registry` in isolation. A dispatch-only
+        /// `SpyDispatcher` stands in for the real MCP runtime adapter (which
+        /// needs the integration-tier harness, tracked separately) but still
+        /// proves the load-bearing claim: the dispatcher receives
+        /// `descriptor: Some(..)` — i.e. the MERGED per-request descriptor
+        /// threaded all the way through, not a silent registry re-resolve
+        /// that would have failed `UnknownCapability` on its own.
+        ///
+        /// Deliberately does NOT reuse the `runtime_with_overlay` helper
+        /// above (which wires `AllowAllAuthorizer`): this test's whole point
+        /// is proving invoke raises a real `RequireApproval` gate — an
+        /// always-`Allow` authorizer would never produce one, so the C1
+        /// regression (resume re-resolving the plain registry and failing
+        /// `UnknownCapability`) couldn't be exercised. `GateThenGrantAuthorizer`
+        /// below reproduces the two authorization shapes invoke/resume
+        /// actually see (empty grants -> gate; grant present -> real
+        /// `GrantAuthorizer`).
+        #[tokio::test]
+        async fn discovered_capability_invoke_approve_resume_completes_through_merged_registry() {
+            struct OneToolOverlay;
+
+            #[async_trait]
+            impl HostedMcpSurfaceOverlay for OneToolOverlay {
+                async fn overlay_capabilities(
+                    &self,
+                    _hire: &HireScope,
+                    _package: &ExtensionPackage,
+                ) -> Result<Vec<CapabilityDescriptor>, HostedMcpOverlayError> {
+                    // DispatchCapability-only (no Network/secrets): keeps this
+                    // fixture obligation-free (no `ApplyNetworkPolicy` /
+                    // `InjectSecretOnce`), which needs no
+                    // `CapabilityObligationHandler` wiring — this test is
+                    // about the invoke/resume descriptor-resolution wiring,
+                    // not obligation handling (covered elsewhere).
+                    Ok(vec![CapabilityDescriptor {
+                        id: CapabilityId::new("notion.live-search").unwrap(),
+                        provider: ExtensionId::new("notion").unwrap(),
+                        runtime: RuntimeKind::Mcp,
+                        trust_ceiling: ironclaw_host_api::TrustClass::UserTrusted,
+                        description: "discovered tool".to_string(),
+                        parameters_schema: serde_json::json!({"type": "object"}),
+                        effects: vec![EffectKind::DispatchCapability],
+                        default_permission: ironclaw_host_api::PermissionMode::Ask,
+                        runtime_credentials: Vec::new(),
+                        resource_profile: None,
+                    }])
+                }
+            }
+
+            let registry = Arc::new(hosted_mcp_registry());
+            let dispatcher = Arc::new(SpyDispatcher::new());
+            let run_state = Arc::new(InMemoryRunStateStore::new());
+            let approval_requests = Arc::new(InMemoryApprovalRequestStore::new());
+            let capability_leases =
+                Arc::new(ironclaw_authorization::InMemoryCapabilityLeaseStore::new());
+            let runtime = DefaultHostRuntime::new(
+                registry,
+                dispatcher.clone() as Arc<dyn CapabilityDispatcher>,
+                Arc::new(GateThenGrantAuthorizer)
+                    as Arc<dyn TrustAwareCapabilityDispatchAuthorizer>,
+                CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+                test_runtime_policy(),
+            )
+            .with_trust_policy(Arc::new(discovered_capability_trust_policy()))
+            .with_run_state(run_state)
+            .with_approval_requests(
+                Arc::clone(&approval_requests) as Arc<dyn ironclaw_run_state::ApprovalRequestStore>
+            )
+            .with_capability_leases(Arc::clone(&capability_leases) as Arc<dyn CapabilityLeaseStore>)
+            .with_hosted_mcp_overlay(Arc::new(OneToolOverlay));
+
+            let capability_id = CapabilityId::new("notion.live-search").unwrap();
+            let context = agent_scoped_request("agent-1").context;
+            let scope = context.resource_scope.clone();
+            let estimate = ResourceEstimate::default();
+            let input = serde_json::json!({"query": "reborn invoke-path"});
+
+            let invoked = runtime
+                .invoke_capability(RuntimeCapabilityRequest::new(
+                    context.clone(),
+                    capability_id.clone(),
+                    estimate.clone(),
+                    input.clone(),
+                    discovered_capability_trust_decision(),
+                ))
+                .await
+                .expect("invoke must not error");
+            let gate = match invoked {
+                RuntimeCapabilityOutcome::ApprovalRequired(gate) => gate,
+                other => panic!(
+                    "expected an approval gate for a discovered Ask-permission \
+                     capability, not {other:?} — a Failed{{UnknownCapability}} here \
+                     means the per-request registry merge regressed"
+                ),
+            };
+
+            let lease = ironclaw_approvals::ApprovalResolver::new(
+                approval_requests.as_ref(),
+                capability_leases.as_ref(),
+            )
+            .approve_dispatch(
+                &scope,
+                gate.approval_request_id,
+                ironclaw_approvals::LeaseApproval {
+                    issued_by: Principal::HostRuntime,
+                    constraints: GrantConstraints {
+                        allowed_effects: vec![EffectKind::DispatchCapability],
+                        mounts: MountView::default(),
+                        network: NetworkPolicy::default(),
+                        secrets: Vec::new(),
+                        resource_ceiling: None,
+                        expires_at: None,
+                        max_invocations: Some(1),
+                    },
+                },
+            )
+            .await
+            .expect("approval must issue a one-shot lease");
+            assert_eq!(lease.grant.capability, capability_id);
+
+            let resumed = runtime
+                .resume_capability(RuntimeCapabilityResumeRequest::new(
+                    context,
+                    gate.approval_request_id,
+                    capability_id.clone(),
+                    estimate,
+                    input,
+                    discovered_capability_trust_decision(),
+                ))
+                .await
+                .expect("resume must not error");
+            match resumed {
+                RuntimeCapabilityOutcome::Completed(completed) => {
+                    assert_eq!(completed.capability_id, capability_id);
+                }
+                other => panic!(
+                    "expected the approved discovered capability to complete, \
+                     not {other:?} — this is the C1 bug this slice fixes: \
+                     resume re-resolving the PLAIN registry would fail \
+                     UnknownCapability even though invoke correctly gated it"
+                ),
+            }
+
+            // The load-bearing assertion: the dispatcher received the MERGED
+            // descriptor, proving `resolve_invocation_registry` threaded all
+            // the way through resume into the `CapabilityDispatchRequest` —
+            // not just that SOME success outcome came back.
+            let dispatched = dispatcher.last_request();
+            assert_eq!(dispatched.capability_id, capability_id);
+            let received_descriptor = dispatched
+                .descriptor
+                .expect("the dispatcher must receive the per-request merged descriptor");
+            assert_eq!(received_descriptor.id, capability_id);
+            assert_eq!(received_descriptor.runtime, RuntimeKind::Mcp);
         }
     }
 

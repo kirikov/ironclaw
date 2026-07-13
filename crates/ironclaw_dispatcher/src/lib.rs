@@ -230,7 +230,19 @@ where
         .await?;
 
         let registry = self.registry.snapshot();
-        let descriptor = match registry.get_capability(&request.capability_id).cloned() {
+        // Prefer the caller-supplied descriptor when present: the caller (a
+        // `CapabilityHost` invoke/resume path) already resolved and
+        // authorized against it from a per-request registry that may carry
+        // a discovered hosted-MCP descriptor never written into this
+        // dispatcher's own (shared, boot-published) registry snapshot. The
+        // provider package lookup below still hits this registry — the
+        // provider extension itself is always a real installed package;
+        // only the discovered capability id is per-request-only.
+        let descriptor = match request
+            .descriptor
+            .take()
+            .or_else(|| registry.get_capability(&request.capability_id).cloned())
+        {
             Some(descriptor) => descriptor,
             None => {
                 let error = DispatchError::UnknownCapability {

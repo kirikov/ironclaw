@@ -498,6 +498,13 @@ where
         let dispatch = match self
             .dispatcher
             .dispatch_json(CapabilityDispatchRequest {
+                // Carry the descriptor this host already resolved and
+                // authorized against, so the dispatcher does not need to
+                // re-resolve `capability_id` from its own (shared,
+                // boot-published) registry snapshot — the descriptor may
+                // only exist in the per-request registry `self.registry`
+                // was resolved from (a discovered hosted-MCP capability).
+                descriptor: Some(descriptor.clone()),
                 capability_id: request.capability_id.clone(),
                 scope: scope.clone(),
                 estimate: request.estimate.clone(),
@@ -1897,6 +1904,11 @@ where
         let dispatch = match self
             .dispatcher
             .dispatch_json(CapabilityDispatchRequest {
+                // See the invoke-path construction site above: carries the
+                // descriptor this resume already resolved/authorized
+                // against, which may only exist in the per-request registry
+                // (a discovered hosted-MCP capability).
+                descriptor: Some(descriptor.clone()),
                 capability_id: capability_id.clone(),
                 scope: scope.clone(),
                 estimate: estimate.clone(),

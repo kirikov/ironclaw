@@ -6,6 +6,7 @@ mod tests {
 
     use super::super::*;
 
+    use crate::extension_host::extension_lifecycle::ActiveExtensionCapability;
     use ironclaw_approvals::{
         ApprovalResolver, CapabilityPermissionOverrideStore, PersistentApprovalAction,
         PersistentApprovalPolicyInput, PersistentApprovalPolicyStore, ToolPermissionOverride,
@@ -184,6 +185,7 @@ mod tests {
                 system_extensions_lifecycle_mounts: &empty_mounts,
                 policy: &policy,
                 extension_surface: &LocalDevExtensionSurface::default(),
+                discovered_grants: &[],
             },
         )
         .expect("visible request")
@@ -1280,6 +1282,8 @@ mod tests {
         );
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
+            discovered_capability_grants: crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(None),
+            shared_extension_registry: None,
             fallback_user_id: UserId::new("skill-activate-user").expect("user id"),
             policy,
             workspace_mounts: local_runtime.workspace_mounts.clone(),
@@ -1425,6 +1429,269 @@ mod tests {
         );
     }
 
+    fn notion_hosted_mcp_package_for_test() -> ironclaw_extensions::ExtensionPackage {
+        const MANIFEST: &str = r#"
+schema_version = "reborn.extension_manifest.v2"
+id = "notion"
+name = "Notion"
+version = "1.0.0"
+description = "test hosted mcp"
+trust = "third_party"
+
+[runtime]
+kind = "mcp"
+transport = "http"
+url = "https://mcp.notion.com/mcp"
+
+[[capabilities]]
+id = "notion.notion-fetch"
+description = "floor capability"
+effects = ["dispatch_capability", "network"]
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/notion/fetch.input.json"
+output_schema_ref = "schemas/notion/fetch.output.json"
+"#;
+        let manifest = ironclaw_extensions::ExtensionManifest::parse(
+            MANIFEST,
+            ironclaw_extensions::ManifestSource::HostBundled,
+            &ironclaw_host_api::HostPortCatalog::default(),
+        )
+        .expect("manifest parses");
+        ironclaw_extensions::ExtensionPackage::from_manifest(
+            manifest,
+            ironclaw_host_api::VirtualPath::new("/system/extensions/notion").expect("root"),
+        )
+        .expect("package builds")
+    }
+
+    fn discovered_descriptor_for_test(
+        id: &str,
+        permission: ironclaw_host_api::PermissionMode,
+    ) -> ironclaw_host_api::CapabilityDescriptor {
+        ironclaw_host_api::CapabilityDescriptor {
+            id: CapabilityId::new(id).expect("capability id"),
+            provider: ExtensionId::new("notion").expect("provider id"),
+            runtime: ironclaw_host_api::RuntimeKind::Mcp,
+            trust_ceiling: ironclaw_host_api::TrustClass::UserTrusted,
+            description: "discovered tool".to_string(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![EffectKind::DispatchCapability],
+            default_permission: permission,
+            runtime_credentials: Vec::new(),
+            resource_profile: None,
+        }
+    }
+
+    struct AskAndNonAskOverlay;
+
+    #[async_trait::async_trait]
+    impl ironclaw_host_runtime::HostedMcpSurfaceOverlay for AskAndNonAskOverlay {
+        async fn overlay_capabilities(
+            &self,
+            _hire: &ironclaw_host_runtime::HireScope,
+            _package: &ironclaw_extensions::ExtensionPackage,
+        ) -> Result<
+            Vec<ironclaw_host_api::CapabilityDescriptor>,
+            ironclaw_host_runtime::HostedMcpOverlayError,
+        > {
+            Ok(vec![
+                discovered_descriptor_for_test(
+                    "notion.live-search",
+                    ironclaw_host_api::PermissionMode::Ask,
+                ),
+                discovered_descriptor_for_test(
+                    "notion.auto-sync",
+                    ironclaw_host_api::PermissionMode::Allow,
+                ),
+            ])
+        }
+    }
+
+    /// Test-through-the-caller (review item 4): every OTHER caller-level test
+    /// in this file constructs `DiscoveredCapabilityGrantSource::new(None)` —
+    /// no overlay attached — so the Ask/non-Ask mint behavior
+    /// (`grants_for_scope`'s own unit tests in `discovered_capability_grants.rs`)
+    /// was never proven to actually flow through
+    /// `RefreshingLocalDevCapabilityPort::build_inner` into a real surface.
+    /// Drives the real `LocalDevLoopCapabilityPortFactory` /
+    /// `RefreshingLocalDevCapabilityPort::build_inner` path (same shape as
+    /// every other caller-level test in this file), with the fake overlay
+    /// attached to BOTH consultation sites production keeps in sync:
+    /// `discovered_capability_grants` (ambient-grant minting) and a
+    /// `DefaultHostRuntime.hosted_mcp_overlay` (the surface's own
+    /// overlay-discovery block, `CapabilityCatalog::visible_capabilities` in
+    /// `ironclaw_host_runtime::surface`). `services.host_runtime` from
+    /// `build_reborn_services` can't be reused for the latter — its overlay is
+    /// soft-disabled without HTTP egress in this local-dev test build — so
+    /// this test builds its own `DefaultHostRuntime` over the same shared
+    /// registry, wired with the real production local-dev authorizer
+    /// (`local_dev_authorizer`) and resolved runtime policy, bypassing only
+    /// the HTTP-egress-gated `attach_hosted_mcp_overlay` transport wiring
+    /// (out of scope here — this test is about the grant-mint -> surface
+    /// wiring, not live discovery transport).
+    #[tokio::test]
+    async fn build_inner_mints_ambient_grant_for_ask_discovered_capability_and_drops_non_ask() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("local-dev");
+        let services = crate::build_reborn_services(crate::RebornBuildInput::local_dev(
+            "local-dev-discovered-cap-owner",
+            storage_root,
+        ))
+        .await
+        .expect("local-dev services build");
+        let local_runtime = services
+            .local_runtime
+            .as_ref()
+            .expect("local runtime substrate");
+
+        // `build_reborn_services` always populates `shared_extension_registry`,
+        // but `hosted_mcp_overlay` is soft-disabled without host runtime HTTP
+        // egress (none wired in this local-dev test build) — `services.host_runtime`
+        // was already built with `hosted_mcp_overlay: None`, so the SURFACE's own
+        // overlay-discovery block (`CapabilityCatalog::visible_capabilities`,
+        // `crates/ironclaw_host_runtime/src/surface.rs`) never fires against
+        // `services.host_runtime` regardless of what's attached to
+        // `discovered_capability_grants` below — that field only feeds ambient
+        // grant minting, a SEPARATE consultation of the overlay from the surface's
+        // own discovery loop (production reuses one overlay instance between the
+        // two; this test attaches the SAME fake to both to mirror that). So this
+        // test builds its own `DefaultHostRuntime` with the fake overlay attached,
+        // reusing the real registry + the real production local-dev authorizer
+        // (`local_dev_authorizer`) and runtime policy resolution so authorization
+        // still runs through production logic — only the overlay and dispatcher
+        // (never invoked by `visible_capabilities`) are test doubles.
+        let shared_registry = local_runtime
+            .shared_extension_registry
+            .clone()
+            .expect("shared registry is always populated by build_reborn_services");
+        shared_registry
+            .upsert(notion_hosted_mcp_package_for_test())
+            .expect("seed hosted-mcp provider package");
+
+        let run_context = run_context("discovered-cap-caller").await;
+        let policy = Arc::new(
+            crate::local_dev_capability_policy::local_dev_capability_policy()
+                .expect("policy parses"),
+        );
+
+        struct UnusedDispatcher;
+        #[async_trait::async_trait]
+        impl ironclaw_host_api::CapabilityDispatcher for UnusedDispatcher {
+            async fn dispatch_json(
+                &self,
+                _request: ironclaw_host_api::CapabilityDispatchRequest,
+            ) -> Result<ironclaw_host_api::CapabilityDispatchResult, ironclaw_host_api::DispatchError>
+            {
+                unreachable!("visible_capabilities never dispatches")
+            }
+        }
+
+        let effective_runtime_policy =
+            ironclaw_runtime_policy::resolve(ironclaw_runtime_policy::ResolveRequest::new(
+                ironclaw_host_api::runtime_policy::DeploymentMode::LocalSingleUser,
+                ironclaw_host_api::runtime_policy::RuntimeProfile::LocalDev,
+            ))
+            .expect("local single-user + local-dev runtime policy resolves");
+        let authorizer = crate::local_dev_authorization::local_dev_authorizer(
+            Some(&effective_runtime_policy),
+            Arc::clone(&policy),
+            Arc::new(crate::profile_approval_authorization::EmptyApprovalSettingsProvider),
+        );
+        let runtime: Arc<dyn ironclaw_host_runtime::HostRuntime> = Arc::new(
+            ironclaw_host_runtime::DefaultHostRuntime::from_shared_registry(
+                Arc::clone(&shared_registry),
+                Arc::new(UnusedDispatcher) as Arc<dyn ironclaw_host_api::CapabilityDispatcher>,
+                authorizer,
+                ironclaw_host_runtime::CapabilitySurfaceVersion::new("discovered-cap-test-overlay")
+                    .expect("surface version"),
+                effective_runtime_policy,
+            )
+            .with_hosted_mcp_overlay(Arc::new(AskAndNonAskOverlay)),
+        );
+
+        let capability_io = Arc::new(LocalDevCapabilityIo::default());
+        let input_resolver: Arc<dyn LoopCapabilityInputResolver> = capability_io.clone();
+        let result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
+        let factory = LocalDevLoopCapabilityPortFactory {
+            runtime,
+            discovered_capability_grants:
+                crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(
+                    Some(Arc::new(AskAndNonAskOverlay)),
+                ),
+            shared_extension_registry: Some(shared_registry),
+            fallback_user_id: UserId::new("discovered-cap-caller-user").expect("user id"),
+            policy,
+            workspace_mounts: local_runtime.workspace_mounts.clone(),
+            memory_mounts: local_runtime.memory_mounts.clone(),
+            system_extensions_lifecycle_mounts: local_runtime
+                .system_extensions_lifecycle_mounts
+                .clone(),
+            // The "notion" provider needs a `provider_trust` entry before ANY
+            // capability with that provider — floor or overlay-discovered —
+            // is even considered by `evaluate_descriptor`
+            // (`request.provider_trust.get(&descriptor.provider)` gates entry).
+            // `provider_trust` is derived from installed/active extension
+            // capabilities (`LocalDevExtensionSurface::provider_trust`), not
+            // from the raw registry `.upsert()` above, so this test must seed
+            // the extension surface too — mirroring
+            // `runtime::approval::tests::extension_capability_missing_from_builtin_policy_gets_one_shot_lease_terms`.
+            extension_surface_source: LocalDevExtensionSurfaceSource::from_surface(
+                LocalDevExtensionSurface::from_active_capabilities(vec![
+                    ActiveExtensionCapability {
+                        id: CapabilityId::new("notion.notion-fetch").expect("capability id"),
+                        provider: ExtensionId::new("notion").expect("provider id"),
+                        effects: vec![EffectKind::DispatchCapability],
+                        default_permission: ironclaw_host_api::PermissionMode::Allow,
+                        runtime_credentials: Vec::new(),
+                    },
+                ]),
+            ),
+            input_resolver,
+            result_writer,
+            milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
+            skill_activation_source: None,
+            project_service: Arc::clone(&local_runtime.project_service),
+            trajectory_observer: None,
+            outbound_preferences_facade: None,
+            outbound_delivery_target_set_requires_approval: false,
+            approval_settings: Arc::new(
+                crate::profile_approval_authorization::EmptyApprovalSettingsProvider,
+            ),
+            approval_requests: local_runtime.approval_requests.clone(),
+            capability_leases: local_runtime.capability_leases.clone(),
+            external_tool_catalog: std::sync::Arc::new(
+                ironclaw_turns::InMemoryExternalToolCatalog::new(),
+            ),
+        };
+        let port = factory
+            .create_capability_port(&run_context)
+            .await
+            .expect("capability port");
+        let surface = port
+            .visible_capabilities(VisibleCapabilityRequest {})
+            .await
+            .expect("visible surface");
+
+        assert!(
+            surface
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.capability_id.as_str() == "notion.live-search"),
+            "the Ask-permission discovered tool must surface once build_inner mints its \
+             ambient grant into the run's context"
+        );
+        assert!(
+            surface
+                .descriptors
+                .iter()
+                .all(|descriptor| descriptor.capability_id.as_str() != "notion.auto-sync"),
+            "the non-Ask discovered tool must NOT surface — DiscoveredCapabilityGrantSource \
+             mints nothing for it, so it drops (S2) instead of appearing as a phantom \
+             askable entry"
+        );
+    }
+
     #[tokio::test]
     async fn local_dev_external_tools_are_advertised_as_provider_tool_names() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1470,6 +1737,8 @@ mod tests {
         );
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
+            discovered_capability_grants: crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(None),
+            shared_extension_registry: None,
             fallback_user_id: UserId::new("external-tool-provider-name-user").expect("user id"),
             policy,
             workspace_mounts: local_runtime.workspace_mounts.clone(),
@@ -1547,6 +1816,8 @@ mod tests {
         let result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
+            discovered_capability_grants: crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(None),
+            shared_extension_registry: None,
             fallback_user_id: UserId::new("project-create-fallback-user").expect("user id"),
             policy: Arc::clone(&local_runtime.capability_policy),
             workspace_mounts: local_runtime.workspace_mounts.clone(),
@@ -1736,6 +2007,8 @@ mod tests {
         );
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
+            discovered_capability_grants: crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(None),
+            shared_extension_registry: None,
             fallback_user_id: fallback_user_id.clone(),
             policy,
             workspace_mounts: local_runtime.workspace_mounts.clone(),
@@ -2437,6 +2710,8 @@ mod tests {
         let result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io;
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
+            discovered_capability_grants: crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(None),
+            shared_extension_registry: None,
             fallback_user_id: UserId::new("outbound-delivery-fallback-user").expect("user id"),
             policy,
             workspace_mounts: local_runtime.workspace_mounts.clone(),
@@ -2548,6 +2823,8 @@ mod tests {
         let result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
+            discovered_capability_grants: crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(None),
+            shared_extension_registry: None,
             fallback_user_id: UserId::new("local-yolo-host-user").expect("user id"), // safety: literal test id is valid.
             policy,
             workspace_mounts,
@@ -2793,6 +3070,8 @@ mod tests {
         let result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
+            discovered_capability_grants: crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(None),
+            shared_extension_registry: None,
             fallback_user_id: UserId::new("local-dev-skill-port-user").expect("user id"), // safety: literal test id is valid.
             policy,
             workspace_mounts,
@@ -2907,6 +3186,8 @@ mod tests {
         let result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
+            discovered_capability_grants: crate::runtime::local_dev::discovered_capability_grants::DiscoveredCapabilityGrantSource::new(None),
+            shared_extension_registry: None,
             fallback_user_id: UserId::new("local-dev-no-host-user").expect("user id"), // safety: literal test id is valid.
             policy,
             workspace_mounts,
