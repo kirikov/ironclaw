@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use ironclaw_capabilities::{
     CapabilityObligationHandler, CapabilityObligationPhase, CapabilityObligationRequest,
 };
 use ironclaw_host_api::{
-    CapabilityId, CapabilitySet, ExecutionContext, ExtensionId, MountView, Obligation,
-    ResourceEstimate, ResourceScope, RuntimeCredentialInjection, RuntimeCredentialSource,
-    RuntimeCredentialTarget, RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressRequest,
-    RuntimeHttpEgressResponse, RuntimeKind, SecretHandle, TrustClass,
+    CapabilityId, CapabilitySet, ExecutionContext, ExtensionId, MountView, NetworkPolicy,
+    Obligation, ResourceEstimate, ResourceScope, RuntimeCredentialInjection,
+    RuntimeCredentialSource, RuntimeCredentialTarget, RuntimeHttpEgress, RuntimeHttpEgressError,
+    RuntimeHttpEgressRequest, RuntimeHttpEgressResponse, RuntimeKind, SecretHandle, TrustClass,
 };
 use ironclaw_secrets::SecretMaterial;
 
@@ -82,6 +83,18 @@ pub struct HostRuntimeCredentialMaterial {
     pub material: SecretMaterial,
     pub target: RuntimeCredentialTarget,
     pub required: bool,
+}
+
+/// Identity + scope for staging a host-initiated request's invoke-phase
+/// obligations. Bundles the five values that always travel together to build
+/// the [`ExecutionContext`] and key the staged obligations, so the staging
+/// entry points stay within one argument budget and read as one concept.
+pub struct HostInitiatedInvokeContext<'a> {
+    pub extension_id: ExtensionId,
+    pub trust: TrustClass,
+    pub runtime: RuntimeKind,
+    pub scope: &'a ResourceScope,
+    pub capability_id: &'a CapabilityId,
 }
 
 impl HostRuntimeHttpEgressPort {
@@ -164,32 +177,163 @@ impl HostRuntimeHttpEgressPort {
         &self,
         request: &HostRuntimeHttpEgressRequest,
     ) -> Result<(), RuntimeHttpEgressError> {
-        let context = execution_context_for_host_http_egress(
-            &request.request.scope,
-            request.extension_id.clone(),
-            request.request.runtime,
-            request.trust,
+        let policy = request.request.network_policy.clone();
+        self.stage_invoke_obligations(
+            HostInitiatedInvokeContext {
+                extension_id: request.extension_id.clone(),
+                trust: request.trust,
+                runtime: request.request.runtime,
+                scope: &request.request.scope,
+                capability_id: &request.request.capability_id,
+            },
+            policy.max_egress_bytes,
+            &[Obligation::ApplyNetworkPolicy { policy }],
+        )
+        .await
+    }
+
+    /// Stages BOTH the host [`Obligation::ApplyNetworkPolicy`] AND the one-shot
+    /// secret material for a host-initiated request whose credential injections
+    /// resolve through `RuntimeCredentialSource::StagedObligation`.
+    ///
+    /// Capability dispatch stages `ApplyNetworkPolicy` (from the grant's
+    /// network constraints) AND `InjectSecretOnce` (leasing the agent's secret
+    /// from the store) before the runtime lane runs; the shared egress reads
+    /// both back. Host-initiated requests that never flow through dispatch —
+    /// hosted-MCP per-user discovery is the motivating case — have nothing to
+    /// stage either, so the shared egress reads an empty policy (fails
+    /// `network_error`, internally `network_policy_missing`) and, once the
+    /// policy is staged, an unresolved credential injection (fails
+    /// `credential_unavailable`). This stages the policy plus one
+    /// `InjectSecretOnce` per handle, so the same `inject_secrets` path (with
+    /// Kolya's owner-scope secret fallback, `resolve_present_secret_scope`)
+    /// leases the material into the store the egress reads. Staging is atomic:
+    /// a missing/failed secret aborts the whole obligation set (nothing is
+    /// staged) and the caller fails closed — hosted-MCP discovery maps that to
+    /// serving the static floor.
+    pub async fn stage_network_policy_and_secret_injections(
+        &self,
+        context: HostInitiatedInvokeContext<'_>,
+        policy: NetworkPolicy,
+        secret_handles: &[SecretHandle],
+    ) -> Result<(), RuntimeHttpEgressError> {
+        let max_egress_bytes = policy.max_egress_bytes;
+        let mut obligations = Vec::with_capacity(1 + secret_handles.len());
+        obligations.push(Obligation::ApplyNetworkPolicy { policy });
+        for handle in secret_handles {
+            obligations.push(Obligation::InjectSecretOnce {
+                handle: handle.clone(),
+            });
+        }
+        self.stage_invoke_obligations(context, max_egress_bytes, &obligations)
+            .await
+    }
+
+    async fn stage_invoke_obligations(
+        &self,
+        context: HostInitiatedInvokeContext<'_>,
+        network_egress_bytes: Option<u64>,
+        obligations: &[Obligation],
+    ) -> Result<(), RuntimeHttpEgressError> {
+        let execution_context = execution_context_for_host_http_egress(
+            context.scope,
+            context.extension_id,
+            context.runtime,
+            context.trust,
         )?;
         let estimate = ResourceEstimate {
-            network_egress_bytes: request.request.network_policy.max_egress_bytes,
+            network_egress_bytes,
             ..ResourceEstimate::default()
         };
         self.obligation_handler
             .satisfy(CapabilityObligationRequest {
                 phase: CapabilityObligationPhase::Invoke,
-                context: &context,
-                capability_id: &request.request.capability_id,
+                context: &execution_context,
+                capability_id: context.capability_id,
                 estimate: &estimate,
-                obligations: &[Obligation::ApplyNetworkPolicy {
-                    policy: request.request.network_policy.clone(),
-                }],
+                obligations,
             })
             .await
             .map_err(|error| RuntimeHttpEgressError::Request {
-                reason: format!("host network egress policy was not authorized: {error}"),
+                reason: format!("host egress obligations were not authorized: {error}"),
                 request_bytes: 0,
                 response_bytes: 0,
             })
+    }
+
+    /// The shared runtime HTTP egress this port stages obligations for.
+    pub fn runtime_http_egress(&self) -> Arc<dyn RuntimeHttpEgress> {
+        Arc::clone(&self.runtime_http_egress)
+    }
+
+    /// Adapts this port into a plain [`RuntimeHttpEgress`] for host-initiated
+    /// requests from a single extension (identity + trust fixed here rather
+    /// than carried on each [`RuntimeHttpEgressRequest`]). Each `execute`
+    /// stages the request-carried network policy AND the one-shot secret
+    /// material for its `StagedObligation` credential injections through
+    /// [`Self::stage_network_policy_and_secret_injections`], then delegates to
+    /// the shared egress, which reads both back — mirroring how dispatch
+    /// stages `ApplyNetworkPolicy` + `InjectSecretOnce` for a normal
+    /// capability call.
+    pub fn into_host_initiated_egress(
+        self,
+        extension_id: ExtensionId,
+        trust: TrustClass,
+    ) -> Arc<dyn RuntimeHttpEgress> {
+        Arc::new(HostInitiatedHttpEgress {
+            port: self,
+            extension_id,
+            trust,
+        })
+    }
+}
+
+/// A [`RuntimeHttpEgress`] for host-initiated requests (hosted-MCP per-user
+/// discovery) that stages the request-carried network policy AND the secret
+/// material its `StagedObligation` credential injections need, before
+/// delegating to the shared runtime egress. Constructed via
+/// [`HostRuntimeHttpEgressPort::into_host_initiated_egress`].
+struct HostInitiatedHttpEgress {
+    port: HostRuntimeHttpEgressPort,
+    extension_id: ExtensionId,
+    trust: TrustClass,
+}
+
+#[async_trait]
+impl RuntimeHttpEgress for HostInitiatedHttpEgress {
+    async fn execute(
+        &self,
+        request: RuntimeHttpEgressRequest,
+    ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
+        // The egress resolves each `StagedObligation` injection from the
+        // staged-secret store keyed by (scope, this request's capability_id);
+        // stage `InjectSecretOnce` for exactly those handles so dispatch and
+        // discovery lease the same material the same way. De-duplicate: one
+        // handle may back several injection targets in a single request, but
+        // `InjectSecretOnce` leases it once.
+        let mut secret_handles: Vec<SecretHandle> = Vec::new();
+        for injection in &request.credential_injections {
+            if let RuntimeCredentialSource::StagedObligation { capability_id } = &injection.source
+                && capability_id == &request.capability_id
+                && !secret_handles.contains(&injection.handle)
+            {
+                secret_handles.push(injection.handle.clone());
+            }
+        }
+        self.port
+            .stage_network_policy_and_secret_injections(
+                HostInitiatedInvokeContext {
+                    extension_id: self.extension_id.clone(),
+                    trust: self.trust,
+                    runtime: request.runtime,
+                    scope: &request.scope,
+                    capability_id: &request.capability_id,
+                },
+                request.network_policy.clone(),
+                &secret_handles,
+            )
+            .await?;
+        self.port.runtime_http_egress().execute(request).await
     }
 }
 

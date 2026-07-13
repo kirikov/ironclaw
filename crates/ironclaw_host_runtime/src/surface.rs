@@ -6,9 +6,9 @@ use ironclaw_extensions::{
 };
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
-    CapabilityDescriptor, CapabilityGrant, CapabilityId, Decision, EffectKind, ExecutionContext,
-    ResourceEstimate, RuntimeKind, canonical_json_v1, runtime_policy::EffectiveRuntimePolicy,
-    sha256_digest_token,
+    CapabilityDescriptor, CapabilityGrant, CapabilityId, Decision, DenyReason, EffectKind,
+    ExecutionContext, ResourceEstimate, RuntimeKind, canonical_json_v1,
+    runtime_policy::EffectiveRuntimePolicy, sha256_digest_token,
 };
 use ironclaw_trust::TrustDecision;
 use serde_json::{Value, json};
@@ -292,6 +292,28 @@ impl<'a> CapabilityCatalog<'a> {
         {
             Decision::Allow { .. } => VisibleCapabilityAccess::Available,
             Decision::RequireApproval { .. } if request.policy.include_requires_approval => {
+                VisibleCapabilityAccess::RequiresApproval
+            }
+            // A freshly discovered hosted-MCP capability of an already-trusted,
+            // installed provider (its `provider_trust` check passed above) has
+            // no pre-provisioned static grant: `ironclaw_authorization` matches
+            // grants by exact `CapabilityId`, and a discovered id only exists
+            // after this turn's live overlay discovery, so the grant authorizer
+            // returns `MissingGrant`. Surface it as requires-approval instead of
+            // dropping it — the visible surface is a visibility affordance, not
+            // authority (see `VisibleCapability`/`VisibleCapabilityAccess`):
+            // direct invocation re-runs host-owned trust, grants, and approval,
+            // and discovered hosted-MCP tools carry `default_permission = Ask`
+            // by construction (`ironclaw_extensions::hosted_mcp_discovery`), so
+            // "askable" is the correct affordance. Overlay-only, MissingGrant-
+            // only, and only when the surface renders askable entries; a
+            // genuinely policy-denied (`PolicyDenied`) discovered capability
+            // still drops.
+            Decision::Deny {
+                reason: DenyReason::MissingGrant,
+            } if source == DescriptorSource::Overlay
+                && request.policy.include_requires_approval =>
+            {
                 VisibleCapabilityAccess::RequiresApproval
             }
             Decision::RequireApproval { .. } | Decision::Deny { .. } => return Ok(None),
@@ -733,6 +755,35 @@ mod tests {
         }
     }
 
+    /// Authorizer that mirrors production `GrantAuthorizer` for this test:
+    /// capabilities with a pre-provisioned grant authorize (`Allow`); any other
+    /// id — e.g. a freshly discovered overlay capability — has no grant and is
+    /// denied with `MissingGrant`, exactly as the live grant authorizer does.
+    struct GrantGatedAuthorizer {
+        granted: Vec<CapabilityId>,
+    }
+
+    #[async_trait::async_trait]
+    impl TrustAwareCapabilityDispatchAuthorizer for GrantGatedAuthorizer {
+        async fn authorize_dispatch_with_trust(
+            &self,
+            _context: &ExecutionContext,
+            descriptor: &CapabilityDescriptor,
+            _estimate: &ResourceEstimate,
+            _trust_decision: &TrustDecision,
+        ) -> Decision {
+            if self.granted.contains(&descriptor.id) {
+                Decision::Allow {
+                    obligations: Obligations::default(),
+                }
+            } else {
+                Decision::Deny {
+                    reason: DenyReason::MissingGrant,
+                }
+            }
+        }
+    }
+
     struct NeverCalledOverlay {
         calls: AtomicUsize,
     }
@@ -984,6 +1035,84 @@ output_schema_ref = "schemas/notion/fetch.output.json"
                 .iter()
                 .any(|capability| capability.descriptor.id.as_str() == "notion.live-search"),
             "new overlay capability must be surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_capabilities_surfaces_ungranted_discovered_tool_as_requires_approval() {
+        // Regression: a genuinely-new discovered tool under a provider that
+        // already has floor grants must appear in the unioned surface. The live
+        // grant authorizer denies the discovered id with `MissingGrant` (grants
+        // are keyed by exact CapabilityId; discovered ids are never granted), so
+        // before the fix `evaluate_descriptor` dropped it — the model saw only
+        // the floor tools (visible_capability_count unchanged). It must instead
+        // surface as requires-approval (the surface is a visibility affordance;
+        // invocation re-authorizes).
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        // Floor capability granted; the discovered `notion.live-search` is not —
+        // exactly the live shape where agent-market floor tools have grants and
+        // the discovered `echo_ping` does not.
+        let authorizer = GrantGatedAuthorizer {
+            granted: vec![CapabilityId::new("notion.notion-fetch").unwrap()],
+        };
+        let overlay = StaticOverlay {
+            descriptors: vec![overlay_capability_descriptor(
+                "notion.live-search",
+                "discovered tool",
+            )],
+        };
+        let catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_hosted_mcp_overlay(&overlay);
+
+        let surface = catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("union surface succeeds");
+
+        assert_eq!(
+            surface.capabilities.len(),
+            2,
+            "floor tool + the ungranted discovered tool must both surface"
+        );
+        let discovered = surface
+            .capabilities
+            .iter()
+            .find(|capability| capability.descriptor.id.as_str() == "notion.live-search")
+            .expect("discovered tool must be surfaced, not dropped for MissingGrant");
+        assert_eq!(
+            discovered.access,
+            VisibleCapabilityAccess::RequiresApproval,
+            "an ungranted discovered tool surfaces as askable, not directly available"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_capabilities_still_drops_ungranted_floor_capability() {
+        // The MissingGrant->requires-approval affordance is overlay-only: a
+        // floor capability the authorizer denies for MissingGrant still drops,
+        // so the fix cannot widen the static floor surface.
+        let registry = registry_with_hosted_mcp_floor();
+        let runtime_policy = overlay_test_runtime_policy();
+        let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
+        let authorizer = GrantGatedAuthorizer {
+            granted: Vec::new(),
+        };
+        let overlay = NeverCalledOverlay::new();
+        let catalog =
+            CapabilityCatalog::new(&registry, &authorizer, &surface_version, &runtime_policy)
+                .with_hosted_mcp_overlay(&overlay);
+
+        let surface = catalog
+            .visible_capabilities(overlay_request(Some("agent-1")))
+            .await
+            .expect("surface builds");
+
+        assert!(
+            surface.capabilities.is_empty(),
+            "an ungranted floor capability must not surface via the overlay affordance"
         );
     }
 

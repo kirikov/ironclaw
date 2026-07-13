@@ -143,7 +143,9 @@ use crate::default_system_prompt::seed_default_system_prompt;
 use crate::extension_host::available_extensions::{
     slack_bot_manifest_digest, slack_manifest_digest,
 };
-use crate::extension_host::hosted_mcp_overlay::CompositionHostedMcpOverlay;
+use crate::extension_host::hosted_mcp_overlay::{
+    CompositionHostedMcpOverlay, StagingDiscoveryEgressProvider,
+};
 use crate::extension_host::lifecycle::{
     RebornLocalSkillManagementPort, build_local_skill_management_port,
 };
@@ -418,16 +420,21 @@ where
     S: ironclaw_processes::ProcessStore + 'static,
     R: ironclaw_processes::ProcessResultStore + 'static,
 {
-    let Some(runtime_ports) = services.product_auth_provider_runtime_ports() else {
+    // Discovery runs outside capability dispatch, so it must stage its own
+    // `ApplyNetworkPolicy` obligation before sending — otherwise the shared
+    // host egress reads an empty staged policy and fails discovery with
+    // `network_error` before the request leaves the host. The port owns that
+    // staging; the overlay wraps it per package.
+    let Some(egress_port) = services.host_runtime_http_egress_port() else {
         tracing::debug!(
             "skipping hosted MCP overlay: host runtime HTTP egress absent \
              (only affects per-user hosted MCP discovery)"
         );
         return Ok(services);
     };
-    let overlay = Arc::new(CompositionHostedMcpOverlay::new(
-        runtime_ports.runtime_http_egress(),
-    ));
+    let overlay = Arc::new(CompositionHostedMcpOverlay::new(Arc::new(
+        StagingDiscoveryEgressProvider::new(egress_port),
+    )));
     Ok(services.with_hosted_mcp_overlay(overlay))
 }
 

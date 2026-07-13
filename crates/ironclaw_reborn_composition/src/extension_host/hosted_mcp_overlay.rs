@@ -17,9 +17,12 @@ use std::{
 use async_trait::async_trait;
 use ironclaw_extensions::ExtensionPackage;
 use ironclaw_host_api::{
-    AgentId, CapabilityDescriptor, ExtensionId, ProjectId, RuntimeHttpEgress, TenantId, UserId,
+    AgentId, CapabilityDescriptor, ExtensionId, ProjectId, RuntimeHttpEgress, TenantId, TrustClass,
+    UserId,
 };
-use ironclaw_host_runtime::{HireScope, HostedMcpOverlayError, HostedMcpSurfaceOverlay};
+use ironclaw_host_runtime::{
+    HireScope, HostRuntimeHttpEgressPort, HostedMcpOverlayError, HostedMcpSurfaceOverlay,
+};
 use tokio::sync::Mutex as AsyncMutex;
 // `tokio::time::Instant`, not `std::time::Instant`: cache-entry timestamps
 // must observe `tokio::time::pause`/`advance` under `start_paused = true`
@@ -76,6 +79,66 @@ struct CacheEntry {
 
 type InflightMap = HashMap<OverlayCacheKey, Arc<AsyncMutex<()>>>;
 
+/// Produces the per-package [`RuntimeHttpEgress`] one hosted-MCP discovery
+/// session runs over.
+///
+/// Discovery runs OUTSIDE capability dispatch, so nothing pre-stages the
+/// `ApplyNetworkPolicy` obligation that the shared host egress reads before
+/// transport. The production provider therefore wraps the host egress port
+/// so each discovery request stages the manifest-host network policy for the
+/// package before sending (see
+/// [`HostRuntimeHttpEgressPort::into_host_initiated_egress`]); without it the
+/// shared egress reads an empty staged policy and fails discovery with
+/// `network_error`. Tests supply a fake egress directly through
+/// [`CompositionHostedMcpOverlay::from_egress`].
+pub(crate) trait HostedMcpDiscoveryEgressProvider: Send + Sync {
+    fn discovery_egress(
+        &self,
+        provider: &ExtensionId,
+        trust: TrustClass,
+    ) -> Arc<dyn RuntimeHttpEgress>;
+}
+
+/// Production [`HostedMcpDiscoveryEgressProvider`]: stages the network-policy
+/// obligation for each discovered package through the host egress port.
+pub(crate) struct StagingDiscoveryEgressProvider {
+    egress_port: HostRuntimeHttpEgressPort,
+}
+
+impl StagingDiscoveryEgressProvider {
+    pub(crate) fn new(egress_port: HostRuntimeHttpEgressPort) -> Self {
+        Self { egress_port }
+    }
+}
+
+impl HostedMcpDiscoveryEgressProvider for StagingDiscoveryEgressProvider {
+    fn discovery_egress(
+        &self,
+        provider: &ExtensionId,
+        trust: TrustClass,
+    ) -> Arc<dyn RuntimeHttpEgress> {
+        self.egress_port
+            .clone()
+            .into_host_initiated_egress(provider.clone(), trust)
+    }
+}
+
+/// Test-only provider that hands out a fixed fake egress regardless of package
+/// (fakes ignore network policy, so no obligation staging is needed).
+#[cfg(test)]
+struct ConstantDiscoveryEgressProvider(Arc<dyn RuntimeHttpEgress>);
+
+#[cfg(test)]
+impl HostedMcpDiscoveryEgressProvider for ConstantDiscoveryEgressProvider {
+    fn discovery_egress(
+        &self,
+        _provider: &ExtensionId,
+        _trust: TrustClass,
+    ) -> Arc<dyn RuntimeHttpEgress> {
+        Arc::clone(&self.0)
+    }
+}
+
 /// Composition-owned [`HostedMcpSurfaceOverlay`]. One instance is shared
 /// across every turn (constructed once in `factory::attach_hosted_mcp_overlay`
 /// and injected into [`ironclaw_host_runtime::services::HostRuntimeServices`]),
@@ -87,18 +150,28 @@ type InflightMap = HashMap<OverlayCacheKey, Arc<AsyncMutex<()>>>;
 /// either, but it stays `tokio::sync::Mutex` for consistency with the rest
 /// of the async surface.
 pub(crate) struct CompositionHostedMcpOverlay {
-    runtime_http_egress: Arc<dyn RuntimeHttpEgress>,
+    discovery_egress: Arc<dyn HostedMcpDiscoveryEgressProvider>,
     store: AsyncMutex<HashMap<OverlayCacheKey, CacheEntry>>,
     inflight: Arc<StdMutex<InflightMap>>,
 }
 
 impl CompositionHostedMcpOverlay {
-    pub(crate) fn new(runtime_http_egress: Arc<dyn RuntimeHttpEgress>) -> Self {
+    pub(crate) fn new(discovery_egress: Arc<dyn HostedMcpDiscoveryEgressProvider>) -> Self {
         Self {
-            runtime_http_egress,
+            discovery_egress,
             store: AsyncMutex::new(HashMap::new()),
             inflight: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// Test constructor: runs discovery over a caller-supplied fake egress with
+    /// no obligation staging (fakes ignore network policy). Production wires a
+    /// [`StagingDiscoveryEgressProvider`] via [`Self::new`] instead.
+    #[cfg(test)]
+    pub(crate) fn from_egress(runtime_http_egress: Arc<dyn RuntimeHttpEgress>) -> Self {
+        Self::new(Arc::new(ConstantDiscoveryEgressProvider(
+            runtime_http_egress,
+        )))
     }
 
     /// Reads the cache, evicting the entry in place if it has expired.
@@ -240,12 +313,16 @@ impl HostedMcpSurfaceOverlay for CompositionHostedMcpOverlay {
             return Ok((*descriptors).clone());
         }
 
-        let result = discover_hosted_mcp_package(
-            package,
-            hire.to_owner_scope(),
-            Arc::clone(&self.runtime_http_egress),
-        )
-        .await;
+        // Discovery runs outside capability dispatch: build the per-package
+        // egress so it stages the manifest-host network-policy obligation the
+        // shared egress reads before transport (see
+        // `HostedMcpDiscoveryEgressProvider`). Identity/trust come from the
+        // package, not the request, so they are fixed here per package.
+        let discovery_egress = self
+            .discovery_egress
+            .discovery_egress(&package.id, package.manifest.descriptor_trust_default);
+        let result =
+            discover_hosted_mcp_package(package, hire.to_owner_scope(), discovery_egress).await;
         match result {
             Ok(discovered) => {
                 let descriptors = Arc::new(discovered.capabilities);
@@ -336,7 +413,7 @@ output_schema_ref = "schemas/notion/fetch.output.json"
     #[tokio::test]
     async fn overlay_returns_discovered_descriptors_with_inline_schema() {
         let overlay =
-            CompositionHostedMcpOverlay::new(Arc::new(HostedMcpDiscoveryEgress::default()));
+            CompositionHostedMcpOverlay::from_egress(Arc::new(HostedMcpDiscoveryEgress::default()));
         let package = notion_package();
 
         let descriptors = overlay
@@ -349,11 +426,67 @@ output_schema_ref = "schemas/notion/fetch.output.json"
         assert!(descriptors[0].parameters_schema.get("$ref").is_none());
     }
 
+    /// Records the `(provider, trust)` each discovery session is built for, so
+    /// a test can assert the overlay threads the package's own identity/trust
+    /// into the egress it stages a network policy under — a mismatch would
+    /// stage the policy under the wrong scope and re-open the `network_error`
+    /// bug in production even though the fake egress here ignores it.
+    struct RecordingDiscoveryEgressProvider {
+        inner: Arc<dyn RuntimeHttpEgress>,
+        calls: StdMutex<Vec<(ExtensionId, TrustClass)>>,
+    }
+
+    impl HostedMcpDiscoveryEgressProvider for RecordingDiscoveryEgressProvider {
+        fn discovery_egress(
+            &self,
+            provider: &ExtensionId,
+            trust: TrustClass,
+        ) -> Arc<dyn RuntimeHttpEgress> {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((provider.clone(), trust));
+            Arc::clone(&self.inner)
+        }
+    }
+
+    #[tokio::test]
+    async fn overlay_builds_discovery_egress_for_package_identity_and_trust() {
+        let provider = Arc::new(RecordingDiscoveryEgressProvider {
+            inner: Arc::new(HostedMcpDiscoveryEgress::default()),
+            calls: StdMutex::new(Vec::new()),
+        });
+        let overlay = CompositionHostedMcpOverlay::new(
+            Arc::clone(&provider) as Arc<dyn HostedMcpDiscoveryEgressProvider>
+        );
+        let package = notion_package();
+
+        overlay
+            .overlay_capabilities(&hire("agent-1"), &package)
+            .await
+            .expect("discovery succeeds");
+
+        let calls = provider
+            .calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(calls.len(), 1, "one discovery egress built per discovery");
+        assert_eq!(
+            calls[0].0, package.id,
+            "discovery egress must be scoped to the package's own extension id"
+        );
+        assert_eq!(
+            calls[0].1, package.manifest.descriptor_trust_default,
+            "discovery egress must carry the package's declared trust"
+        );
+    }
+
     #[tokio::test]
     async fn overlay_caches_and_does_not_refetch_within_ttl() {
         let egress = Arc::new(HostedMcpDiscoveryEgress::default());
-        let overlay =
-            CompositionHostedMcpOverlay::new(Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>);
+        let overlay = CompositionHostedMcpOverlay::from_egress(
+            Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>
+        );
         let package = notion_package();
         let hire = hire("agent-1");
 
@@ -377,8 +510,9 @@ output_schema_ref = "schemas/notion/fetch.output.json"
     #[tokio::test(start_paused = true)]
     async fn overlay_refetches_after_ttl_expiry() {
         let egress = Arc::new(HostedMcpDiscoveryEgress::default());
-        let overlay =
-            CompositionHostedMcpOverlay::new(Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>);
+        let overlay = CompositionHostedMcpOverlay::from_egress(
+            Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>
+        );
         let package = notion_package();
         let hire = hire("agent-1");
 
@@ -410,8 +544,9 @@ output_schema_ref = "schemas/notion/fetch.output.json"
         // so a second discovery here can only be explained by `agent_id`
         // actually differentiating the cache key.
         let egress = Arc::new(HostedMcpDiscoveryEgress::default());
-        let overlay =
-            CompositionHostedMcpOverlay::new(Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>);
+        let overlay = CompositionHostedMcpOverlay::from_egress(
+            Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>
+        );
         let package = notion_package();
 
         overlay
@@ -449,7 +584,7 @@ output_schema_ref = "schemas/notion/fetch.output.json"
             }
         }
 
-        let overlay = CompositionHostedMcpOverlay::new(Arc::new(FailingEgress));
+        let overlay = CompositionHostedMcpOverlay::from_egress(Arc::new(FailingEgress));
         let error = overlay
             .overlay_capabilities(&hire("agent-1"), &notion_package())
             .await
@@ -481,7 +616,7 @@ output_schema_ref = "schemas/notion/fetch.output.json"
             }
         }
 
-        let overlay = CompositionHostedMcpOverlay::new(Arc::new(FailOnceEgress {
+        let overlay = CompositionHostedMcpOverlay::from_egress(Arc::new(FailOnceEgress {
             calls: std::sync::atomic::AtomicUsize::new(0),
         }));
         let package = notion_package();
@@ -502,8 +637,8 @@ output_schema_ref = "schemas/notion/fetch.output.json"
     #[tokio::test]
     async fn overlay_concurrent_calls_for_same_key_single_flight_to_one_discovery() {
         let egress = Arc::new(HostedMcpDiscoveryEgress::default());
-        let overlay = Arc::new(CompositionHostedMcpOverlay::new(
-            Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>
+        let overlay = Arc::new(CompositionHostedMcpOverlay::from_egress(
+            Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>,
         ));
         let package = Arc::new(notion_package());
         let hire = Arc::new(hire("agent-1"));
@@ -560,7 +695,9 @@ output_schema_ref = "schemas/notion/fetch.output.json"
             }
         }
 
-        let overlay = Arc::new(CompositionHostedMcpOverlay::new(Arc::new(StallingEgress)));
+        let overlay = Arc::new(CompositionHostedMcpOverlay::from_egress(Arc::new(
+            StallingEgress,
+        )));
         let package = notion_package();
         let hire = hire("agent-1");
 
@@ -588,8 +725,9 @@ output_schema_ref = "schemas/notion/fetch.output.json"
     #[tokio::test]
     async fn overlay_cache_eviction_respects_max_entries() {
         let egress = Arc::new(HostedMcpDiscoveryEgress::default());
-        let overlay =
-            CompositionHostedMcpOverlay::new(Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>);
+        let overlay = CompositionHostedMcpOverlay::from_egress(
+            Arc::clone(&egress) as Arc<dyn RuntimeHttpEgress>
+        );
         let package = notion_package();
 
         // Force the cap by inserting synthetic entries directly.

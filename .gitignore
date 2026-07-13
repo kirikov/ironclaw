@@ -88,3 +88,4 @@ tests/fixtures/llm_traces/live/*.log
 # See CLAUDE.md -> "Code Discovery".
 .codebase-memory/
 .local/
+/target
