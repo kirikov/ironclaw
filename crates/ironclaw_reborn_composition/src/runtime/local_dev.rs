@@ -1126,6 +1126,10 @@ fn visible_capability_request(
         .cloned()
         .or_else(|| run_context.actor().map(|actor| actor.user_id.clone()))
         .unwrap_or_else(|| fallback_user_id.clone());
+    let overlay_owner = ironclaw_extensions::OverlayOwner::new(
+        run_context.scope.tenant_id.clone(),
+        user_id.clone(),
+    );
     let mut grants = inputs.policy.builtin_grants(
         &extension_id,
         inputs.workspace_mounts,
@@ -1135,7 +1139,7 @@ fn visible_capability_request(
     );
     grants
         .grants
-        .extend(inputs.extension_surface.grants(&extension_id, &user_id));
+        .extend(inputs.extension_surface.grants(&extension_id, &overlay_owner));
     let mut context = ExecutionContext::local_default(
         user_id,
         extension_id,
@@ -1194,7 +1198,7 @@ fn visible_capability_request(
             },
         );
     }
-    provider_trust.extend(inputs.extension_surface.provider_trust(&context.user_id));
+    provider_trust.extend(inputs.extension_surface.provider_trust(&overlay_owner));
 
     Ok(HostVisibleCapabilityRequest::new(
         context,
