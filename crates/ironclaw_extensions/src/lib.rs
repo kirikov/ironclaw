@@ -398,6 +398,7 @@ mod hosted_mcp_discovery;
 mod installations;
 mod lifecycle;
 mod registry;
+mod scoped_overlay;
 pub mod resolved;
 pub mod v2;
 pub mod v3;
@@ -441,6 +442,10 @@ pub use installations::{
 };
 pub use lifecycle::{
     ExtensionLifecycleEvent, ExtensionLifecycleEventSink, ExtensionLifecycleService,
+};
+pub use scoped_overlay::{
+    DEFAULT_SCOPED_OVERLAY_TTL, OverlaidRegistryView, OverlayFreshness, OverlayOwner,
+    ScopedPackageOverlay,
 };
 pub use registry::{ExtensionRegistry, SharedExtensionRegistry};
 
