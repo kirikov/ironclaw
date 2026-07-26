@@ -93,6 +93,24 @@ impl OverlayScope {
 /// and the turn-start refresher still re-discovers once an idle entry expires.
 pub const DEFAULT_SCOPED_OVERLAY_TTL: Duration = Duration::from_secs(1800);
 
+/// How long past its TTL a discovered entry is retained (still served as
+/// last-good) before eviction.
+///
+/// Bounds the growth the thread cache axis would otherwise cause: a one-off
+/// job's thread never recurs, so freshness (which only gates *re-discovery* of
+/// the same scope) never expires it and it would be served-stale forever.
+/// Serving stays available within `[expiry, expiry + retention]` so a
+/// concurrent turn that skips the in-flight refresh keeps the surface, but a
+/// finished thread's entry is swept once it has been stale this long.
+/// Comfortably exceeds any bounded run plus the refresh gap.
+pub const OVERLAY_STALE_RETENTION: Duration = Duration::from_secs(1800);
+
+/// Hard cap on total live entries — a backstop against pathological growth
+/// (e.g. a burst of concurrent one-off jobs faster than the retention sweep).
+/// When exceeded, the entries closest to (or furthest past) expiry are evicted
+/// first.
+const MAX_OVERLAY_ENTRIES: usize = 4096;
+
 #[derive(Debug, Clone)]
 struct OverlayEntry {
     package: Arc<ExtensionPackage>,
@@ -119,24 +137,70 @@ pub enum OverlayFreshness {
 /// tenant + user + thread) and extension. Composition owns one instance and shares it
 /// (via `Arc`) with every registry consumer that resolves capabilities for a
 /// scoped request.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScopedPackageOverlay {
     entries: RwLock<HashMap<(OverlayScope, ExtensionId), OverlayEntry>>,
+    /// How long past its TTL an entry is kept (still served last-good) before
+    /// eviction. A composition knob: production uses [`OVERLAY_STALE_RETENTION`];
+    /// a shorter value tightens the bound where discovered surfaces churn fast.
+    stale_retention: Duration,
+}
+
+impl Default for ScopedPackageOverlay {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ScopedPackageOverlay {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_stale_retention(OVERLAY_STALE_RETENTION)
+    }
+
+    /// Construct with an explicit stale-retention window (see the field).
+    pub fn with_stale_retention(stale_retention: Duration) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            stale_retention,
+        }
     }
 
     /// Store (or refresh) `owner`'s discovered surface for `package.id`.
+    ///
+    /// Opportunistically evicts entries stale beyond the retention window (and
+    /// enforces [`MAX_OVERLAY_ENTRIES`]) on the same lock, so the per-thread key
+    /// axis cannot grow the cache without bound — inserts run at every turn-start
+    /// discovery, so the sweep keeps pace with new threads.
     pub fn insert(&self, owner: OverlayScope, package: ExtensionPackage, ttl: Duration) {
         let key = (owner, package.id.clone());
         let entry = OverlayEntry {
             package: Arc::new(package),
             expires_at: Instant::now() + ttl,
         };
-        self.entries.write().insert(key, entry);
+        let mut entries = self.entries.write();
+        entries.insert(key, entry);
+        self.evict_locked(&mut entries, Instant::now());
+    }
+
+    /// Evict entries stale beyond the retention window, then enforce the hard
+    /// cap (most-expired first). Called under the write lock from `insert`.
+    fn evict_locked(
+        &self,
+        entries: &mut HashMap<(OverlayScope, ExtensionId), OverlayEntry>,
+        now: Instant,
+    ) {
+        entries.retain(|_, entry| entry.expires_at + self.stale_retention > now);
+        if entries.len() > MAX_OVERLAY_ENTRIES {
+            let mut by_expiry: Vec<((OverlayScope, ExtensionId), Instant)> = entries
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.expires_at))
+                .collect();
+            by_expiry.sort_by_key(|(_, expires_at)| *expires_at);
+            let excess = entries.len() - MAX_OVERLAY_ENTRIES;
+            for (key, _) in by_expiry.into_iter().take(excess) {
+                entries.remove(&key);
+            }
+        }
     }
 
     /// Drop `owner`'s entry for `extension_id` (e.g. missing credential).
@@ -442,6 +506,63 @@ runtime_credentials = [
 
     fn capability(id: &str) -> CapabilityId {
         CapabilityId::new(id).expect("capability id")
+    }
+
+    #[test]
+    fn stale_entries_beyond_retention_are_evicted_so_one_off_threads_dont_leak() {
+        // The thread cache axis means a one-off job's thread never recurs, so
+        // freshness alone never expires its entry — retention-based eviction
+        // bounds the growth. With a zero retention window, a stale (TTL-0) entry
+        // is swept by the next insert's opportunistic eviction.
+        let overlay = ScopedPackageOverlay::with_stale_retention(Duration::ZERO);
+        let one_off = owner_thread("worker-agent", "thread-a");
+        overlay.insert(
+            one_off.clone(),
+            discovered_package("timeless__list_meetings"),
+            Duration::ZERO,
+        );
+        // A later job's insert triggers the sweep.
+        let live = owner_thread("worker-agent", "thread-b");
+        overlay.insert(
+            live.clone(),
+            discovered_package("timeless__list_meetings"),
+            Duration::from_secs(60),
+        );
+
+        assert!(
+            overlay.packages_for(&one_off).is_empty(),
+            "one-off thread's stale-beyond-retention entry must be evicted"
+        );
+        assert_eq!(
+            overlay.packages_for(&live).len(),
+            1,
+            "a fresh entry must survive the sweep"
+        );
+    }
+
+    #[test]
+    fn stale_within_retention_is_still_served_last_good() {
+        // Default (non-zero) retention keeps a just-expired entry served, so a
+        // concurrent turn that skips the in-flight refresh keeps the surface.
+        let overlay = ScopedPackageOverlay::new();
+        let job = owner_thread("worker-agent", "thread-a");
+        overlay.insert(
+            job.clone(),
+            discovered_package("timeless__list_meetings"),
+            Duration::ZERO,
+        );
+        // Trigger a sweep with another insert; the just-expired entry is within
+        // the retention window, so it is retained.
+        overlay.insert(
+            owner_thread("worker-agent", "thread-b"),
+            discovered_package("timeless__list_meetings"),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            overlay.packages_for(&job).len(),
+            1,
+            "stale-but-within-retention entry must still be served last-good"
+        );
     }
 
     #[test]

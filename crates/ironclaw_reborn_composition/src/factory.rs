@@ -960,10 +960,15 @@ where
     };
     let runtime_http_egress = runtime_ports.runtime_http_egress();
     let registry = services.shared_extension_registry();
+    // Per-user discovered-package overlay (P2b): the egress planner needs it to
+    // resolve credentials for DISCOVERED hosted-MCP tools (absent from the
+    // global registry), else those calls egress unauthenticated.
+    let scoped_overlay = services.scoped_package_overlay();
 
     Ok(services.with_mcp_runtime(Arc::new(hosted_http_mcp_runtime(
         registry,
         runtime_http_egress,
+        Some(scoped_overlay),
     ))))
 }
 
