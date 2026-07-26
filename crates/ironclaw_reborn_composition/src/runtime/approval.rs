@@ -82,9 +82,10 @@ impl PolicyApprovalLeaseTermsProvider {
         let Some(grant) = surface
             .grants(
                 extension_id,
-                &ironclaw_extensions::OverlayOwner::new(
+                &ironclaw_extensions::OverlayScope::new(
                     gate.resource_scope().tenant_id.clone(),
                     gate.resource_scope().user_id.clone(),
+                    gate.resource_scope().thread_id.clone(),
                 ),
             )
             .into_iter()

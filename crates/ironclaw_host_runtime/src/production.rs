@@ -25,7 +25,7 @@ use ironclaw_capabilities::{
     CapabilityHost, CapabilityInvocationError, CapabilityInvocationResult,
     CapabilityObligationHandler, CapabilitySpawnRequest, CapabilitySpawnResult,
 };
-use ironclaw_extensions::{ExtensionRegistry, OverlayOwner, ScopedPackageOverlay, SharedExtensionRegistry};
+use ironclaw_extensions::{ExtensionRegistry, OverlayScope, ScopedPackageOverlay, SharedExtensionRegistry};
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
     ApprovalRequestId, CapabilityDispatcher, CapabilityId, DenyReason, DispatchFailureKind,
@@ -199,10 +199,11 @@ impl DefaultHostRuntime {
         &self,
         tenant_id: &ironclaw_host_api::TenantId,
         user_id: &ironclaw_host_api::UserId,
+        thread_id: Option<&ironclaw_host_api::ThreadId>,
     ) -> Arc<ExtensionRegistry> {
         match &self.scoped_overlay {
             Some(overlay) => overlay.merged_snapshot(
-                &OverlayOwner::new(tenant_id.clone(), user_id.clone()),
+                &OverlayScope::new(tenant_id.clone(), user_id.clone(), thread_id.cloned()),
                 self.registry.snapshot(),
             ),
             None => self.registry.snapshot(),
@@ -456,7 +457,11 @@ impl HostRuntime for DefaultHostRuntime {
         let invocation_id = context.invocation_id;
         let total_started_at = live_latency_started_at();
 
-        let registry = self.scoped_snapshot(&context.resource_scope.tenant_id, &context.resource_scope.user_id);
+        let registry = self.scoped_snapshot(
+            &context.resource_scope.tenant_id,
+            &context.resource_scope.user_id,
+            context.resource_scope.thread_id.as_ref(),
+        );
 
         // Validate the execution context before the kernel's credential pre-flight
         // queries the secret store. Without this guard a malformed
@@ -560,7 +565,11 @@ impl HostRuntime for DefaultHostRuntime {
         let scope = context.resource_scope.clone();
         let invocation_id = context.invocation_id;
 
-        let registry = self.scoped_snapshot(&context.resource_scope.tenant_id, &context.resource_scope.user_id);
+        let registry = self.scoped_snapshot(
+            &context.resource_scope.tenant_id,
+            &context.resource_scope.user_id,
+            context.resource_scope.thread_id.as_ref(),
+        );
 
         // Validate the execution context before the kernel's credential pre-flight
         // queries the secret store. Without this guard a malformed
@@ -618,7 +627,11 @@ impl HostRuntime for DefaultHostRuntime {
         // Trust classification runs inside the kernel's `authorize_resumed` fold,
         // which fails the blocked run on a trust rejection (replacing the former
         // host_runtime pre-authorization + `context.trust` stamp).
-        let registry = self.scoped_snapshot(&context.resource_scope.tenant_id, &context.resource_scope.user_id);
+        let registry = self.scoped_snapshot(
+            &context.resource_scope.tenant_id,
+            &context.resource_scope.user_id,
+            context.resource_scope.thread_id.as_ref(),
+        );
         let host = self.capability_host(&registry);
         match host
             .resume_json(
@@ -681,7 +694,11 @@ impl HostRuntime for DefaultHostRuntime {
         // credential gate, and a trust rejection fails the blocked run there —
         // replacing the former host_runtime pre-authorization + `context.trust`
         // stamp.
-        let registry = self.scoped_snapshot(&context.resource_scope.tenant_id, &context.resource_scope.user_id);
+        let registry = self.scoped_snapshot(
+            &context.resource_scope.tenant_id,
+            &context.resource_scope.user_id,
+            context.resource_scope.thread_id.as_ref(),
+        );
         let host = self.capability_host(&registry);
         match host
             .auth_resume_json(
@@ -775,7 +792,11 @@ impl HostRuntime for DefaultHostRuntime {
         // `resume_spawn_json` fold, which fails the blocked run on rejection —
         // replacing the former host_runtime pre-authorization + `context.trust`
         // stamp.
-        let registry = self.scoped_snapshot(&context.resource_scope.tenant_id, &context.resource_scope.user_id);
+        let registry = self.scoped_snapshot(
+            &context.resource_scope.tenant_id,
+            &context.resource_scope.user_id,
+            context.resource_scope.thread_id.as_ref(),
+        );
         let host = self.capability_host(&registry);
         match host
             .resume_spawn_json(
@@ -825,6 +846,7 @@ impl HostRuntime for DefaultHostRuntime {
         let registry = self.scoped_snapshot(
             &request.context.tenant_id,
             &request.context.user_id,
+            request.context.thread_id.as_ref(),
         );
         let catalog = CapabilityCatalog::new(
             &registry,

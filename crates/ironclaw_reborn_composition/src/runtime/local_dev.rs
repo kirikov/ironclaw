@@ -1143,9 +1143,10 @@ fn visible_capability_request(
         .cloned()
         .or_else(|| run_context.actor().map(|actor| actor.user_id.clone()))
         .unwrap_or_else(|| fallback_user_id.clone());
-    let overlay_owner = ironclaw_extensions::OverlayOwner::new(
+    let overlay_owner = ironclaw_extensions::OverlayScope::new(
         run_context.scope.tenant_id.clone(),
         user_id.clone(),
+        Some(run_context.scope.thread_id.clone()),
     );
     let mut grants = inputs.policy.builtin_grants(
         &extension_id,

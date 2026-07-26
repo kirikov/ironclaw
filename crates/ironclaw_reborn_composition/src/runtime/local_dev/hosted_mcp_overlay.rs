@@ -32,7 +32,7 @@ use std::{
 };
 
 use ironclaw_extensions::{
-    DEFAULT_SCOPED_OVERLAY_TTL, ExtensionPackage, OverlayFreshness, OverlayOwner,
+    DEFAULT_SCOPED_OVERLAY_TTL, ExtensionPackage, OverlayFreshness, OverlayScope,
     ScopedPackageOverlay, SharedExtensionRegistry, is_hosted_http_mcp_package,
 };
 use ironclaw_host_api::{
@@ -62,8 +62,8 @@ pub(super) struct HostedMcpOverlayRefresher {
     runtime_ports: ProductAuthProviderRuntimePorts,
     /// Single-flight: an (owner, extension) pair being discovered by one turn
     /// is skipped by concurrent turns, which serve the last-good overlay.
-    in_flight: Mutex<HashSet<(OverlayOwner, ExtensionId)>>,
-    negative_until: Mutex<HashMap<(OverlayOwner, ExtensionId), Instant>>,
+    in_flight: Mutex<HashSet<(OverlayScope, ExtensionId)>>,
+    negative_until: Mutex<HashMap<(OverlayScope, ExtensionId), Instant>>,
 }
 
 impl HostedMcpOverlayRefresher {
@@ -93,7 +93,11 @@ impl HostedMcpOverlayRefresher {
                     .map(|(capability_id, handle)| (package.clone(), capability_id, handle))
             })
             .collect();
-        let owner = OverlayOwner::new(scope.tenant_id.clone(), scope.user_id.clone());
+        let owner = OverlayScope::new(
+            scope.tenant_id.clone(),
+            scope.user_id.clone(),
+            scope.thread_id.clone(),
+        );
         for (package, capability_id, handle) in eligible {
             let key = (owner.clone(), package.id.clone());
             if matches!(
@@ -117,7 +121,7 @@ impl HostedMcpOverlayRefresher {
     async fn refresh_one(
         &self,
         scope: &ResourceScope,
-        owner: &OverlayOwner,
+        owner: &OverlayScope,
         package: &ExtensionPackage,
         capability_id: &CapabilityId,
         handle: &SecretHandle,
@@ -219,7 +223,7 @@ impl HostedMcpOverlayRefresher {
 
     /// Re-arm a stale last-good entry so a transient provider failure does not
     /// drop the user's discovered surface (and does not re-probe every turn).
-    fn keep_last_good(&self, owner: &OverlayOwner, package: &ExtensionPackage) {
+    fn keep_last_good(&self, owner: &OverlayScope, package: &ExtensionPackage) {
         if self.overlay.get(owner, &package.id).is_some() {
             self.overlay
                 .touch(owner, &package.id, DEFAULT_SCOPED_OVERLAY_TTL);
@@ -228,7 +232,7 @@ impl HostedMcpOverlayRefresher {
         }
     }
 
-    fn negative_cache_active(&self, key: &(OverlayOwner, ExtensionId)) -> bool {
+    fn negative_cache_active(&self, key: &(OverlayScope, ExtensionId)) -> bool {
         let Ok(mut negative) = self.negative_until.lock() else {
             return false; // silent-ok: poisoned negative cache only re-probes
         };
@@ -242,7 +246,7 @@ impl HostedMcpOverlayRefresher {
         }
     }
 
-    fn negative_insert(&self, owner: &OverlayOwner, package: &ExtensionPackage) {
+    fn negative_insert(&self, owner: &OverlayScope, package: &ExtensionPackage) {
         if let Ok(mut negative) = self.negative_until.lock() {
             negative.insert(
                 (owner.clone(), package.id.clone()),
@@ -251,14 +255,14 @@ impl HostedMcpOverlayRefresher {
         }
     }
 
-    fn begin(&self, key: &(OverlayOwner, ExtensionId)) -> bool {
+    fn begin(&self, key: &(OverlayScope, ExtensionId)) -> bool {
         self.in_flight
             .lock()
             .map(|mut in_flight| in_flight.insert(key.clone()))
             .unwrap_or(false) // silent-ok: poisoned single-flight skips refresh this turn
     }
 
-    fn finish(&self, key: &(OverlayOwner, ExtensionId)) {
+    fn finish(&self, key: &(OverlayScope, ExtensionId)) {
         if let Ok(mut in_flight) = self.in_flight.lock() {
             in_flight.remove(key);
         }

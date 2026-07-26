@@ -449,7 +449,7 @@ pub use lifecycle::{
     ExtensionLifecycleEvent, ExtensionLifecycleEventSink, ExtensionLifecycleService,
 };
 pub use scoped_overlay::{
-    DEFAULT_SCOPED_OVERLAY_TTL, OverlaidRegistryView, OverlayFreshness, OverlayOwner,
+    DEFAULT_SCOPED_OVERLAY_TTL, OverlaidRegistryView, OverlayFreshness, OverlayScope,
     ScopedPackageOverlay,
 };
 pub use registry::{ExtensionRegistry, SharedExtensionRegistry};
