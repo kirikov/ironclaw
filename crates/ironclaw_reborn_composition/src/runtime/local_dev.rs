@@ -49,6 +49,7 @@ use crate::runtime::ComposedSelectableSkillContextSource;
 use ironclaw_product::projection::{CapabilityDisplayPreviewResult, CapabilityDisplayPreviewStore};
 
 pub(crate) mod extension_surface;
+mod hosted_mcp_overlay;
 mod external_tool_capability;
 mod outbound_delivery;
 mod project_create;
