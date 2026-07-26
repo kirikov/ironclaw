@@ -474,6 +474,16 @@ where
         let url = request.url.as_deref().ok_or_else(|| {
             McpClientError::client(request_denied(McpRequestDeniedCause::MissingUrl))
         })?;
+        // Stamp the SEP-414 `_meta` attribution on the tool-facing methods only.
+        // `initialize` carries no per-turn attribution and must keep its exact
+        // handshake params. Threading it through the shared planner (rather than
+        // each call site) guarantees `tools/list` and `tools/call` agree.
+        let params = match method {
+            McpJsonRpcMethod::ToolsList | McpJsonRpcMethod::ToolsCall => {
+                Some(params_with_sep414_meta(params, &request.scope))
+            }
+            _ => params,
+        };
         let body =
             encode_json_rpc_request(id, method.as_str(), params).map_err(McpClientError::client)?;
         let policy_headers = vec![
@@ -961,6 +971,54 @@ fn protocol_version_from_initialize_response(
         ));
     }
     Ok(protocol_version.to_string())
+}
+
+/// Builds the SEP-414 `_meta` attribution block the host stamps on every
+/// outbound MCP `tools/list` / `tools/call`.
+///
+/// It is derived from the trusted turn [`ResourceScope`] and merged into
+/// `params` *after* argument serialization, so extension and model code can
+/// neither read nor forge it. Hosted providers (the marketplace connector
+/// endpoint) resolve the caller's dispatch/hire from `io.ironclaw/threadId` —
+/// never from tool arguments — which is what lets one stable per-user token
+/// serve concurrent jobs without cross-job data bleed. Absent a thread scope
+/// (non-threaded runtime) the key is omitted rather than sent empty.
+fn sep414_meta(scope: &ResourceScope) -> Value {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "io.ironclaw/userId".to_string(),
+        Value::String(scope.user_id.as_str().to_string()),
+    );
+    meta.insert(
+        "io.ironclaw/invocationId".to_string(),
+        Value::String(scope.invocation_id.to_string()),
+    );
+    if let Some(thread_id) = scope.thread_id.as_ref() {
+        meta.insert(
+            "io.ironclaw/threadId".to_string(),
+            Value::String(thread_id.as_str().to_string()),
+        );
+    }
+    Value::Object(meta)
+}
+
+/// Merge [`sep414_meta`] into an outbound `params` object, creating the object
+/// when the method carries no other params (e.g. `tools/list`, whose params are
+/// `None`). Both call sites (`call_tool`, `discover_tools`) pass either an
+/// object or `None`; a non-object value is preserved under `"params"` so a
+/// future caller cannot silently drop it.
+fn params_with_sep414_meta(params: Option<Value>, scope: &ResourceScope) -> Value {
+    let mut object = match params {
+        Some(Value::Object(map)) => map,
+        None => serde_json::Map::new(),
+        Some(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("params".to_string(), other);
+            map
+        }
+    };
+    object.insert("_meta".to_string(), sep414_meta(scope));
+    Value::Object(object)
 }
 
 fn encode_json_rpc_request(
@@ -1854,7 +1912,137 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironclaw_host_api::{
+        AgentId, InvocationId, MissionId, ProjectId, TenantId, ThreadId, UserId,
+    };
     use serde_json::json;
+
+    /// Never invoked: `plan_json_rpc` builds the outbound body without touching
+    /// the transport. Present only to satisfy `McpHostHttpClient`'s `H: McpHostHttp`.
+    struct UnusedHttp;
+
+    #[async_trait]
+    impl McpHostHttp for UnusedHttp {
+        async fn request(
+            &self,
+            _request: CapabilityHostHttpRequest,
+        ) -> Result<McpHostHttpResponse, McpHostHttpError> {
+            unreachable!("plan_json_rpc must not touch the transport")
+        }
+    }
+
+    fn planning_client() -> McpHostHttpClient<UnusedHttp, StaticMcpHostHttpEgressPlanner> {
+        McpHostHttpClient::new(
+            UnusedHttp,
+            StaticMcpHostHttpEgressPlanner::new(McpHostHttpEgressPlan::default()),
+        )
+    }
+
+    fn scope_with_thread(thread_id: Option<&str>) -> ResourceScope {
+        ResourceScope {
+            tenant_id: TenantId::new("tenant-a").unwrap(),
+            user_id: UserId::new("user-a").unwrap(),
+            agent_id: Some(AgentId::new("agent-a").unwrap()),
+            project_id: Some(ProjectId::new("project-a").unwrap()),
+            mission_id: Some(MissionId::new("mission-a").unwrap()),
+            thread_id: thread_id.map(|id| ThreadId::new(id).unwrap()),
+            invocation_id: InvocationId::new(),
+        }
+    }
+
+    fn meta_probe_request(scope: ResourceScope, input: Value) -> McpClientRequest {
+        McpClientRequest {
+            provider: ExtensionId::new("agent-market").unwrap(),
+            capability_id: CapabilityId::new("agent-market.timeless__list_meetings").unwrap(),
+            scope,
+            transport: "http".to_string(),
+            command: None,
+            args: Vec::new(),
+            url: Some("https://mcp.example.test/rpc".to_string()),
+            input,
+            max_output_bytes: 1_000_000,
+        }
+    }
+
+    /// The outbound `params` object that `plan_json_rpc` actually encodes.
+    fn planned_params(client: &McpHostHttpClient<UnusedHttp, StaticMcpHostHttpEgressPlanner>, request: &McpClientRequest, method: McpJsonRpcMethod, params: Option<Value>) -> Value {
+        let planned = client
+            .plan_json_rpc(request, Some(1), method, params)
+            .expect("planning succeeds");
+        let decoded: Value = serde_json::from_slice(&planned.body).expect("body is JSON");
+        decoded
+            .get("params")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn tools_call_stamps_sep414_thread_attribution_on_the_wire() {
+        let client = planning_client();
+        let request =
+            meta_probe_request(scope_with_thread(Some("thread-a")), json!({"limit": 10}));
+
+        let params = planned_params(
+            &client,
+            &request,
+            McpJsonRpcMethod::ToolsCall,
+            Some(json!({ "name": "timeless__list_meetings", "arguments": { "limit": 10 } })),
+        );
+
+        // Attribution is carried in `_meta`, never derived from arguments — this
+        // is what lets one stable per-user token serve concurrent jobs without a
+        // buyer seeing another buyer's connector.
+        assert_eq!(params["_meta"]["io.ironclaw/threadId"], json!("thread-a"));
+        assert_eq!(params["_meta"]["io.ironclaw/userId"], json!("user-a"));
+        assert!(params["_meta"]["io.ironclaw/invocationId"].is_string());
+        // Original tool arguments survive the merge untouched.
+        assert_eq!(params["name"], json!("timeless__list_meetings"));
+        assert_eq!(params["arguments"], json!({ "limit": 10 }));
+    }
+
+    #[test]
+    fn tools_list_stamps_sep414_thread_attribution_even_without_other_params() {
+        let client = planning_client();
+        let request = meta_probe_request(scope_with_thread(Some("thread-a")), Value::Null);
+
+        // `tools/list` carries no other params (`None`) — the block must still
+        // materialize so per-turn discovery is attributed to its thread.
+        let params = planned_params(&client, &request, McpJsonRpcMethod::ToolsList, None);
+
+        assert_eq!(params["_meta"]["io.ironclaw/threadId"], json!("thread-a"));
+        assert_eq!(params["_meta"]["io.ironclaw/userId"], json!("user-a"));
+    }
+
+    #[test]
+    fn initialize_handshake_is_not_stamped_with_attribution() {
+        let client = planning_client();
+        let request = meta_probe_request(scope_with_thread(Some("thread-a")), Value::Null);
+
+        // The handshake predates any turn attribution; stamping it would corrupt
+        // the exact `initialize` params contract.
+        let params = planned_params(
+            &client,
+            &request,
+            McpJsonRpcMethod::Initialize,
+            Some(json!({ "protocolVersion": "2025-06-18" })),
+        );
+
+        assert!(params.get("_meta").is_none());
+        assert_eq!(params["protocolVersion"], json!("2025-06-18"));
+    }
+
+    #[test]
+    fn thread_less_scope_omits_thread_id_but_keeps_user_attribution() {
+        let client = planning_client();
+        let request = meta_probe_request(scope_with_thread(None), Value::Null);
+
+        let params = planned_params(&client, &request, McpJsonRpcMethod::ToolsList, None);
+
+        // A non-threaded runtime sends no thread key (absent, not empty) but is
+        // still user-attributed.
+        assert!(params["_meta"].get("io.ironclaw/threadId").is_none());
+        assert_eq!(params["_meta"]["io.ironclaw/userId"], json!("user-a"));
+    }
 
     #[test]
     fn mcp_auth_context_preserves_product_auth_oauth_setup() {
