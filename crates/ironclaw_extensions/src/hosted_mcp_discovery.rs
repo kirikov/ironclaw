@@ -79,7 +79,13 @@ pub fn package_with_discovered_hosted_mcp_tools(
 }
 
 fn hosted_http_mcp_url(package: &ExtensionPackage) -> Option<&str> {
-    if package.manifest.source != ManifestSource::HostBundled {
+    // InstalledLocal (operator-installed volume) providers are discovery-eligible
+    // alongside compiled-in HostBundled ones (P2b). Discovery still runs under
+    // the caller's scope and leases the caller's credential.
+    if !matches!(
+        package.manifest.source,
+        ManifestSource::HostBundled | ManifestSource::InstalledLocal
+    ) {
         return None;
     }
     let ExtensionRuntime::Mcp {
