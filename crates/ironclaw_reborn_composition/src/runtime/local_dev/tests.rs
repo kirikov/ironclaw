@@ -1565,6 +1565,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -1875,6 +1876,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -2393,6 +2395,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -2643,6 +2646,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -2727,6 +2731,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -2929,6 +2934,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -3266,6 +3272,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -3696,6 +3703,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -3853,6 +3861,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -4709,6 +4718,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -4825,6 +4835,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -5075,6 +5086,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -5194,6 +5206,7 @@ mod tests {
                 .system_extensions_lifecycle_mounts_for_test()
                 .clone(),
             extension_surface_source: ExtensionCapabilitySurfaceSource::default(),
+            hosted_mcp_overlay_refresher: None,
             input_resolver,
             result_writer,
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
