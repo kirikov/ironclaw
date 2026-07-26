@@ -47,7 +47,9 @@ impl SnapshotToolResolver {
 impl ToolResolver for SnapshotToolResolver {
     fn resolve(&self, capability_id: &CapabilityId) -> Option<ResolvedCapability> {
         let snapshot = self.watch.current();
-        let binding = snapshot.resolve_tool(capability_id)?;
+        let binding = snapshot
+            .resolve_tool(capability_id)
+            .or_else(|| snapshot.resolve_hosted_mcp_tool(capability_id))?;
         let provider = ExtensionId::new(binding.declaration.id.as_str()).ok()?;
         let runtime = binding.declaration.runtime.kind();
         Some(ResolvedCapability {
