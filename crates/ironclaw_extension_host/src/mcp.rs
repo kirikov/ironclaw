@@ -139,7 +139,10 @@ impl HostedMcpEndpoint {
 }
 
 pub fn hosted_http_mcp_endpoint(package: &ExtensionPackage) -> Option<HostedMcpEndpoint> {
-    if package.manifest.source != ManifestSource::HostBundled {
+    if !matches!(
+        package.manifest.source,
+        ManifestSource::HostBundled | ManifestSource::InstalledLocal
+    ) {
         return None;
     }
     let ExtensionRuntime::Mcp {
