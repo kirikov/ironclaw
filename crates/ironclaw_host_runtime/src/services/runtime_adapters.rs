@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::FutureExt;
 
-use ironclaw_extensions::ExtensionPackage;
+use ironclaw_extensions::{ExtensionPackage, OverlayScope, ScopedPackageOverlay};
 use ironclaw_host_api::{
     CapabilityDescriptor, InvocationOrigin, MountView, ResourceEstimate, ResourceReservation,
     UserId, runtime_policy::EffectiveRuntimePolicy,
@@ -407,11 +407,51 @@ where
 #[derive(Clone)]
 pub(super) struct McpRuntimeAdapter {
     executor: Arc<dyn McpExecutor>,
+    /// Per-user discovered-package overlay (P2b). The scope-free resolver binds
+    /// the STATIC package, so a DISCOVERED hosted-MCP tool would fail
+    /// `CapabilityNotDeclared` (its id is not in the static package). At
+    /// dispatch the scope is known, so we swap in the caller's discovered
+    /// package when it declares the requested capability. `None` when no overlay
+    /// is wired (static-only deployments).
+    scoped_overlay: Option<Arc<ScopedPackageOverlay>>,
 }
 
 impl McpRuntimeAdapter {
     pub(super) fn from_executor(executor: Arc<dyn McpExecutor>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            scoped_overlay: None,
+        }
+    }
+
+    pub(super) fn with_scoped_overlay(mut self, overlay: Arc<ScopedPackageOverlay>) -> Self {
+        self.scoped_overlay = Some(overlay);
+        self
+    }
+
+    /// The caller's discovered package for `capability_id`'s provider, when the
+    /// overlay holds one that actually declares this capability. Returned as an
+    /// owned `Arc` so the borrow used as `McpExecutionRequest.package` lives for
+    /// the dispatch call.
+    fn discovered_package(
+        &self,
+        scope: &ResourceScope,
+        capability_id: &CapabilityId,
+    ) -> Option<Arc<ExtensionPackage>> {
+        let overlay = self.scoped_overlay.as_ref()?;
+        let (provider, _tool) = capability_id.as_str().split_once('.')?;
+        let extension_id = ironclaw_host_api::ExtensionId::new(provider).ok()?;
+        let owner = OverlayScope::new(
+            scope.tenant_id.clone(),
+            scope.user_id.clone(),
+            scope.thread_id.clone(),
+        );
+        let (package, _freshness) = overlay.get(&owner, &extension_id)?;
+        package
+            .capabilities
+            .iter()
+            .any(|descriptor| &descriptor.id == capability_id)
+            .then_some(package)
     }
 }
 
@@ -425,12 +465,19 @@ where
         &self,
         request: RuntimeLaneRequest<'_, F, G>,
     ) -> Result<RuntimeAdapterResult, DispatchError> {
+        // The scope-free resolver bound the STATIC package; swap in the caller's
+        // discovered package (P2b) when it declares this capability, so a
+        // per-user hosted-MCP tool is not rejected as `CapabilityNotDeclared`
+        // and its descriptor's credential requirements resolve. Held as an owned
+        // `Arc` so the `&ExtensionPackage` borrow lives for the executor call.
+        let discovered = self.discovered_package(&request.scope, request.capability_id);
+        let package = discovered.as_deref().unwrap_or(request.package);
         let execution = self
             .executor
             .execute_extension_json(
                 request.governor,
                 McpExecutionRequest {
-                    package: request.package,
+                    package,
                     capability_id: request.capability_id,
                     scope: request.scope,
                     estimate: request.estimate,

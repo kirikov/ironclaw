@@ -670,7 +670,10 @@ where
         });
         let mcp = self.mcp_runtime.as_ref().map(|runtime| {
             ServiceResolvedRuntimeAdapter::new(
-                Arc::new(McpRuntimeAdapter::from_executor(Arc::clone(runtime))),
+                Arc::new(
+                    McpRuntimeAdapter::from_executor(Arc::clone(runtime))
+                        .with_scoped_overlay(Arc::clone(&self.scoped_overlay)),
+                ),
                 Arc::clone(&invocation_services),
             )
         });

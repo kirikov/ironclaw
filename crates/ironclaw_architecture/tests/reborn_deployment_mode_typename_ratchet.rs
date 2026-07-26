@@ -100,6 +100,9 @@ const FROZEN_OTHER_MODE_TYPES: &[&str] = &[
     "HostedMcpDiscoveryEgress",
     "HostedMcpDiscoveryError",
     "HostedMcpEndpoint",
+    // P2b turn-start refresher that populates the per-user hosted-MCP discovery
+    // overlay — same Bucket-3 "hosted MCP" domain class, not a deployment tier.
+    "HostedMcpOverlayRefresher",
     // --- Local* (non-LocalDev): the `local_trigger_access` module has been
     //     folded to a config value — fire-time trigger access is now the
     //     `TriggerFireAccessPolicy` on `RebornRuntimeInput`, backed by config
