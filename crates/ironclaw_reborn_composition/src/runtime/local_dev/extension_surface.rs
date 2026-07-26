@@ -9,7 +9,7 @@ use ironclaw_host_api::{
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 
 use ironclaw_extension_host::extension_lifecycle::RebornLocalExtensionManagementPort;
-use ironclaw_extensions::{InstallationOwner, OverlayOwner, ScopedPackageOverlay};
+use ironclaw_extensions::{InstallationOwner, OverlayScope, ScopedPackageOverlay};
 use ironclaw_product::ProductSurfaceFailure;
 
 #[derive(Clone, Default)]
@@ -101,7 +101,7 @@ impl ExtensionCapabilitySurface {
     /// for replaced by its discovered (per-principal) capability set. The
     /// overlay applies only to extensions with a caller-visible active
     /// installation (fail closed).
-    fn caller_capabilities(&self, caller: &OverlayOwner) -> Vec<ActiveExtensionCapability> {
+    fn caller_capabilities(&self, caller: &OverlayScope) -> Vec<ActiveExtensionCapability> {
         let user = caller.user_id();
         let overlay_capabilities = self.overlay_capabilities(caller);
         let overlaid_providers: Vec<&ExtensionId> = overlay_capabilities
@@ -119,7 +119,7 @@ impl ExtensionCapabilitySurface {
         merged
     }
 
-    fn overlay_capabilities(&self, caller: &OverlayOwner) -> Vec<ActiveExtensionCapability> {
+    fn overlay_capabilities(&self, caller: &OverlayScope) -> Vec<ActiveExtensionCapability> {
         let Some(overlay) = &self.scoped_overlay else {
             return Vec::new();
         };
@@ -157,7 +157,7 @@ impl ExtensionCapabilitySurface {
     pub(in crate::runtime) fn grants(
         &self,
         grantee: &ExtensionId,
-        caller: &OverlayOwner,
+        caller: &OverlayScope,
     ) -> Vec<CapabilityGrant> {
         self.caller_capabilities(caller)
             .iter()
@@ -185,7 +185,7 @@ impl ExtensionCapabilitySurface {
     /// advertised to other users' surfaces.
     pub(super) fn provider_trust(
         &self,
-        caller: &OverlayOwner,
+        caller: &OverlayScope,
     ) -> BTreeMap<ExtensionId, TrustDecision> {
         let mut effects_by_provider: BTreeMap<ExtensionId, Vec<EffectKind>> = BTreeMap::new();
         for capability in &self.caller_capabilities(caller) {
@@ -284,8 +284,8 @@ mod tests {
     use super::*;
     use ironclaw_host_api::TenantId;
 
-    fn test_owner(user: &ironclaw_host_api::UserId) -> OverlayOwner {
-        OverlayOwner::new(TenantId::new("tenant-a").unwrap(), user.clone())
+    fn test_owner(user: &ironclaw_host_api::UserId) -> OverlayScope {
+        OverlayScope::new(TenantId::new("tenant-a").unwrap(), user.clone(), None)
     }
     use ironclaw_host_api::{
         CapabilityId, NetworkScheme, NetworkTargetPattern, PermissionMode, UserId,

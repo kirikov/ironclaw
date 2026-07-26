@@ -5,7 +5,8 @@
 //! hirer-granted connector tools for a worker-agent bearer). The global
 //! [`crate::SharedExtensionRegistry`] holds exactly one surface per extension
 //! id, so per-principal discovered surfaces live here instead: an in-memory,
-//! TTL-bounded cache keyed by ([`OverlayOwner`] = tenant + user, `ExtensionId`).
+//! TTL-bounded cache keyed by ([`OverlayScope`] = tenant + user + thread,
+//! `ExtensionId`).
 //!
 //! This is a **derived cache**, not lifecycle state: nothing here is
 //! persisted, installation records are never touched, and a restart simply
@@ -14,11 +15,13 @@
 //! snapshot — the same view feeds the model surface, authorization, dispatch
 //! and egress planning so no parallel resolution pipeline exists.
 //!
-//! Security invariant: entries are keyed by the full tenant+user owner whose
-//! credential produced the discovery result — never by a bare `UserId`, which
-//! is unique only within a tenant — and a view only ever merges entries for
-//! the single owner it was built for. Cross-user AND cross-tenant leakage are
-//! regression-tested failure modes.
+//! Security invariant: entries are keyed by the full tenant + user + thread
+//! scope whose credential produced the discovery result — never by a bare
+//! `UserId` (unique only within a tenant), and never by owner alone (a managed
+//! agent serves many hires under one identity, distinguished only by thread) —
+//! and a view only ever merges entries for the single scope it was built for.
+//! Cross-user, cross-tenant AND cross-thread leakage are regression-tested
+//! failure modes.
 
 use std::{
     collections::HashMap,
@@ -26,29 +29,42 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ironclaw_host_api::{CapabilityDescriptor, CapabilityId, ExtensionId, TenantId, UserId};
+use ironclaw_host_api::{CapabilityDescriptor, CapabilityId, ExtensionId, TenantId, ThreadId, UserId};
 use parking_lot::RwLock;
 
 use crate::{CapabilityVisibility, ExtensionPackage, ExtensionRegistry};
 
-/// The owner axis a discovered surface is keyed by: `tenant_id` **and**
-/// `user_id`. A bare `UserId` is not a safe key — `UserId` is unique only
-/// within a tenant, so keying by user alone lets one tenant's discovered
-/// tool surface (and the refresher's negative-cache / single-flight verdicts)
-/// bleed into another tenant that reuses the same user id. Every overlay and
-/// refresher operation takes this owner so the tenant axis can never be
-/// dropped at a call site.
+/// The scope axes a discovered surface is keyed by: `tenant_id`, `user_id`,
+/// **and** `thread_id`.
+///
+/// The tenant axis is non-negotiable — a bare `UserId` is unique only within a
+/// tenant, so keying by user alone lets one tenant's discovered tool surface
+/// (and the refresher's negative-cache / single-flight verdicts) bleed into
+/// another tenant that reuses the same user id.
+///
+/// The thread axis is load-bearing for **isolation**, not merely cache
+/// efficiency. A managed worker agent serves several hires under ONE IronClaw
+/// identity (its own tenant + user); the only thing distinguishing hire A's
+/// discovered surface (e.g. a buyer's `timeless__*` connector) from hire B's
+/// (`firefly__*`) is the thread each job runs on. Keyed by owner alone, hire
+/// A's cached tools would serve hire B — a cross-buyer personal-data leak.
+/// `thread_id` is `None` only for non-threaded runtimes (one execution context,
+/// so the owner axis is sufficient); consumers treat `None` as its own bucket,
+/// never a wildcard. Every overlay and refresher operation takes this scope so
+/// no axis can be dropped at a call site.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct OverlayOwner {
+pub struct OverlayScope {
     tenant_id: TenantId,
     user_id: UserId,
+    thread_id: Option<ThreadId>,
 }
 
-impl OverlayOwner {
-    pub fn new(tenant_id: TenantId, user_id: UserId) -> Self {
+impl OverlayScope {
+    pub fn new(tenant_id: TenantId, user_id: UserId, thread_id: Option<ThreadId>) -> Self {
         Self {
             tenant_id,
             user_id,
+            thread_id,
         }
     }
 
@@ -58,6 +74,10 @@ impl OverlayOwner {
 
     pub fn user_id(&self) -> &UserId {
         &self.user_id
+    }
+
+    pub fn thread_id(&self) -> Option<&ThreadId> {
+        self.thread_id.as_ref()
     }
 }
 
@@ -95,13 +115,13 @@ pub enum OverlayFreshness {
     Stale,
 }
 
-/// In-memory discovered-package cache keyed by owner ([`OverlayOwner`]:
-/// tenant + user) and extension. Composition owns one instance and shares it
+/// In-memory discovered-package cache keyed by scope ([`OverlayScope`]:
+/// tenant + user + thread) and extension. Composition owns one instance and shares it
 /// (via `Arc`) with every registry consumer that resolves capabilities for a
 /// scoped request.
 #[derive(Debug, Default)]
 pub struct ScopedPackageOverlay {
-    entries: RwLock<HashMap<(OverlayOwner, ExtensionId), OverlayEntry>>,
+    entries: RwLock<HashMap<(OverlayScope, ExtensionId), OverlayEntry>>,
 }
 
 impl ScopedPackageOverlay {
@@ -110,7 +130,7 @@ impl ScopedPackageOverlay {
     }
 
     /// Store (or refresh) `owner`'s discovered surface for `package.id`.
-    pub fn insert(&self, owner: OverlayOwner, package: ExtensionPackage, ttl: Duration) {
+    pub fn insert(&self, owner: OverlayScope, package: ExtensionPackage, ttl: Duration) {
         let key = (owner, package.id.clone());
         let entry = OverlayEntry {
             package: Arc::new(package),
@@ -120,7 +140,7 @@ impl ScopedPackageOverlay {
     }
 
     /// Drop `owner`'s entry for `extension_id` (e.g. missing credential).
-    pub fn remove(&self, owner: &OverlayOwner, extension_id: &ExtensionId) {
+    pub fn remove(&self, owner: &OverlayScope, extension_id: &ExtensionId) {
         self.entries
             .write()
             .remove(&(owner.clone(), extension_id.clone()));
@@ -140,7 +160,7 @@ impl ScopedPackageOverlay {
     /// paths below.
     pub fn get(
         &self,
-        owner: &OverlayOwner,
+        owner: &OverlayScope,
         extension_id: &ExtensionId,
     ) -> Option<(Arc<ExtensionPackage>, OverlayFreshness)> {
         let entries = self.entries.read();
@@ -156,7 +176,7 @@ impl ScopedPackageOverlay {
     /// Re-arm the TTL on an existing entry (a transient discovery failure kept
     /// the last-good surface; avoid re-running discovery every turn while the
     /// provider is down).
-    pub fn touch(&self, owner: &OverlayOwner, extension_id: &ExtensionId, ttl: Duration) {
+    pub fn touch(&self, owner: &OverlayScope, extension_id: &ExtensionId, ttl: Duration) {
         if let Some(entry) = self
             .entries
             .write()
@@ -169,7 +189,7 @@ impl ScopedPackageOverlay {
     /// The owner's last-good overlay packages (for grant/provider-trust minting
     /// at surface-request time). Serves stale entries too — see
     /// [`OverlayFreshness`]: freshness gates re-discovery, not serving.
-    pub fn packages_for(&self, owner: &OverlayOwner) -> Vec<Arc<ExtensionPackage>> {
+    pub fn packages_for(&self, owner: &OverlayScope) -> Vec<Arc<ExtensionPackage>> {
         self.entries
             .read()
             .iter()
@@ -187,7 +207,7 @@ impl ScopedPackageOverlay {
     /// to its `&ExtensionRegistry` API.
     pub fn merged_snapshot(
         &self,
-        owner: &OverlayOwner,
+        owner: &OverlayScope,
         global: Arc<ExtensionRegistry>,
     ) -> Arc<ExtensionRegistry> {
         let packages = self.packages_for(owner);
@@ -211,7 +231,7 @@ impl ScopedPackageOverlay {
     /// discovered packages (fresh or stale — serving is not freshness-gated).
     pub fn view_for(
         &self,
-        owner: &OverlayOwner,
+        owner: &OverlayScope,
         global: Arc<ExtensionRegistry>,
     ) -> OverlaidRegistryView {
         let overlays = self.packages_for(owner);
@@ -404,12 +424,20 @@ runtime_credentials = [
         UserId::new(id).expect("user id")
     }
 
-    fn owner(id: &str) -> OverlayOwner {
-        OverlayOwner::new(TenantId::new("tenant-a").expect("tenant"), user(id))
+    fn owner(id: &str) -> OverlayScope {
+        OverlayScope::new(TenantId::new("tenant-a").expect("tenant"), user(id), None)
     }
 
-    fn owner_in(tenant: &str, id: &str) -> OverlayOwner {
-        OverlayOwner::new(TenantId::new(tenant).expect("tenant"), user(id))
+    fn owner_in(tenant: &str, id: &str) -> OverlayScope {
+        OverlayScope::new(TenantId::new(tenant).expect("tenant"), user(id), None)
+    }
+
+    fn owner_thread(id: &str, thread: &str) -> OverlayScope {
+        OverlayScope::new(
+            TenantId::new("tenant-a").expect("tenant"),
+            user(id),
+            Some(ThreadId::new(thread).expect("thread id")),
+        )
     }
 
     fn capability(id: &str) -> CapabilityId {
@@ -545,6 +573,62 @@ runtime_credentials = [
                 .is_none()
         );
         assert!(overlay.get(&tenant_b, &static_package().id).is_none());
+    }
+
+    #[test]
+    fn overlay_entries_never_leak_across_threads_for_the_same_owner() {
+        // The managed-agent isolation case: buyer A hires the agent and grants
+        // `timeless`, buyer B hires the SAME agent and grants `firefly`. Both
+        // jobs run under the agent's single IronClaw identity (same tenant +
+        // user), distinguished only by the thread each dispatch runs on. Keyed
+        // by owner alone, job B would see job A's `timeless` — a cross-buyer
+        // personal-data leak. Keyed by thread, each job sees only its own.
+        let overlay = ScopedPackageOverlay::new();
+        let job_a = owner_thread("worker-agent", "thread-a");
+        let job_b = owner_thread("worker-agent", "thread-b");
+        overlay.insert(
+            job_a.clone(),
+            discovered_package("timeless__list_meetings"),
+            Duration::from_secs(60),
+        );
+        overlay.insert(
+            job_b.clone(),
+            discovered_package("firefly__list_documents"),
+            Duration::from_secs(60),
+        );
+
+        let a_view = overlay.view_for(&job_a, global_registry());
+        assert!(
+            a_view
+                .get_capability(&capability("agent-market.timeless__list_meetings"))
+                .is_some(),
+            "job A sees its own connector"
+        );
+        assert!(
+            a_view
+                .get_capability(&capability("agent-market.firefly__list_documents"))
+                .is_none(),
+            "job A must NOT see buyer B's connector"
+        );
+
+        let b_view = overlay.view_for(&job_b, global_registry());
+        assert!(
+            b_view
+                .get_capability(&capability("agent-market.firefly__list_documents"))
+                .is_some(),
+            "job B sees its own connector"
+        );
+        assert!(
+            b_view
+                .get_capability(&capability("agent-market.timeless__list_meetings"))
+                .is_none(),
+            "job B must NOT see buyer A's connector"
+        );
+
+        // And a thread-less scope for the same owner is its own bucket — it sees
+        // neither job's surface.
+        let threadless = owner("worker-agent");
+        assert!(!overlay.view_for(&threadless, global_registry()).has_overlays());
     }
 
     #[test]
