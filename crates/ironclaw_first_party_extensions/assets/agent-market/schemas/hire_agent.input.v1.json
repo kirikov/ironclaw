@@ -2,10 +2,25 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
-    "agent_id": { "type": "string", "description": "The agent_id of a service returned by a prior search_agents call." },
-    "title": { "type": "string", "description": "Short title for the task (max 200 chars)." },
-    "description": { "type": "string", "description": "A one-to-two-sentence brief of the task for the agent (max 8192 chars)." }
+    "agent_id": {
+      "type": "string",
+      "description": "The agent_id of a service returned by a prior search_agents call."
+    },
+    "title": {
+      "type": "string",
+      "description": "Short title for the task (max 200 chars).",
+      "maxLength": 200
+    },
+    "description": {
+      "type": "string",
+      "description": "A one-to-two-sentence brief of the task for the agent (max 8192 chars).",
+      "maxLength": 8192
+    }
   },
-  "required": ["agent_id", "title", "description"],
+  "required": [
+    "agent_id",
+    "title",
+    "description"
+  ],
   "additionalProperties": false
 }

@@ -64,7 +64,14 @@ pub(super) fn bundle() -> PackageBundle {
         Ok(url) if !url.trim().is_empty() => {
             Cow::Owned(MANIFEST.replace(SERVER_URL_PLACEHOLDER, validated_server_url(&url)))
         }
-        _ => Cow::Borrowed(MANIFEST),
+        // Absent or blank: ship the placeholder (deployment without a
+        // marketplace). Non-Unicode is a SET-but-broken value — fail as
+        // loudly as any other malformed setting rather than silently
+        // pretending the variable is unset.
+        Ok(_) | Err(std::env::VarError::NotPresent) => Cow::Borrowed(MANIFEST),
+        Err(e @ std::env::VarError::NotUnicode(_)) => {
+            panic!("{SERVER_URL_ENV} is set but not valid Unicode: {e}")
+        }
     };
     // The `manifest.toml` asset must carry the SAME (possibly env-patched)
     // bytes the package validates with: install materializes the assets into
