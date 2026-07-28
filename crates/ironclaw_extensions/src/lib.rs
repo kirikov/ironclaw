@@ -415,7 +415,7 @@ pub use host_api::capability_provider::{
 };
 pub use hosted_mcp_discovery::{
     HostedMcpDiscoveredTool, HostedMcpDiscoveredToolAnnotations, is_hosted_http_mcp_package,
-    package_with_discovered_hosted_mcp_tools,
+    merge_discovered_hosted_mcp_package, package_with_discovered_hosted_mcp_tools,
 };
 pub use resolved::{
     ResolvedAuthSurface, ResolvedExtensionManifest, ResolvedHostApiRef, ResolvedMcpDeclaration,

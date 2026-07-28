@@ -968,6 +968,9 @@ fn mcp_attribution_unknown_value_is_rejected() {
         "[mcp]\nattribution = \"telemetry-v9\"\n",
     );
     parse_v3(&manifest).expect_err("unknown attribution value must not parse");
+}
+
+// ---------------------------------------------------------------------------
 // [mcp] static tools: additive per-tool effects
 // ---------------------------------------------------------------------------
 

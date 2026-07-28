@@ -72,6 +72,7 @@ use crate::{
     manifest_runtime_credential_auth_requirements, package_declares_inbound_product_adapter,
     package_runtime_credential_auth_requirements,
 };
+use ironclaw_extensions::merge_discovered_hosted_mcp_package;
 
 use crate::ActiveExtensionPublisher;
 use crate::{
@@ -1265,6 +1266,28 @@ impl ExtensionLifecycleManager {
         {
             return activation_credentials_incomplete_response(package_ref, missing);
         }
+        // Hosted-MCP catalogs are per-principal upstream but the active
+        // registry keys one package per extension (#6778): publishing this
+        // caller's discovery verbatim would evict every other principal's
+        // tools. Merge with the published package so fresh tools win per
+        // capability id and the rest of the catalog survives.
+        let active_package = match self
+            .active_extensions
+            .snapshot()
+            .get_extension(&extension_id)
+        {
+            Some(published) => merge_discovered_hosted_mcp_package(&active_package, published)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        %error,
+                        extension_id = %extension_id.as_str(),
+                        "hosted MCP discovery could not merge with the published catalog; \
+                         publishing the fresh discovery only"
+                    );
+                    active_package
+                }),
+            None => active_package,
+        };
         self.commit_activation(
             package_ref,
             &extension_id,
