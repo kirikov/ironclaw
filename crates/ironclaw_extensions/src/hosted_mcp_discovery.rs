@@ -246,11 +246,15 @@ fn discovered_capability_manifest(
     // hard approval floor keyed on it) when the live catalog replaces the
     // static one, and an `allow` declared for autonomous read tools survives
     // discovery. Unknown discovered tools keep the conservative derived
-    // effects + Ask.
+    // effects + Ask. Only MODEL-visible declarations participate: a
+    // host-internal row (the synthesized `<id>.mcp_server` connection
+    // template) is host plumbing, and a server returning a tool named after
+    // it must not inherit that row's permissions.
     let declared = package
         .manifest
         .capabilities
         .iter()
+        .filter(|capability| capability.visibility == CapabilityVisibility::Model)
         .find(|capability| capability.id == capability_id);
     let (effects, default_permission) = match declared {
         Some(capability) => {
@@ -471,6 +475,40 @@ runtime_credentials = [
             .expect("unknown tool discovered");
         assert!(!unknown.effects.contains(&EffectKind::Financial));
         assert_eq!(unknown.default_permission, ironclaw_host_api::PermissionMode::Ask, "unknown discovered tools stay Ask");
+    }
+
+    /// A host-internal manifest row (the synthesized `<id>.mcp_server`
+    /// connection template) is host plumbing, not a reviewed tool grant: a
+    /// server returning a tool with the matching name must NOT adopt its
+    /// declaration — it stays on derived effects + Ask.
+    #[test]
+    fn discovered_tool_does_not_adopt_host_internal_declarations() {
+        let mut package = notion_package();
+        let mut template = package.manifest.capabilities[0].clone();
+        template.id = ironclaw_host_api::CapabilityId::new("notion.mcp_server").unwrap();
+        template.visibility = CapabilityVisibility::HostInternal;
+        template.default_permission = ironclaw_host_api::PermissionMode::Allow;
+        package.manifest.capabilities.push(template);
+
+        let tools = vec![HostedMcpDiscoveredTool {
+            name: "mcp_server".to_string(),
+            description: "Tool named after the connection template".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: HostedMcpDiscoveredToolAnnotations::default(),
+        }];
+        let discovered = package_with_discovered_hosted_mcp_tools(&package, &tools)
+            .expect("build discovered package");
+
+        let shadowed = discovered
+            .capabilities
+            .iter()
+            .find(|c| c.id.as_str() == "notion.mcp_server")
+            .expect("tool discovered");
+        assert_eq!(
+            shadowed.default_permission,
+            ironclaw_host_api::PermissionMode::Ask,
+            "a host-internal declaration must not hand its permission to a discovered tool"
+        );
     }
 
     fn discovered_tool(name: &str, description: &str) -> HostedMcpDiscoveredTool {

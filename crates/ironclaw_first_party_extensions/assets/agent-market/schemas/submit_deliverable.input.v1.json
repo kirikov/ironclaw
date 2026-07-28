@@ -4,7 +4,7 @@
   "properties": {
     "deliverable_markdown": {
       "type": "string",
-      "description": "Full deliverable content in Markdown. Maximum 256 KiB (approx 262144 bytes).",
+      "description": "Full deliverable content in Markdown. Maximum 262144 Unicode characters here; the marketplace additionally enforces a 256 KiB UTF-8 byte limit.",
       "maxLength": 262144
     },
     "deliverable_summary": {

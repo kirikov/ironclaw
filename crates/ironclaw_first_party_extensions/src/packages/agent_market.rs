@@ -76,14 +76,17 @@ fn manifest_with_server_url(url: &str) -> String {
 pub(super) fn bundle() -> PackageBundle {
     // Read through the workspace's thread-safe env overlay (the repo-wide
     // replacement for raw `std::env`; tests inject overrides without process
-    // env mutation). Set → validate (blank or malformed fails loudly — a SET
-    // variable must be a real https URL) and patch [mcp].server through the
-    // TOML model. Absent → ship the placeholder manifest: the deployment has
-    // no marketplace and the extension points nowhere.
-    let manifest_toml = match ironclaw_common::env_helpers::env_or_override(SERVER_URL_ENV) {
-        Some(url) => Cow::Owned(manifest_with_server_url(validated_server_url(&url))),
-        None => Cow::Borrowed(MANIFEST),
-    };
+    // env mutation). The `_present` variant surfaces a SET-but-empty value
+    // instead of folding it into "unset": PRESENT → validate (blank or
+    // malformed fails loudly — a set variable must be a real https URL) and
+    // patch [mcp].server through the TOML model. Absent → ship the
+    // placeholder manifest: the deployment has no marketplace and the
+    // extension points nowhere.
+    let manifest_toml =
+        match ironclaw_common::env_helpers::env_or_override_present(SERVER_URL_ENV) {
+            Some(url) => Cow::Owned(manifest_with_server_url(validated_server_url(&url))),
+            None => Cow::Borrowed(MANIFEST),
+        };
     // The `manifest.toml` asset must carry the SAME (possibly env-patched)
     // bytes the package validates with: install materializes the assets into
     // the extension dir, and a divergent copy would change the manifest hash
@@ -214,6 +217,33 @@ mod tests {
     #[should_panic(expected = "AGENT_MARKET_MCP_URL")]
     fn rejects_blank_value() {
         validated_server_url("   ");
+    }
+
+    /// The caller-level contract for the blank case: `AGENT_MARKET_MCP_URL=""`
+    /// must fail `bundle()` loudly, not silently ship the placeholder — the
+    /// `_present` env read keeps a set-but-empty value visible to validation.
+    /// Uses the runtime-env overlay (no process env mutation); the snapshot is
+    /// restored before the panic assert so the poisoned lock can't leak state.
+    #[test]
+    fn bundle_rejects_a_set_but_blank_value() {
+        let _env = ironclaw_common::env_helpers::lock_env();
+        let snapshot =
+            ironclaw_common::env_helpers::snapshot_runtime_env(super::SERVER_URL_ENV);
+        ironclaw_common::env_helpers::set_runtime_env(super::SERVER_URL_ENV, "");
+        let panic = std::panic::catch_unwind(super::bundle);
+        ironclaw_common::env_helpers::restore_runtime_env(snapshot);
+        let message = match panic {
+            Ok(_) => panic!("bundle() accepted a set-but-blank {}", super::SERVER_URL_ENV),
+            Err(payload) => payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        };
+        assert!(
+            message.contains("set but blank"),
+            "panic must name the operator error: {message}"
+        );
     }
 
     /// A fragment (or any other non-plain component) is rejected by URL
