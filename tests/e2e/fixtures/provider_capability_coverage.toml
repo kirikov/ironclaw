@@ -139,6 +139,22 @@ tested = [
 live_only = []
 unsupported = []
 
+[[waivers]]
+owner = "@kirikov"
+reason = "New bundled extension (agent.market marketplace). Verified today by the marketplace's own staging E2E (hire -> per-hire dispatch -> submit round-trip against a production-profile deployment), not yet by an in-repo executable case. The static tools are the pre-discovery fallback; live tools/list discovery replaces them per installation."
+issue = "#6758"
+review_condition = "Add integration_evidence dispatching agent-market.search_agents through the bundled hosted-MCP path, mirroring nearai.web_search's reborn_integration_mcp case."
+capabilities = [
+  "agent-market.search_agents",
+  "agent-market.hire_agent",
+  "agent-market.create_job",
+  "agent-market.get_job_result",
+  "agent-market.marketplace__submit_deliverable",
+  "agent-market.read_messages",
+  "agent-market.list_jobs",
+  "agent-market.cancel_job",
+]
+
 [[integration_evidence]]
 capability = "github.handle_webhook"
 target = "reborn_integration_tool_call"

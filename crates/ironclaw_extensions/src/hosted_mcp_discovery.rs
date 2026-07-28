@@ -185,6 +185,35 @@ fn discovered_capability_manifest(
         effects.push(EffectKind::ExternalWrite);
     }
 
+    // A HOST-BUNDLED manifest may pre-declare known tools of its server (the
+    // static fallback catalog). Those declarations went through the same
+    // review as the rest of the manifest, so a discovered tool with a
+    // matching capability id ADOPTS its declared effects and permission —
+    // e.g. a marketplace hire tool keeps its `financial` marking (and the
+    // hard approval floor keyed on it) when the live catalog replaces the
+    // static one, and an `allow` declared for autonomous read tools survives
+    // discovery. Unknown discovered tools keep the conservative derived
+    // effects + Ask.
+    let declared = package
+        .manifest
+        .capabilities
+        .iter()
+        .find(|capability| capability.id == capability_id);
+    let (effects, default_permission) = match declared {
+        Some(capability) => {
+            // Union with the derived set: the manifest may add (financial),
+            // never hide what the connection mechanically does.
+            let mut merged = effects;
+            for effect in &capability.effects {
+                if !merged.contains(effect) {
+                    merged.push(*effect);
+                }
+            }
+            (merged, capability.default_permission)
+        }
+        None => (effects, PermissionMode::Ask),
+    };
+
     Ok(CapabilityManifest {
         id: capability_id,
         description: if tool.description.trim().is_empty() {
@@ -193,7 +222,7 @@ fn discovered_capability_manifest(
             tool.description.clone()
         },
         effects,
-        default_permission: PermissionMode::Ask,
+        default_permission,
         visibility: CapabilityVisibility::Model,
         input_schema_ref,
         output_schema_ref: Some(output_schema_ref),
@@ -334,6 +363,61 @@ runtime_credentials = [
             .expect("discovered create-pages capability");
         assert!(create_pages.effects.contains(&EffectKind::ExternalWrite));
         assert_eq!(discovered.manifest.capabilities.len(), 2);
+    }
+
+    /// A discovered tool whose id matches a manifest-declared static tool
+    /// adopts that declaration's effects (unioned with the derived set) and
+    /// default_permission — the reviewed manifest keeps authority over known
+    /// tools across discovery. Unknown discovered tools stay conservative
+    /// (derived effects + Ask).
+    #[test]
+    fn discovered_tool_adopts_matching_manifest_declaration() {
+        let mut package = notion_package();
+        // Declare notion.notion-buy as a known static tool with financial +
+        // allow — the shape a marketplace hire tool ships with.
+        let mut declared = package.manifest.capabilities[0].clone();
+        declared.id = ironclaw_host_api::CapabilityId::new("notion.notion-buy").unwrap();
+        declared.effects = vec![
+            EffectKind::DispatchCapability,
+            EffectKind::Network,
+            EffectKind::UseSecret,
+            EffectKind::Financial,
+        ];
+        declared.default_permission = ironclaw_host_api::PermissionMode::Allow;
+        package.manifest.capabilities.push(declared);
+
+        let tools = vec![
+            HostedMcpDiscoveredTool {
+                name: "notion-buy".to_string(),
+                description: "Spends money".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                annotations: HostedMcpDiscoveredToolAnnotations::default(),
+            },
+            HostedMcpDiscoveredTool {
+                name: "notion-unknown".to_string(),
+                description: "Not declared anywhere".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                annotations: HostedMcpDiscoveredToolAnnotations::default(),
+            },
+        ];
+        let discovered = package_with_discovered_hosted_mcp_tools(&package, &tools)
+            .expect("build discovered package");
+
+        let buy = discovered
+            .capabilities
+            .iter()
+            .find(|c| c.id.as_str() == "notion.notion-buy")
+            .expect("declared tool discovered");
+        assert!(buy.effects.contains(&EffectKind::Financial), "declared financial survives discovery");
+        assert_eq!(buy.default_permission, ironclaw_host_api::PermissionMode::Allow);
+
+        let unknown = discovered
+            .capabilities
+            .iter()
+            .find(|c| c.id.as_str() == "notion.notion-unknown")
+            .expect("unknown tool discovered");
+        assert!(!unknown.effects.contains(&EffectKind::Financial));
+        assert_eq!(unknown.default_permission, ironclaw_host_api::PermissionMode::Ask, "unknown discovered tools stay Ask");
     }
 
     #[test]

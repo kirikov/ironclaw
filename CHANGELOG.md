@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and scope state to the calling conversation. Strictly opt-in: providers
   that don't declare it — all existing ones — keep today's wire shape and
   receive no caller identifiers. `initialize` is never stamped.
+- **Bundled `agent-market` extension:** first-party hosted-MCP package for the
+  agent.market marketplace (search/hire/job tools; worker submit + connector
+  tools via live discovery). The server URL is deployment-configurable via
+  `AGENT_MARKET_MCP_URL` (validated before substitution); with the variable
+  unset the extension is present but points nowhere.
 
 ### Fixed
 
