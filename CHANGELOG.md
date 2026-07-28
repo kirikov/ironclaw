@@ -16,7 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unset the extension is present but points nowhere.
 
 ### Fixed
-### Fixed
 
 - **Agent-loop termination recovery:** tell the model when no-progress or the
   iteration limit would otherwise stop a run, preserve that one-shot warning

@@ -27,19 +27,18 @@ const MANIFEST: &str = include_str!("../../assets/agent-market/manifest.toml");
 /// Deployment-time override for the marketplace MCP origin.
 const SERVER_URL_ENV: &str = "AGENT_MARKET_MCP_URL";
 
-/// The placeholder the shipped manifest carries in `[mcp].server`.
-const SERVER_URL_PLACEHOLDER: &str = "https://MARKET_PUBLIC_HOST/mcp";
-
-/// Validate the operator-supplied server URL before splicing it into TOML
-/// source. The value lands inside a TOML string literal, so an unvalidated
-/// `"` would break out of the literal and inject keys, and a `#` would
-/// comment out the rest of the line — both silently corrupting the manifest.
-/// Requirements mirror what the hosted-MCP endpoint parser accepts: https,
-/// host, no userinfo/query/fragment. Panics with a message naming the env
-/// var — a set-but-malformed value is an operator error, and failing at
-/// startup beats an extension that mysteriously never loads.
+/// Validate the operator-supplied server URL. Requirements mirror what the
+/// hosted-MCP endpoint parser accepts: https, host, no
+/// userinfo/query/fragment. Panics with a message naming the env var — a
+/// set-but-malformed (or set-but-blank) value is an operator error, and
+/// failing at startup beats an extension that mysteriously never loads.
 fn validated_server_url(raw: &str) -> &str {
     let trimmed = raw.trim();
+    assert!(
+        !trimmed.is_empty(),
+        "{SERVER_URL_ENV} is set but blank — unset it entirely for a \
+         deployment without a marketplace, or set a real https URL"
+    );
     let parsed = url::Url::parse(trimmed).unwrap_or_else(|error| {
         panic!("{SERVER_URL_ENV} is not a valid URL ({error}): {trimmed:?}")
     });
@@ -48,30 +47,42 @@ fn validated_server_url(raw: &str) -> &str {
         && parsed.username().is_empty()
         && parsed.password().is_none()
         && parsed.query().is_none()
-        && parsed.fragment().is_none()
-        && !trimmed.contains(['"', '#', '\\'])
-        && !trimmed.chars().any(char::is_whitespace);
+        && parsed.fragment().is_none();
     assert!(
         ok,
         "{SERVER_URL_ENV} must be a plain https URL (host + path only, no \
-         userinfo/query/fragment or TOML-significant characters): {trimmed:?}"
+         userinfo/query/fragment): {trimmed:?}"
     );
     trimmed
 }
 
+/// Substitute `[mcp].server` through the TOML model rather than raw string
+/// replacement: parse → set the one field → re-serialize. No placeholder
+/// string is duplicated between this module and the manifest (an endpoint
+/// edit in the asset cannot silently detach the env override), and the value
+/// never touches TOML source syntax, so no character class of the URL can
+/// corrupt adjacent keys.
+fn manifest_with_server_url(url: &str) -> String {
+    let mut manifest: toml::Value =
+        toml::from_str(MANIFEST).expect("bundled agent-market manifest is valid TOML");
+    let mcp = manifest
+        .get_mut("mcp")
+        .and_then(toml::Value::as_table_mut)
+        .expect("bundled agent-market manifest declares [mcp]");
+    mcp.insert("server".to_string(), toml::Value::String(url.to_string()));
+    toml::to_string(&manifest).expect("patched agent-market manifest re-serializes")
+}
+
 pub(super) fn bundle() -> PackageBundle {
-    let manifest_toml = match std::env::var(SERVER_URL_ENV) {
-        Ok(url) if !url.trim().is_empty() => {
-            Cow::Owned(MANIFEST.replace(SERVER_URL_PLACEHOLDER, validated_server_url(&url)))
-        }
-        // Absent or blank: ship the placeholder (deployment without a
-        // marketplace). Non-Unicode is a SET-but-broken value — fail as
-        // loudly as any other malformed setting rather than silently
-        // pretending the variable is unset.
-        Ok(_) | Err(std::env::VarError::NotPresent) => Cow::Borrowed(MANIFEST),
-        Err(e @ std::env::VarError::NotUnicode(_)) => {
-            panic!("{SERVER_URL_ENV} is set but not valid Unicode: {e}")
-        }
+    // Read through the workspace's thread-safe env overlay (the repo-wide
+    // replacement for raw `std::env`; tests inject overrides without process
+    // env mutation). Set → validate (blank or malformed fails loudly — a SET
+    // variable must be a real https URL) and patch [mcp].server through the
+    // TOML model. Absent → ship the placeholder manifest: the deployment has
+    // no marketplace and the extension points nowhere.
+    let manifest_toml = match ironclaw_common::env_helpers::env_or_override(SERVER_URL_ENV) {
+        Some(url) => Cow::Owned(manifest_with_server_url(validated_server_url(&url))),
+        None => Cow::Borrowed(MANIFEST),
     };
     // The `manifest.toml` asset must carry the SAME (possibly env-patched)
     // bytes the package validates with: install materializes the assets into
@@ -135,6 +146,58 @@ fn assets(manifest: &[u8]) -> Vec<super::PackageAsset> {
 mod tests {
     use super::validated_server_url;
 
+    /// The caller-level contract (not just the helper): with the env set,
+    /// `bundle()` patches `[mcp].server` AND ships the same patched bytes as
+    /// the `manifest.toml` asset — the pair the installation hash pins.
+    /// Uses the workspace runtime-env overlay (no process env mutation).
+    #[test]
+    fn bundle_patches_manifest_and_asset_from_env() {
+        let _env = ironclaw_common::env_helpers::lock_env();
+        let snapshot =
+            ironclaw_common::env_helpers::snapshot_runtime_env(super::SERVER_URL_ENV);
+        ironclaw_common::env_helpers::set_runtime_env(
+            super::SERVER_URL_ENV,
+            "https://market.test.example/mcp",
+        );
+        let bundle = super::bundle();
+        ironclaw_common::env_helpers::restore_runtime_env(snapshot);
+
+        let parsed: toml::Value =
+            toml::from_str(&bundle.manifest_toml).expect("patched manifest parses");
+        assert_eq!(
+            parsed["mcp"]["server"].as_str(),
+            Some("https://market.test.example/mcp")
+        );
+        let manifest_asset = bundle
+            .assets
+            .iter()
+            .find(|a| a.path == "manifest.toml")
+            .expect("manifest.toml asset present");
+        let super::super::PackageAssetContent::Bytes(bytes) = &manifest_asset.content;
+        assert_eq!(
+            bytes.as_slice(),
+            bundle.manifest_toml.as_bytes(),
+            "asset must carry the SAME patched bytes the package validates with"
+        );
+    }
+
+    /// Without the env the placeholder manifest ships untouched.
+    #[test]
+    fn bundle_without_env_ships_the_placeholder() {
+        let _env = ironclaw_common::env_helpers::lock_env();
+        let snapshot =
+            ironclaw_common::env_helpers::snapshot_runtime_env(super::SERVER_URL_ENV);
+        // Mask instead of remove: also shields the test from a real value in
+        // the process environment.
+        ironclaw_common::env_helpers::mask_runtime_env(super::SERVER_URL_ENV);
+        let bundle = super::bundle();
+        ironclaw_common::env_helpers::restore_runtime_env(snapshot);
+        assert!(
+            bundle.manifest_toml.contains("MARKET_PUBLIC_HOST"),
+            "absent env keeps the unreachable placeholder"
+        );
+    }
+
     #[test]
     fn accepts_a_plain_https_url() {
         assert_eq!(
@@ -143,20 +206,35 @@ mod tests {
         );
     }
 
-    /// A quote would break out of the TOML string literal and inject keys
-    /// into the `[mcp]` table — the exact corruption the validator exists for.
+    /// A set-but-blank value is an operator error, not "unset".
     #[test]
     #[should_panic(expected = "AGENT_MARKET_MCP_URL")]
-    fn rejects_toml_string_breakout() {
-        validated_server_url("https://market.example.com/mcp\"\nhack = \"1");
+    fn rejects_blank_value() {
+        validated_server_url("   ");
     }
 
-    /// A `#` would turn the rest of the manifest line into a TOML comment,
-    /// silently dropping the keys that follow.
+    /// A fragment (or any other non-plain component) is rejected by URL
+    /// validation before it reaches the manifest.
     #[test]
     #[should_panic(expected = "AGENT_MARKET_MCP_URL")]
-    fn rejects_comment_truncation() {
-        validated_server_url("https://market.example.com/mcp#");
+    fn rejects_fragment() {
+        validated_server_url("https://market.example.com/mcp#frag");
+    }
+
+    /// The substitution goes through the TOML model, so even URL-legal
+    /// characters that are TOML-significant (quotes in a path segment) can
+    /// never corrupt adjacent keys — they are escaped structurally.
+    #[test]
+    fn toml_patching_is_structural() {
+        let url = "https://market.example.com/mc\"p";
+        let patched = super::manifest_with_server_url(url);
+        let parsed: toml::Value = toml::from_str(&patched).expect("patched manifest stays valid TOML");
+        assert_eq!(
+            parsed["mcp"]["server"].as_str(),
+            Some(url),
+            "the exact URL round-trips through the TOML model"
+        );
+        assert!(parsed["mcp"].get("hack").is_none());
     }
 
     #[test]

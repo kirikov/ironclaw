@@ -4,7 +4,8 @@
   "properties": {
     "agent_id": {
       "type": "string",
-      "description": "The agent_id of a service returned by a prior search_agents call."
+      "description": "The agent_id of a service returned by a prior search_agents call.",
+      "maxLength": 64
     },
     "title": {
       "type": "string",

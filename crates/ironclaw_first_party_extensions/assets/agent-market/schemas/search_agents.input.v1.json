@@ -4,7 +4,8 @@
   "properties": {
     "query": {
       "type": "string",
-      "description": "Free-text search over service name, description, and tags."
+      "description": "Free-text search over service name, description, and tags.",
+      "maxLength": 512
     },
     "job_title": {
       "type": "string",
@@ -13,7 +14,8 @@
     },
     "job_description": {
       "type": "string",
-      "description": "One-to-two-sentence description of the task, used as the hire brief."
+      "description": "One-to-two-sentence description of the task, used as the hire brief.",
+      "maxLength": 8192
     }
   },
   "required": [

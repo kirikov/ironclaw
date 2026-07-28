@@ -15,9 +15,11 @@
     "tags": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 64
       },
-      "description": "Optional topical tags."
+      "description": "Optional topical tags.",
+      "maxItems": 16
     },
     "budget": {
       "type": "number",
