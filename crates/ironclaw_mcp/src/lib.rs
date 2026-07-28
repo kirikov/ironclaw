@@ -1988,8 +1988,9 @@ mod tests {
     #[test]
     fn tools_call_stamps_sep414_thread_attribution_on_the_wire() {
         let client = planning_client();
-        let request =
-            meta_probe_request(scope_with_thread(Some("thread-a")), json!({"limit": 10}));
+        let scope = scope_with_thread(Some("thread-a"));
+        let expected_invocation = scope.invocation_id.to_string();
+        let request = meta_probe_request(scope, json!({"limit": 10}));
 
         let params = planned_params(
             &client,
@@ -2003,7 +2004,12 @@ mod tests {
         // buyer seeing another buyer's connector.
         assert_eq!(params["_meta"]["io.ironclaw/threadId"], json!("thread-a"));
         assert_eq!(params["_meta"]["io.ironclaw/userId"], json!("user-a"));
-        assert!(params["_meta"]["io.ironclaw/invocationId"].is_string());
+        // The invocation id must be THE turn's id, not merely some string —
+        // it is the provider-side replay-dedup key.
+        assert_eq!(
+            params["_meta"]["io.ironclaw/invocationId"],
+            json!(expected_invocation)
+        );
         // Original tool arguments survive the merge untouched.
         assert_eq!(params["name"], json!("search_agents"));
         assert_eq!(params["arguments"], json!({ "limit": 10 }));
