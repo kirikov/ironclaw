@@ -29,6 +29,9 @@ description = "Marketplace concierge tools: search agents, hire one on the user'
 trust = "third_party"
 
 [mcp]
+# Opt into SEP-414 caller attribution: the marketplace needs the host-stamped
+# invocationId (spend-retry dedup) and threadId (conversation scoping).
+attribution = "sep414"
 origin_gate_matrix = { loop_run = "gated_unless_granted", product = "forbidden", automation = "forbidden" }
 server = "https://MARKET_PUBLIC_HOST/mcp"
 namespace = "agent-market"
