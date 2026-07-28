@@ -78,6 +78,59 @@ pub fn package_with_discovered_hosted_mcp_tools(
     )
 }
 
+/// Merge a freshly discovered hosted-MCP package with the currently published
+/// package for the same extension.
+///
+/// The marketplace serves a different `tools/list` catalog per authenticated
+/// principal, but the active registry keys one package per extension id
+/// (#6778): publishing one principal's discovery verbatim evicts every other
+/// principal's tools — a worker activation would remove the concierge's
+/// catalog and strand its in-flight tool calls. Until catalogs are keyed
+/// per user, publication keeps a superset: fresh discovery wins per
+/// capability id, and published capabilities the fresh catalog did not
+/// return are carried over (both the manifest declaration and its
+/// descriptor, so package consistency validation still holds).
+pub fn merge_discovered_hosted_mcp_package(
+    discovered: &ExtensionPackage,
+    published: &ExtensionPackage,
+) -> Result<ExtensionPackage, ExtensionError> {
+    if published.id != discovered.id {
+        return Err(invalid_hosted_mcp_manifest(format!(
+            "cannot merge discovered package {} with published package {}",
+            discovered.id, published.id
+        )));
+    }
+    let mut manifest = discovered.manifest.clone();
+    let mut capabilities = discovered.capabilities.clone();
+    for declared in &published.manifest.capabilities {
+        if manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.id == declared.id)
+        {
+            continue;
+        }
+        let Some(descriptor) = published
+            .capabilities
+            .iter()
+            .find(|descriptor| descriptor.id == declared.id)
+        else {
+            // A published package always carries a descriptor per manifest
+            // declaration; a missing one means the published record is not a
+            // validated package, so skip the row rather than fail activation.
+            continue;
+        };
+        manifest.capabilities.push(declared.clone());
+        capabilities.push(descriptor.clone());
+    }
+    ExtensionPackage::from_host_bundled_manifest_with_inline_dynamic_schemas(
+        manifest,
+        discovered.root.clone(),
+        discovered.manifest_digest(),
+        capabilities,
+    )
+}
+
 fn hosted_http_mcp_url(package: &ExtensionPackage) -> Option<&str> {
     if package.manifest.source != ManifestSource::HostBundled {
         return None;
@@ -334,6 +387,106 @@ runtime_credentials = [
             .expect("discovered create-pages capability");
         assert!(create_pages.effects.contains(&EffectKind::ExternalWrite));
         assert_eq!(discovered.manifest.capabilities.len(), 2);
+    }
+
+    fn discovered_tool(name: &str, description: &str) -> HostedMcpDiscoveredTool {
+        HostedMcpDiscoveredTool {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: HostedMcpDiscoveredToolAnnotations::default(),
+        }
+    }
+
+    /// One principal's discovery must not evict another principal's published
+    /// tools (#6778): the merged package is fresh-wins-per-id superset.
+    #[test]
+    fn merged_discovery_keeps_other_principals_catalog() {
+        let package = notion_package();
+        let concierge = package_with_discovered_hosted_mcp_tools(
+            &package,
+            &[discovered_tool("notion-hire", "Hire an agent")],
+        )
+        .expect("concierge discovery");
+        let worker = package_with_discovered_hosted_mcp_tools(
+            &package,
+            &[discovered_tool("notion-deliver", "Submit a deliverable")],
+        )
+        .expect("worker discovery");
+
+        let merged =
+            merge_discovered_hosted_mcp_package(&worker, &concierge).expect("merged package");
+
+        for id in ["notion.notion-deliver", "notion.notion-hire"] {
+            assert!(
+                merged
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.id.as_str() == id),
+                "merged package must keep {id}"
+            );
+        }
+        assert_eq!(merged.manifest.capabilities.len(), 2);
+        assert_eq!(merged.capabilities.len(), 2);
+    }
+
+    #[test]
+    fn merged_discovery_prefers_fresh_tool_over_published() {
+        let package = notion_package();
+        let stale = package_with_discovered_hosted_mcp_tools(
+            &package,
+            &[discovered_tool("notion-search", "Stale description")],
+        )
+        .expect("stale discovery");
+        let fresh = package_with_discovered_hosted_mcp_tools(
+            &package,
+            &[discovered_tool("notion-search", "Fresh description")],
+        )
+        .expect("fresh discovery");
+
+        let merged = merge_discovered_hosted_mcp_package(&fresh, &stale).expect("merged package");
+
+        assert_eq!(merged.capabilities.len(), 1);
+        assert_eq!(merged.capabilities[0].description, "Fresh description");
+    }
+
+    /// Merging against the published static-fallback package (pre-discovery
+    /// state after a restart) keeps the reviewed static catalog alive for the
+    /// principals that still rely on it.
+    #[test]
+    fn merged_discovery_keeps_static_fallback_from_published_base() {
+        let base = notion_package();
+        let worker = package_with_discovered_hosted_mcp_tools(
+            &base,
+            &[discovered_tool("notion-deliver", "Submit a deliverable")],
+        )
+        .expect("worker discovery");
+
+        let merged = merge_discovered_hosted_mcp_package(&worker, &base).expect("merged package");
+
+        for id in ["notion.notion-deliver", "notion.notion-fetch"] {
+            assert!(
+                merged
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.id.as_str() == id),
+                "merged package must keep {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_discovery_rejects_mismatched_extension_ids() {
+        let package = notion_package();
+        let discovered = package_with_discovered_hosted_mcp_tools(
+            &package,
+            &[discovered_tool("notion-search", "Search")],
+        )
+        .expect("discovery");
+        let mut foreign = package.clone();
+        foreign.id = ironclaw_host_api::ExtensionId::new("other").expect("valid id");
+
+        assert!(merge_discovered_hosted_mcp_package(&discovered, &foreign).is_err());
     }
 
     #[test]
