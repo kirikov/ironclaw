@@ -960,10 +960,15 @@ where
     };
     let runtime_http_egress = runtime_ports.runtime_http_egress();
     let registry = services.shared_extension_registry();
+    // Per-user discovered-package overlay (P2b): the egress planner needs it to
+    // resolve credentials for DISCOVERED hosted-MCP tools (absent from the
+    // global registry), else those calls egress unauthenticated.
+    let scoped_overlay = services.scoped_package_overlay();
 
     Ok(services.with_mcp_runtime(Arc::new(hosted_http_mcp_runtime(
         registry,
         runtime_http_egress,
+        Some(scoped_overlay),
     ))))
 }
 
@@ -1082,6 +1087,13 @@ pub(crate) struct RebornRuntimeStores {
     pub(crate) in_memory_budget_event_sink: Arc<ironclaw_resources::InMemoryBudgetEventSink>,
     pub(crate) extension_registry: Arc<ExtensionRegistry>,
     pub(crate) shared_extension_registry: Arc<SharedExtensionRegistry>,
+    /// Per-user discovered hosted-MCP overlay (P2b), shared with the host
+    /// runtime's scoped capability-resolution paths.
+    pub(crate) scoped_overlay: Arc<ironclaw_extensions::ScopedPackageOverlay>,
+    /// Product-auth runtime ports (egress + one-shot secret/policy staging) for
+    /// turn-start hosted-MCP discovery (P2b). None when host egress is absent.
+    pub(crate) product_auth_runtime_ports:
+        Option<ironclaw_host_runtime::ProductAuthProviderRuntimePorts>,
     pub(crate) scoped_filesystem: Arc<ScopedFilesystem<CompositeRootFilesystem>>,
     pub(crate) turn_state: Arc<TurnStateRowStore<CompositeRootFilesystem>>,
     pub(crate) checkpoint_state_store: Arc<dyn CheckpointStateStorePort>,
@@ -5553,6 +5565,8 @@ async fn build_backend_production(
         }
     };
     let shared_extension_registry = services.shared_extension_registry();
+    let scoped_overlay = services.scoped_package_overlay();
+    let product_auth_runtime_ports = services.product_auth_provider_runtime_ports();
 
     #[cfg(test)]
     let local_dev_wasm_runtime_credential_provider_captured =
@@ -5565,6 +5579,8 @@ async fn build_backend_production(
 
     Ok(RebornRuntimeStores {
         host_runtime,
+        scoped_overlay,
+        product_auth_runtime_ports,
         #[cfg(test)]
         turn_coordinator,
         readiness: readiness_for(profile, true, true, product_auth_ready),

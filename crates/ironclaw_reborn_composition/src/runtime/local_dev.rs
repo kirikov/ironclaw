@@ -49,6 +49,7 @@ use crate::runtime::ComposedSelectableSkillContextSource;
 use ironclaw_product::projection::{CapabilityDisplayPreviewResult, CapabilityDisplayPreviewStore};
 
 pub(crate) mod extension_surface;
+mod hosted_mcp_overlay;
 mod external_tool_capability;
 mod outbound_delivery;
 mod project_create;
@@ -126,7 +127,17 @@ pub(super) fn capability_wiring(
         &[EffectKind::ExternalWrite],
     );
     let extension_surface_source =
-        ExtensionCapabilitySurfaceSource::new(Some(services.extension_management.clone()));
+        ExtensionCapabilitySurfaceSource::new(Some(services.extension_management.clone()))
+            .with_scoped_overlay(services.scoped_overlay.clone());
+    // Turn-start per-user hosted-MCP discovery (P2b): only when the product-auth
+    // runtime ports are present (host egress + secret staging).
+    let hosted_mcp_overlay_refresher = services.product_auth_runtime_ports.clone().map(|ports| {
+        Arc::new(hosted_mcp_overlay::HostedMcpOverlayRefresher::new(
+            services.scoped_overlay.clone(),
+            services.shared_extension_registry.clone(),
+            ports,
+        ))
+    });
     // First-class project creation reuses the same access-controlled
     // `ProjectService` service the WebUI v2 surface wires (composition owns the
     // service, never the raw repository), so an agent-created project is a real
@@ -172,6 +183,7 @@ pub(super) fn capability_wiring(
             memory_mounts,
             system_extensions_lifecycle_mounts,
             extension_surface_source,
+            hosted_mcp_overlay_refresher,
             input_resolver: Arc::clone(&capability_input_resolver),
             result_writer: Arc::clone(&capability_result_writer),
             milestone_sink,
@@ -206,6 +218,7 @@ struct RefreshingLoopCapabilityPortFactory {
     memory_mounts: MountView,
     system_extensions_lifecycle_mounts: MountView,
     extension_surface_source: ExtensionCapabilitySurfaceSource,
+    hosted_mcp_overlay_refresher: Option<Arc<hosted_mcp_overlay::HostedMcpOverlayRefresher>>,
     input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
@@ -236,11 +249,15 @@ impl LoopCapabilityPortFactory for RefreshingLoopCapabilityPortFactory {
         &self,
         run_context: &LoopRunContext,
     ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
-        let skill_mounts = scoped_skill_management_mount_view(&local_dev_resource_scope_for_run(
-            run_context,
-            &self.fallback_user_id,
-        ))
-        .map_err(host_api_agent_loop_error)?;
+        let run_scope = local_dev_resource_scope_for_run(run_context, &self.fallback_user_id);
+        // Per-user hosted-MCP discovery BEFORE the surface/resolver snapshot so
+        // this turn's grants, surface, and dispatch see the caller's discovered
+        // tools. Failures degrade to last-good/static and never fail the turn.
+        if let Some(refresher) = &self.hosted_mcp_overlay_refresher {
+            refresher.refresh_for_scope(&run_scope).await;
+        }
+        let skill_mounts =
+            scoped_skill_management_mount_view(&run_scope).map_err(host_api_agent_loop_error)?;
         create_refreshing_capability_port(RefreshingCapabilityPortConfig {
             runtime: Arc::clone(&self.runtime),
             run_context: run_context.clone(),
@@ -1126,6 +1143,11 @@ fn visible_capability_request(
         .cloned()
         .or_else(|| run_context.actor().map(|actor| actor.user_id.clone()))
         .unwrap_or_else(|| fallback_user_id.clone());
+    let overlay_owner = ironclaw_extensions::OverlayScope::new(
+        run_context.scope.tenant_id.clone(),
+        user_id.clone(),
+        Some(run_context.scope.thread_id.clone()),
+    );
     let mut grants = inputs.policy.builtin_grants(
         &extension_id,
         inputs.workspace_mounts,
@@ -1135,7 +1157,7 @@ fn visible_capability_request(
     );
     grants
         .grants
-        .extend(inputs.extension_surface.grants(&extension_id, &user_id));
+        .extend(inputs.extension_surface.grants(&extension_id, &overlay_owner));
     let mut context = ExecutionContext::local_default(
         user_id,
         extension_id,
@@ -1194,7 +1216,7 @@ fn visible_capability_request(
             },
         );
     }
-    provider_trust.extend(inputs.extension_surface.provider_trust(&context.user_id));
+    provider_trust.extend(inputs.extension_surface.provider_trust(&overlay_owner));
 
     Ok(HostVisibleCapabilityRequest::new(
         context,

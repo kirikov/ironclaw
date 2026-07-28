@@ -279,7 +279,10 @@ impl ExtensionPackage {
         manifest_digest: Option<String>,
         capabilities: Vec<CapabilityDescriptor>,
     ) -> Result<Self, ExtensionError> {
-        if manifest.source != ManifestSource::HostBundled {
+        if !matches!(
+            manifest.source,
+            ManifestSource::HostBundled | ManifestSource::InstalledLocal
+        ) {
             return Err(ExtensionError::InvalidManifest {
                 reason:
                     "inline dynamic descriptor schemas are only supported for host-bundled packages"
@@ -322,8 +325,10 @@ impl ExtensionPackage {
         let consistent = match self.descriptor_schema_mode {
             CapabilityDescriptorSchemaMode::ManifestRefs => self.capabilities == expected,
             CapabilityDescriptorSchemaMode::InlineDynamic => {
-                self.manifest.source == ManifestSource::HostBundled
-                    && descriptors_match_except_schema(&self.capabilities, &expected)
+                matches!(
+                    self.manifest.source,
+                    ManifestSource::HostBundled | ManifestSource::InstalledLocal
+                ) && descriptors_match_except_schema(&self.capabilities, &expected)
             }
         };
         if !consistent {
@@ -398,6 +403,7 @@ mod hosted_mcp_discovery;
 mod installations;
 mod lifecycle;
 mod registry;
+mod scoped_overlay;
 pub mod resolved;
 pub mod v2;
 pub mod v3;
@@ -441,6 +447,10 @@ pub use installations::{
 };
 pub use lifecycle::{
     ExtensionLifecycleEvent, ExtensionLifecycleEventSink, ExtensionLifecycleService,
+};
+pub use scoped_overlay::{
+    DEFAULT_SCOPED_OVERLAY_TTL, OverlaidRegistryView, OverlayFreshness, OverlayScope,
+    ScopedPackageOverlay,
 };
 pub use registry::{ExtensionRegistry, SharedExtensionRegistry};
 
