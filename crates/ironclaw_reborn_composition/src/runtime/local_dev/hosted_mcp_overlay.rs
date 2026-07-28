@@ -3,7 +3,7 @@
 //! Hosted-MCP providers with a per-user secret credential (e.g. the agent
 //! marketplace) serve a **per-principal** `tools/list`. This refresher runs
 //! before a turn's capability port is built: for every active hosted-MCP
-//! extension whose discovery template binds a [`SecretHandle`]-sourced
+//! extension whose discovery template binds a per-user-resolvable
 //! runtime credential, it stages the TURN USER's secret and re-runs
 //! `tools/list` discovery under that user's scope, caching the discovered
 //! package in the [`ScopedPackageOverlay`] the surface/dispatch/egress paths
@@ -37,7 +37,7 @@ use ironclaw_extensions::{
 };
 use ironclaw_host_api::{
     CapabilityId, CredentialStageError, ExtensionId, ResourceScope,
-    RuntimeCredentialRequirementSource, SecretHandle,
+    RuntimeCredentialRequirement, RuntimeCredentialRequirementSource,
 };
 use ironclaw_host_runtime::ProductAuthProviderRuntimePorts;
 use std::sync::Mutex;
@@ -86,13 +86,15 @@ impl HostedMcpOverlayRefresher {
     /// degrades to the previous surface (last-good or static manifest).
     pub(super) async fn refresh_for_scope(&self, scope: &ResourceScope) {
         let snapshot = self.registry.snapshot();
-        let eligible: Vec<(ExtensionPackage, CapabilityId, SecretHandle)> = snapshot
-            .extensions()
-            .filter_map(|package| {
-                per_user_secret_discovery_template(package)
-                    .map(|(capability_id, handle)| (package.clone(), capability_id, handle))
-            })
-            .collect();
+        let eligible: Vec<(ExtensionPackage, CapabilityId, RuntimeCredentialRequirement)> =
+            snapshot
+                .extensions()
+                .filter_map(|package| {
+                    per_user_secret_discovery_template(package).map(
+                        |(capability_id, requirement)| (package.clone(), capability_id, requirement),
+                    )
+                })
+                .collect();
         let owner = OverlayScope::new(
             scope.tenant_id.clone(),
             scope.user_id.clone(),
@@ -115,7 +117,7 @@ impl HostedMcpOverlayRefresher {
             Err(_) => scope.clone(),
         };
         let scope = &discovery_scope;
-        for (package, capability_id, handle) in eligible {
+        for (package, capability_id, requirement) in eligible {
             let key = (owner.clone(), package.id.clone());
             if matches!(
                 self.overlay.get(&owner, &package.id),
@@ -129,7 +131,7 @@ impl HostedMcpOverlayRefresher {
             if !self.begin(&key) {
                 continue;
             }
-            self.refresh_one(scope, &owner, &package, &capability_id, &handle)
+            self.refresh_one(scope, &owner, &package, &capability_id, &requirement)
                 .await;
             self.finish(&key);
         }
@@ -141,14 +143,17 @@ impl HostedMcpOverlayRefresher {
         owner: &OverlayScope,
         package: &ExtensionPackage,
         capability_id: &CapabilityId,
-        handle: &SecretHandle,
+        requirement: &RuntimeCredentialRequirement,
     ) {
-        // Stage the turn user's secret for the discovery egress (the MCP lane
-        // consumes staged one-shot credentials only). AuthRequired here IS the
-        // "user has no token" verdict.
+        // Stage the turn user's credential for the discovery egress (the MCP
+        // lane consumes staged one-shot credentials only). The requirement
+        // router covers both source kinds — a raw secret-store handle AND a
+        // product-auth account (vendor-recipe credentials delivered through
+        // the extension setup channel). AuthRequired here IS the "user has no
+        // token" verdict.
         match self
             .runtime_ports
-            .stage_owner_resolved_secret_once(scope, capability_id, handle)
+            .stage_credential_requirement_once(scope, capability_id, requirement, &package.id)
             .await
         {
             Ok(()) => {}
@@ -156,7 +161,7 @@ impl HostedMcpOverlayRefresher {
                 tracing::debug!(
                     extension_id = %package.id,
                     user_id = %scope.user_id,
-                    secret_handle = %handle,
+                    secret_handle = %requirement.handle,
                     "hosted MCP per-user discovery skipped: credential not provisioned"
                 );
                 // The user has no credential: any previously discovered
@@ -319,25 +324,27 @@ fn hosted_mcp_discovery_network_policy(
 
 fn per_user_secret_discovery_template(
     package: &ExtensionPackage,
-) -> Option<(CapabilityId, SecretHandle)> {
+) -> Option<(CapabilityId, RuntimeCredentialRequirement)> {
     if !is_hosted_http_mcp_package(package) {
         return None;
     }
     let template = package.manifest.capabilities.first()?;
     // Both credential kinds qualify: a raw `SecretHandle` credential, and a
-    // vendor-recipe (`ProductAuthAccount`) credential whose per-user secret is
-    // delivered through the extension's setup channel into the user's secret
-    // store under the same handle (the v3 `[mcp]` + `[auth.<vendor>]` shape —
-    // e.g. the agent-market bearer). Staging resolves BY HANDLE from the
-    // caller's store either way, and a user without the secret fails closed
-    // into the AuthRequired skip below.
-    let handle = template.runtime_credentials.iter().find_map(|credential| {
-        matches!(
-            credential.source,
-            RuntimeCredentialRequirementSource::SecretHandle
-                | RuntimeCredentialRequirementSource::ProductAuthAccount { .. }
-        )
-        .then(|| credential.handle.clone())
-    })?;
-    Some((template.id.clone(), handle))
+    // vendor-recipe (`ProductAuthAccount`) credential delivered through the
+    // extension's setup channel (the v3 `[mcp]` + `[auth.<vendor>]` shape —
+    // e.g. the agent-market bearer). Staging routes by the requirement's
+    // SOURCE (`stage_credential_requirement_once`), and a user without the
+    // credential fails closed into the AuthRequired skip.
+    let requirement = template
+        .runtime_credentials
+        .iter()
+        .find(|credential| {
+            matches!(
+                credential.source,
+                RuntimeCredentialRequirementSource::SecretHandle
+                    | RuntimeCredentialRequirementSource::ProductAuthAccount { .. }
+            )
+        })
+        .cloned()?;
+    Some((template.id.clone(), requirement))
 }
