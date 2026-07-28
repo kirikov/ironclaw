@@ -307,10 +307,18 @@ fn per_user_secret_discovery_template(
         return None;
     }
     let template = package.manifest.capabilities.first()?;
+    // Both credential kinds qualify: a raw `SecretHandle` credential, and a
+    // vendor-recipe (`ProductAuthAccount`) credential whose per-user secret is
+    // delivered through the extension's setup channel into the user's secret
+    // store under the same handle (the v3 `[mcp]` + `[auth.<vendor>]` shape —
+    // e.g. the agent-market bearer). Staging resolves BY HANDLE from the
+    // caller's store either way, and a user without the secret fails closed
+    // into the AuthRequired skip below.
     let handle = template.runtime_credentials.iter().find_map(|credential| {
         matches!(
             credential.source,
             RuntimeCredentialRequirementSource::SecretHandle
+                | RuntimeCredentialRequirementSource::ProductAuthAccount { .. }
         )
         .then(|| credential.handle.clone())
     })?;
