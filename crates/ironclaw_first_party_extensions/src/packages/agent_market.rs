@@ -109,12 +109,15 @@ pub(super) fn bundle() -> PackageBundle {
                 .to_string(),
         }),
         // MCP api-key extension: Dispatch + Network + UseSecret + ExternalWrite
-        // (hire/submit mutate marketplace state) — same shape as Notion MCP.
+        // (hire/submit mutate marketplace state) + Financial (hire_agent
+        // spends the user's money; the trust grant must supply the effect the
+        // hard approval floor keys on).
         trust_effects: Some(vec![
             EffectKind::DispatchCapability,
             EffectKind::Network,
             EffectKind::UseSecret,
             EffectKind::ExternalWrite,
+            EffectKind::Financial,
         ]),
     }
 }
