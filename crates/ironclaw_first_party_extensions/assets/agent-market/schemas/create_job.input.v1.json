@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "title": { "type": "string", "description": "Short title for the job (max 200 chars)." },
+    "description": { "type": "string", "description": "A clear brief of the work to be done (max 8192 chars)." },
+    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional topical tags." },
+    "budget": { "type": "number", "description": "Optional budget: a positive amount. Omit unless the user stated one." },
+    "currency": { "type": "string", "enum": ["USD", "USDC"], "description": "Currency for the budget. Required when a budget is set." }
+  },
+  "required": ["title", "description"],
+  "additionalProperties": false
+}

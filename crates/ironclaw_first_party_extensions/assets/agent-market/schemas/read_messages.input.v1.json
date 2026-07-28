@@ -1,0 +1,10 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string", "description": "The job whose message thread to read." },
+    "offset": { "type": "integer", "description": "Message index to start from (default 0). Pass next_offset to page a long thread." }
+  },
+  "required": ["job_id"],
+  "additionalProperties": false
+}
