@@ -935,3 +935,37 @@ fn memory_surface_without_document_store_fails_closed() {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// [mcp] attribution opt-in (SEP-414)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mcp_attribution_defaults_to_none() {
+    // A manifest that says nothing about attribution must never be stamped —
+    // the privacy default for every existing provider.
+    let record = parse_v3(&mcp_manifest()).expect("mcp manifest parses");
+    assert_eq!(record.manifest().mcp_attribution, None);
+}
+
+#[test]
+fn mcp_attribution_sep414_parses() {
+    let manifest = mcp_manifest().replace(
+        "[mcp]\n",
+        "[mcp]\nattribution = \"sep414\"\n",
+    );
+    let record = parse_v3(&manifest).expect("attributed mcp manifest parses");
+    assert_eq!(
+        record.manifest().mcp_attribution,
+        Some(ironclaw_extensions::McpAttribution::Sep414)
+    );
+}
+
+#[test]
+fn mcp_attribution_unknown_value_is_rejected() {
+    let manifest = mcp_manifest().replace(
+        "[mcp]\n",
+        "[mcp]\nattribution = \"telemetry-v9\"\n",
+    );
+    parse_v3(&manifest).expect_err("unknown attribution value must not parse");
+}
