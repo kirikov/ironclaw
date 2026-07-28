@@ -98,6 +98,23 @@ impl HostedMcpOverlayRefresher {
             scope.user_id.clone(),
             scope.thread_id.clone(),
         );
+        // Secrets live under the user's DEFAULT axes — the setup channel and
+        // the dispatch-time `ExecutionContext::local_default` shape (default
+        // agent/project, no thread). The run scope's thread/agent axes would
+        // miss them, so staging AND the discovery egress use the normalized
+        // scope; only the OVERLAY key keeps the full run scope (the thread
+        // axis is the hire-isolation boundary, not a storage axis).
+        let discovery_scope = match ResourceScope::local_default(
+            scope.user_id.clone(),
+            scope.invocation_id.clone(),
+        ) {
+            Ok(mut normalized) => {
+                normalized.tenant_id = scope.tenant_id.clone();
+                normalized
+            }
+            Err(_) => scope.clone(),
+        };
+        let scope = &discovery_scope;
         for (package, capability_id, handle) in eligible {
             let key = (owner.clone(), package.id.clone());
             if matches!(
