@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
 use ironclaw_extensions::{
-    ExtensionPackage, ExtensionRuntime, ManifestSource, SharedExtensionRegistry,
+    ExtensionPackage, ExtensionRuntime, ManifestSource, OverlayScope, ScopedPackageOverlay,
+    SharedExtensionRegistry,
 };
 use ironclaw_host_api::{
-    CapabilityId, ExtensionId, NetworkPolicy, NetworkScheme, NetworkTargetPattern,
-    RuntimeCredentialInjection, RuntimeCredentialSource, RuntimeHttpEgress,
+    CapabilityDescriptor, CapabilityId, ExtensionId, NetworkPolicy, NetworkScheme,
+    NetworkTargetPattern, ResourceScope, RuntimeCredentialInjection, RuntimeCredentialSource,
+    RuntimeHttpEgress,
 };
 use ironclaw_mcp::{
     McpHostHttpClient, McpHostHttpEgressPlan, McpHostHttpEgressPlanRequest,
@@ -19,35 +21,76 @@ const MCP_TIMEOUT_MS: u32 = 60_000;
 pub fn hosted_http_mcp_runtime(
     registry: Arc<SharedExtensionRegistry>,
     runtime_http_egress: Arc<dyn RuntimeHttpEgress>,
+    scoped_overlay: Option<Arc<ScopedPackageOverlay>>,
 ) -> McpRuntime<
     McpHostHttpClient<McpRuntimeHttpAdapter<Arc<dyn RuntimeHttpEgress>>, RegistryMcpEgressPlanner>,
 > {
-    let client = McpHostHttpClient::new(
-        McpRuntimeHttpAdapter::new(runtime_http_egress),
-        RegistryMcpEgressPlanner::new(registry),
-    );
+    let mut planner = RegistryMcpEgressPlanner::new(registry);
+    if let Some(overlay) = scoped_overlay {
+        planner = planner.with_scoped_overlay(overlay);
+    }
+    let client = McpHostHttpClient::new(McpRuntimeHttpAdapter::new(runtime_http_egress), planner);
     McpRuntime::new(McpRuntimeConfig::default(), client)
 }
 
 #[derive(Debug, Clone)]
 pub struct RegistryMcpEgressPlanner {
     registry: Arc<SharedExtensionRegistry>,
+    /// Per-user discovered-package overlay (P2b). Credential injection for a
+    /// DISCOVERED hosted-MCP tool must resolve its descriptor from the caller's
+    /// overlay — the discovered capability id is not in the global registry, so
+    /// resolving against `registry` alone injects no credential and the call
+    /// egresses unauthenticated. `None` for callers with no overlay (discovery,
+    /// static-only providers).
+    scoped_overlay: Option<Arc<ScopedPackageOverlay>>,
 }
 
 impl RegistryMcpEgressPlanner {
     pub fn new(registry: Arc<SharedExtensionRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            scoped_overlay: None,
+        }
+    }
+
+    pub fn with_scoped_overlay(mut self, overlay: Arc<ScopedPackageOverlay>) -> Self {
+        self.scoped_overlay = Some(overlay);
+        self
+    }
+
+    /// Resolve `capability_id`'s descriptor for `scope`, consulting the caller's
+    /// per-user overlay so a DISCOVERED capability (absent from the global
+    /// registry) still resolves. Falls back to the global snapshot when there is
+    /// no overlay.
+    fn scoped_capability(
+        &self,
+        scope: &ResourceScope,
+        capability_id: &CapabilityId,
+    ) -> Option<CapabilityDescriptor> {
+        match &self.scoped_overlay {
+            Some(overlay) => {
+                let owner = OverlayScope::new(
+                    scope.tenant_id.clone(),
+                    scope.user_id.clone(),
+                    scope.thread_id.clone(),
+                );
+                overlay
+                    .view_for(&owner, self.registry.snapshot())
+                    .get_capability(capability_id)
+                    .cloned()
+            }
+            None => self.registry.snapshot().get_capability(capability_id).cloned(),
+        }
     }
 
     fn credential_injections(
         &self,
+        scope: &ResourceScope,
         provider: &ExtensionId,
         capability_id: &CapabilityId,
         endpoint: &HostedMcpEndpoint,
     ) -> Vec<RuntimeCredentialInjection> {
-        self.registry
-            .snapshot()
-            .get_capability(capability_id)
+        self.scoped_capability(scope, capability_id)
             .filter(|descriptor| &descriptor.provider == provider)
             .map(|descriptor| {
                 descriptor
@@ -83,8 +126,12 @@ impl McpHostHttpEgressPlanner for RegistryMcpEgressPlanner {
         if !hosted_mcp_url_allowed(request.url, &endpoint) {
             return McpHostHttpEgressPlan::default();
         }
-        let credential_injections =
-            self.credential_injections(request.provider, request.capability_id, &endpoint);
+        let credential_injections = self.credential_injections(
+            request.scope,
+            request.provider,
+            request.capability_id,
+            &endpoint,
+        );
         // Caller attribution is strictly opt-in: only a provider whose
         // manifest declares `[mcp] attribution = "sep414"` gets the SEP-414
         // `_meta` block stamped on its tool calls.
@@ -151,7 +198,10 @@ impl HostedMcpEndpoint {
 }
 
 pub fn hosted_http_mcp_endpoint(package: &ExtensionPackage) -> Option<HostedMcpEndpoint> {
-    if package.manifest.source != ManifestSource::HostBundled {
+    if !matches!(
+        package.manifest.source,
+        ManifestSource::HostBundled | ManifestSource::InstalledLocal
+    ) {
         return None;
     }
     let ExtensionRuntime::Mcp {
@@ -224,7 +274,8 @@ mod tests {
         let capability_id = CapabilityId::new("notion.notion-search").unwrap();
         let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).unwrap();
 
-        let injections = planner.credential_injections(&provider, &capability_id, &endpoint);
+        let injections =
+            planner.credential_injections(&sample_scope(), &provider, &capability_id, &endpoint);
 
         assert_eq!(injections.len(), 1);
         assert_eq!(

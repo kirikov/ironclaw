@@ -80,7 +80,14 @@ impl PolicyApprovalLeaseTermsProvider {
         // (#5459 P1): their own private capability resolves, anyone else's
         // yields no grant and the lease stays unavailable.
         let Some(grant) = surface
-            .grants(extension_id, &gate.resource_scope().user_id)
+            .grants(
+                extension_id,
+                &ironclaw_extensions::OverlayScope::new(
+                    gate.resource_scope().tenant_id.clone(),
+                    gate.resource_scope().user_id.clone(),
+                    gate.resource_scope().thread_id.clone(),
+                ),
+            )
             .into_iter()
             .find(|grant| grant.capability == *capability)
         else {

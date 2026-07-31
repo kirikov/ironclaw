@@ -119,6 +119,9 @@ pub async fn build_lifecycle_test_services(
         host_services = host_services.with_mcp_runtime(Arc::new(hosted_http_mcp_runtime(
             shared_registry,
             runtime_http_egress,
+            // Test lifecycles exercise the global registry surface; per-scope
+            // discovered overlays are wired only by the full composition.
+            None,
         )));
     }
     let runtime_ports = host_services.product_auth_provider_runtime_ports();
