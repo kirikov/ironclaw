@@ -36,6 +36,7 @@ mod input;
 mod llm_admin;
 mod local_dev_authorization;
 mod local_dev_mounts;
+mod local_skill_listing;
 mod memory_binding;
 mod memory_provider_factory;
 mod observability;
@@ -131,6 +132,9 @@ pub use ironclaw_runtime_policy::{
 pub use ironclaw_skills::{
     ManagedSkillSource as RebornSkillSource, SkillSummary as RebornSkillSummary,
     skill_summary_json as reborn_skill_summary_json,
+};
+pub use local_skill_listing::{
+    LocalSkillListingSource, LocalSkillOwner, open_local_skill_listing_source,
 };
 pub use ironclaw_triggers::TriggerId;
 pub use ironclaw_turns::TurnStatus;

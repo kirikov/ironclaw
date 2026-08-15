@@ -374,6 +374,18 @@ mod tests {
         )
     }
 
+    fn user_skill_scope(tenant_id: &str, user_id: &str) -> ironclaw_host_api::ResourceScope {
+        ironclaw_host_api::ResourceScope {
+            tenant_id: TenantId::new(tenant_id).expect("tenant id"),
+            user_id: UserId::new(user_id).expect("user id"),
+            agent_id: None,
+            project_id: None,
+            mission_id: None,
+            thread_id: None,
+            invocation_id: ironclaw_host_api::InvocationId::new(),
+        }
+    }
+
     #[derive(Debug, Default)]
     struct UnavailableModelGateway;
 
@@ -2347,19 +2359,19 @@ mod tests {
             ))
             .await
             .expect("local-dev services build");
-        let skill_path = storage_root.join(
-            "tenants/tenant-skill-activate-tool/users/skill-activate-user/skills/unit-activate-helper/SKILL.md",
-        );
-        std::fs::create_dir_all(skill_path.parent().expect("skill parent")).expect("skill dir");
-        std::fs::write(
-            &skill_path,
-            skill_md(
-                "unit-activate-helper",
-                "Unit activation helper",
-                "UNIT_ACTIVATE_SENTINEL",
-            ),
-        )
-        .expect("skill file");
+        services
+            .skill_management
+            .install_for_scope(
+                user_skill_scope("tenant-skill-activate-tool", "skill-activate-user"),
+                Some("unit-activate-helper"),
+                &skill_md(
+                    "unit-activate-helper",
+                    "Unit activation helper",
+                    "UNIT_ACTIVATE_SENTINEL",
+                ),
+            )
+            .await
+            .expect("seed user skill");
         let runtime = services.host_runtime.clone();
         let runtime_surfaces = services
             .local_runtime_for_test()
@@ -5157,13 +5169,15 @@ mod tests {
             .expect("result output lookup") // safety: test-only assertion in #[cfg(test)] module.
             .expect("result output"); // safety: test-only assertion in #[cfg(test)] module.
         assert_eq!(output["installed"], serde_json::json!(true));
-        assert!(
-            storage_root
-                .join(
-                    "tenants/tenant-skill-install-write/users/local-dev-skill-port-user/skills/qa-smoke-skill/SKILL.md"
-                )
-                .exists()
-        );
+        let installed = services
+            .skill_management
+            .read_content_for_scope(
+                user_skill_scope("tenant-skill-install-write", "local-dev-skill-port-user"),
+                "qa-smoke-skill",
+            )
+            .await
+            .expect("installed skill is readable"); // safety: test-only assertion in #[cfg(test)] module.
+        assert!(installed.content.contains("qa skill loaded"));
     }
 
     #[tokio::test]

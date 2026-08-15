@@ -1,10 +1,22 @@
 use clap::{Args, Subcommand};
-use ironclaw_extension_host::skill_listing::list_reborn_local_skills;
-use ironclaw_reborn_composition::{RebornSkillSummary, reborn_skill_summary_json};
+use ironclaw_extension_host::skill_listing::{
+    list_reborn_bundled_skills, list_reborn_local_skills_for_owner,
+};
+use ironclaw_reborn_composition::{
+    RebornSkillSummary, host_api::AgentId, host_api::TenantId, host_api::UserId,
+    open_local_skill_listing_source, reborn_skill_summary_json,
+};
 use ironclaw_reborn_config::{RebornBootConfig, RebornProfile};
 use std::path::PathBuf;
 
 use crate::context::RebornCliContext;
+
+/// Skills for one `(tenant, user)`. `owner` is `None` for the bundled system
+/// skills, which are global rather than owned by a user.
+struct SkillGroup {
+    owner: Option<(String, String)>,
+    skills: Vec<RebornSkillSummary>,
+}
 
 #[derive(Debug, Args)]
 pub(crate) struct SkillsCommand {
@@ -27,6 +39,14 @@ struct SkillsListCommand {
     /// Output skills as JSON.
     #[arg(long)]
     json: bool,
+
+    /// Only list skills owned by this tenant.
+    #[arg(long)]
+    tenant: Option<String>,
+
+    /// Only list skills owned by this user.
+    #[arg(long)]
+    user: Option<String>,
 }
 
 impl SkillsCommand {
@@ -40,13 +60,15 @@ impl SkillsCommand {
 impl SkillsListCommand {
     fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
         let config = build_skill_list_config(context.boot_config())?;
-        let skills = crate::runtime::block_on_cli(list_reborn_local_skills(
-            config.owner_id.clone(),
-            config.local_dev_root.clone(),
-        ))?;
+        let filter = SkillOwnerFilter {
+            tenant: self.tenant.clone(),
+            user: self.user.clone(),
+        };
+        let groups = crate::runtime::block_on_cli(collect_skill_groups(config.clone(), filter))?;
+        let configured = groups.iter().map(|group| group.skills.len()).sum::<usize>();
 
         if self.json {
-            let mut output = skills_json(&skills);
+            let mut output = skills_json(configured, &groups);
             if self.verbose {
                 output["details"] = serde_json::json!({
                     "profile": config.profile.to_string(),
@@ -60,7 +82,7 @@ impl SkillsListCommand {
         }
 
         println!("IronClaw Reborn skills");
-        println!("configured: {}", skills.len());
+        println!("configured: {configured}");
         println!("source: reborn-local-dev");
 
         if self.verbose {
@@ -73,17 +95,103 @@ impl SkillsListCommand {
             println!("owner_id: {}", config.owner_id);
         }
 
-        for skill in skills {
-            print_skill(&skill, self.verbose);
+        for group in groups {
+            println!();
+            println!("{}", group_heading(&group));
+            for skill in &group.skills {
+                print_skill(skill, self.verbose);
+            }
         }
 
         Ok(())
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SkillOwnerFilter {
+    tenant: Option<String>,
+    user: Option<String>,
+}
+
+impl SkillOwnerFilter {
+    fn is_empty(&self) -> bool {
+        self.tenant.is_none() && self.user.is_none()
+    }
+
+    fn matches(&self, tenant: &str, user: &str) -> bool {
+        self.tenant.as_deref().is_none_or(|value| value == tenant)
+            && self.user.as_deref().is_none_or(|value| value == user)
+    }
+
+    /// An owner named on the command line is shown even with no skills, so an
+    /// empty result is distinguishable from a filter typo.
+    fn names_explicitly(&self, tenant: &str, user: &str) -> bool {
+        self.tenant.as_deref() == Some(tenant) || self.user.as_deref() == Some(user)
+    }
+}
+
+/// Bundled skills first, then one group per owner the store knows about.
+/// Owners are discovered rather than assumed: the CLI cannot know which users
+/// exist, because WebUI login mints them at runtime.
+async fn collect_skill_groups(
+    config: SkillListConfig,
+    filter: SkillOwnerFilter,
+) -> anyhow::Result<Vec<SkillGroup>> {
+    let mut groups = Vec::new();
+    if filter.is_empty() {
+        groups.push(SkillGroup {
+            owner: None,
+            skills: list_reborn_bundled_skills()?,
+        });
+    }
+
+    let tenant_id = TenantId::new(config.tenant_id)
+        .map_err(|error| anyhow::anyhow!("invalid runtime tenant identity: {error}"))?;
+    let agent_id = AgentId::new(config.agent_id)
+        .map_err(|error| anyhow::anyhow!("invalid runtime agent identity: {error}"))?;
+    let owner_id = UserId::new(config.owner_id)
+        .map_err(|error| anyhow::anyhow!("invalid runtime owner identity: {error}"))?;
+    let Some(source) =
+        open_local_skill_listing_source(&config.local_dev_root, tenant_id, agent_id, owner_id)
+            .await?
+    else {
+        return Ok(groups);
+    };
+
+    for owner in source.owners() {
+        let tenant = owner.tenant_id.as_str().to_string();
+        let user = owner.user_id.as_str().to_string();
+        if !filter.matches(&tenant, &user) {
+            continue;
+        }
+        let skills = list_reborn_local_skills_for_owner(source.port(), owner.scope.clone()).await?;
+        if skills.is_empty() && !filter.names_explicitly(&tenant, &user) {
+            continue;
+        }
+        groups.push(SkillGroup {
+            owner: Some((tenant, user)),
+            skills,
+        });
+    }
+    Ok(groups)
+}
+
+fn group_heading(group: &SkillGroup) -> String {
+    match &group.owner {
+        None => "bundled".to_string(),
+        Some((tenant, user)) => format!(
+            "tenant {} / user {}",
+            crate::render::terminal_safe_text(tenant),
+            crate::render::terminal_safe_text(user)
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkillListConfig {
     owner_id: String,
+    tenant_id: String,
+    agent_id: String,
     local_dev_root: PathBuf,
     profile: RebornProfile,
 }
@@ -96,8 +204,11 @@ fn build_skill_list_config(config: &RebornBootConfig) -> anyhow::Result<SkillLis
             "ironclaw skills currently supports profile=local-dev, profile=local-dev-yolo, profile=hosted-single-tenant, or profile=hosted-single-tenant-volume; got profile={profile}"
         );
     }
+    let identity = crate::runtime::runtime_identity(config_file.as_ref());
     Ok(SkillListConfig {
         owner_id: crate::runtime::default_owner_id(config_file.as_ref()).to_string(),
+        tenant_id: identity.tenant_id,
+        agent_id: identity.agent_id,
         local_dev_root: crate::runtime::local_runtime_storage_root(config, profile),
         profile,
     })
@@ -142,10 +253,28 @@ fn print_list_field(label: &str, values: &[String]) {
     }
 }
 
-fn skills_json(skills: &[RebornSkillSummary]) -> serde_json::Value {
+fn skills_json(configured: usize, groups: &[SkillGroup]) -> serde_json::Value {
+    let skills = groups
+        .iter()
+        .flat_map(|group| {
+            group.skills.iter().map(|skill| {
+                let mut value = reborn_skill_summary_json(skill);
+                let (tenant, user) = match &group.owner {
+                    None => (serde_json::Value::Null, serde_json::Value::Null),
+                    Some((tenant, user)) => (
+                        serde_json::Value::from(tenant.clone()),
+                        serde_json::Value::from(user.clone()),
+                    ),
+                };
+                value["tenant"] = tenant;
+                value["user"] = user;
+                value
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
-        "configured": skills.len(),
-        "skills": skills.iter().map(reborn_skill_summary_json).collect::<Vec<_>>(),
+        "configured": configured,
+        "skills": skills,
         "source": "reborn-local-dev",
     })
 }

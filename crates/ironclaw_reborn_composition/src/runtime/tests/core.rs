@@ -1705,19 +1705,28 @@ fn skill_md(name: &str, description: &str, prompt: &str) -> String {
     )
 }
 
-fn user_skill_dir(
-    storage_root: &std::path::Path,
+/// Seed a per-user skill bundle through the composed filesystem; the scoped
+/// skill root lives on the libSQL `/tenants` backend, not on disk.
+async fn seed_user_skill(
+    runtime: &crate::RebornRuntime,
     tenant_id: &str,
     user_id: &str,
     name: &str,
-) -> std::path::PathBuf {
-    storage_root
-        .join("tenants")
-        .join(tenant_id)
-        .join("users")
-        .join(user_id)
-        .join("skills")
-        .join(name)
+    relative_files: &[(&str, String)],
+) {
+    let filesystem = runtime
+        .local_dev_profile_filesystem_for_test()
+        .expect("local-dev composed filesystem");
+    for (relative, contents) in relative_files {
+        let path = ironclaw_host_api::VirtualPath::new(format!(
+            "/tenants/{tenant_id}/users/{user_id}/skills/{name}/{relative}"
+        ))
+        .expect("user skill virtual path");
+        filesystem
+            .write_file(&path, contents.as_bytes())
+            .await
+            .expect("seed user skill file");
+    }
 }
 
 fn skill_md_with_setup_marker(name: &str, description: &str, marker: &str, prompt: &str) -> String {
@@ -4314,22 +4323,6 @@ async fn local_dev_runtime_wires_filesystem_skills_by_default_to_model_calls() {
         ),
     )
     .expect("write system skill");
-    let local_helper_dir = user_skill_dir(
-        &storage_root,
-        "runtime-filesystem-skill-tenant",
-        "runtime-filesystem-skill-owner",
-        "local-helper",
-    );
-    std::fs::create_dir_all(&local_helper_dir).expect("user skill dir");
-    std::fs::write(
-        local_helper_dir.join("SKILL.md"),
-        skill_md(
-            "local-helper",
-            "local helper description",
-            "USER_HELPER_PROMPT_SENTINEL",
-        ),
-    )
-    .expect("write user skill");
     std::fs::create_dir_all(storage_root.join("tenant-shared/skills/shared-helper"))
         .expect("tenant shared skill dir");
     std::fs::write(
@@ -4363,6 +4356,21 @@ async fn local_dev_runtime_wires_filesystem_skills_by_default_to_model_calls() {
     .with_model_gateway_override(gateway);
 
     let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    seed_user_skill(
+        &runtime,
+        "runtime-filesystem-skill-tenant",
+        "runtime-filesystem-skill-owner",
+        "local-helper",
+        &[(
+            "SKILL.md",
+            skill_md(
+                "local-helper",
+                "local helper description",
+                "USER_HELPER_PROMPT_SENTINEL",
+            ),
+        )],
+    )
+    .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
     let reply = tokio::time::timeout(
         RUNTIME_SEND_TIMEOUT,
@@ -4410,11 +4418,18 @@ async fn local_dev_runtime_wires_filesystem_skills_by_default_to_model_calls() {
     runtime.shutdown().await.expect("runtime shutdown");
 }
 
+/// A legacy `<storage_root>/skills` tree migrates into the owner's scoped skill
+/// root and is reachable by the loop. The scoped root lives on the libSQL
+/// `/tenants` backend, so the destination is asserted through the composed
+/// filesystem, never on disk. No configured identity here, so the backfill
+/// scope comes from the `reborn-cli` fallback the same way `turn_state_scope`
+/// does.
 #[tokio::test]
 async fn local_dev_runtime_backfills_legacy_owner_skill_root() {
     let root = tempfile::tempdir().expect("tempdir");
     let storage_root = root.path().join("local-dev");
-    std::fs::create_dir_all(storage_root.join("skills/legacy-helper")).expect("legacy skill dir");
+    std::fs::create_dir_all(storage_root.join("skills/legacy-helper/references"))
+        .expect("legacy skill dir");
     std::fs::write(
         storage_root.join("skills/legacy-helper/SKILL.md"),
         skill_md(
@@ -4424,6 +4439,11 @@ async fn local_dev_runtime_backfills_legacy_owner_skill_root() {
         ),
     )
     .expect("write legacy helper skill");
+    std::fs::write(
+        storage_root.join("skills/legacy-helper/references/policy.md"),
+        "legacy helper policy",
+    )
+    .expect("write legacy helper asset");
 
     let input = RebornRuntimeInput::from_build_input(
         crate::deployment::local_dev_build_input(
@@ -4442,13 +4462,28 @@ async fn local_dev_runtime_backfills_legacy_owner_skill_root() {
 
     assert_eq!(result.plan.activations().len(), 1);
     assert_eq!(result.plan.activations()[0].name, "legacy-helper");
-    assert!(
-        storage_root
-            .join(
-                "tenants/reborn-cli/users/runtime-legacy-skill-owner/skills/legacy-helper/SKILL.md"
-            )
-            .exists()
-    );
+
+    // Nested bundle assets migrate too, and land on the backend the loop reads.
+    let filesystem = runtime
+        .local_dev_profile_filesystem_for_test()
+        .expect("local-dev composed filesystem");
+    for (relative, expected) in [
+        ("SKILL.md", "LEGACY_HELPER_PROMPT_SENTINEL"),
+        ("references/policy.md", "legacy helper policy"),
+    ] {
+        let path = ironclaw_host_api::VirtualPath::new(format!(
+            "/tenants/reborn-cli/users/runtime-legacy-skill-owner/skills/legacy-helper/{relative}"
+        ))
+        .expect("migrated skill virtual path");
+        let contents = filesystem
+            .read_file(&path)
+            .await
+            .expect("migrated skill file is readable");
+        assert!(
+            String::from_utf8_lossy(&contents).contains(expected),
+            "migrated '{relative}' must carry its legacy contents"
+        );
+    }
 
     runtime.shutdown().await.expect("runtime shutdown");
 }
@@ -4457,28 +4492,6 @@ async fn local_dev_runtime_backfills_legacy_owner_skill_root() {
 async fn execute_skill_message_returns_plan_and_reads_active_bundle_assets() {
     let root = tempfile::tempdir().expect("tempdir");
     let storage_root = root.path().join("local-dev");
-    let asset_helper_dir = user_skill_dir(
-        &storage_root,
-        "runtime-skill-exec-tenant",
-        "runtime-skill-exec-owner",
-        "asset-helper",
-    );
-    std::fs::create_dir_all(asset_helper_dir.join("references"))
-        .expect("asset skill references dir");
-    std::fs::write(
-        asset_helper_dir.join("SKILL.md"),
-        skill_md(
-            "asset-helper",
-            "asset helper description",
-            "ASSET_HELPER_PROMPT_SENTINEL",
-        ),
-    )
-    .expect("write asset helper skill");
-    std::fs::write(
-        asset_helper_dir.join("references/policy.md"),
-        "asset helper policy",
-    )
-    .expect("write asset helper policy");
     let requests = Arc::new(StdMutex::new(Vec::new()));
     let gateway = Arc::new(RecordingGateway {
         reply: "asset helper ok".to_string(),
@@ -4501,6 +4514,24 @@ async fn execute_skill_message_returns_plan_and_reads_active_bundle_assets() {
     .with_model_gateway_override(gateway);
 
     let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    seed_user_skill(
+        &runtime,
+        "runtime-skill-exec-tenant",
+        "runtime-skill-exec-owner",
+        "asset-helper",
+        &[
+            (
+                "SKILL.md",
+                skill_md(
+                    "asset-helper",
+                    "asset helper description",
+                    "ASSET_HELPER_PROMPT_SENTINEL",
+                ),
+            ),
+            ("references/policy.md", "asset helper policy".to_string()),
+        ],
+    )
+    .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
     let result = tokio::time::timeout(
         RUNTIME_SEND_TIMEOUT,
@@ -4577,22 +4608,6 @@ async fn local_dev_runtime_fails_closed_for_ambiguous_explicit_skill_before_mode
         ),
     )
     .expect("write system skill");
-    let user_code_review_dir = user_skill_dir(
-        &storage_root,
-        "runtime-ambiguous-skill-tenant",
-        "runtime-ambiguous-skill-owner",
-        "code-review",
-    );
-    std::fs::create_dir_all(&user_code_review_dir).expect("user skill dir");
-    std::fs::write(
-        user_code_review_dir.join("SKILL.md"),
-        skill_md(
-            "code-review",
-            "user review description",
-            "USER_REVIEW_PROMPT_SENTINEL",
-        ),
-    )
-    .expect("write user skill");
     let requests = Arc::new(StdMutex::new(Vec::new()));
     let gateway = Arc::new(RecordingGateway {
         reply: "should not reach model".to_string(),
@@ -4615,6 +4630,21 @@ async fn local_dev_runtime_fails_closed_for_ambiguous_explicit_skill_before_mode
     .with_model_gateway_override(gateway);
 
     let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    seed_user_skill(
+        &runtime,
+        "runtime-ambiguous-skill-tenant",
+        "runtime-ambiguous-skill-owner",
+        "code-review",
+        &[(
+            "SKILL.md",
+            skill_md(
+                "code-review",
+                "user review description",
+                "USER_REVIEW_PROMPT_SENTINEL",
+            ),
+        )],
+    )
+    .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
     let reply = tokio::time::timeout(
         RUNTIME_SEND_TIMEOUT,
@@ -4640,24 +4670,7 @@ async fn local_dev_runtime_fails_closed_for_ambiguous_explicit_skill_before_mode
 async fn local_dev_runtime_suppresses_explicit_setup_skill_when_workspace_marker_exists() {
     let root = tempfile::tempdir().expect("tempdir");
     let storage_root = root.path().join("local-dev");
-    let marker_helper_dir = user_skill_dir(
-        &storage_root,
-        "runtime-setup-marker-tenant",
-        "runtime-setup-marker-owner",
-        "marker-helper",
-    );
-    std::fs::create_dir_all(&marker_helper_dir).expect("user skill dir");
     std::fs::create_dir_all(storage_root.join("workspace/markers")).expect("marker dir");
-    std::fs::write(
-        marker_helper_dir.join("SKILL.md"),
-        skill_md_with_setup_marker(
-            "marker-helper",
-            "marker helper description",
-            "markers/marker-helper.done",
-            "MARKER_HELPER_PROMPT_SENTINEL",
-        ),
-    )
-    .expect("write marker helper skill");
     std::fs::write(
         storage_root.join("workspace/markers/marker-helper.done"),
         "done",
@@ -4685,6 +4698,19 @@ async fn local_dev_runtime_suppresses_explicit_setup_skill_when_workspace_marker
     .with_model_gateway_override(gateway);
 
     let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    seed_user_skill(
+        &runtime,
+        "runtime-setup-marker-tenant",
+        "runtime-setup-marker-owner",
+        "marker-helper",
+        &[("SKILL.md", skill_md_with_setup_marker(
+            "marker-helper",
+            "marker helper description",
+            "markers/marker-helper.done",
+            "MARKER_HELPER_PROMPT_SENTINEL",
+        ))],
+    )
+    .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
     let result = tokio::time::timeout(
         RUNTIME_SEND_TIMEOUT,
@@ -4731,23 +4757,6 @@ async fn local_dev_runtime_suppresses_explicit_setup_skill_when_workspace_marker
 async fn local_dev_runtime_activates_setup_skill_when_workspace_marker_is_absent() {
     let root = tempfile::tempdir().expect("tempdir");
     let storage_root = root.path().join("local-dev");
-    let marker_helper_dir = user_skill_dir(
-        &storage_root,
-        "runtime-setup-marker-absent-tenant",
-        "runtime-setup-marker-absent-owner",
-        "marker-helper",
-    );
-    std::fs::create_dir_all(&marker_helper_dir).expect("user skill dir");
-    std::fs::write(
-        marker_helper_dir.join("SKILL.md"),
-        skill_md_with_setup_marker(
-            "marker-helper",
-            "marker helper description",
-            "markers/marker-helper.done",
-            "MARKER_HELPER_PROMPT_SENTINEL",
-        ),
-    )
-    .expect("write marker helper skill");
     let requests = Arc::new(StdMutex::new(Vec::new()));
     let gateway = Arc::new(RecordingGateway {
         reply: "setup marker absent ok".to_string(),
@@ -4770,6 +4779,19 @@ async fn local_dev_runtime_activates_setup_skill_when_workspace_marker_is_absent
     .with_model_gateway_override(gateway);
 
     let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    seed_user_skill(
+        &runtime,
+        "runtime-setup-marker-absent-tenant",
+        "runtime-setup-marker-absent-owner",
+        "marker-helper",
+        &[("SKILL.md", skill_md_with_setup_marker(
+            "marker-helper",
+            "marker helper description",
+            "markers/marker-helper.done",
+            "MARKER_HELPER_PROMPT_SENTINEL",
+        ))],
+    )
+    .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
     let result = tokio::time::timeout(
         RUNTIME_SEND_TIMEOUT,
@@ -4849,22 +4871,6 @@ async fn local_dev_runtime_rejects_workspace_overlapping_default_skill_roots() {
 async fn local_dev_runtime_skips_invalid_filesystem_skill_before_model_call() {
     let root = tempfile::tempdir().expect("tempdir");
     let storage_root = root.path().join("local-dev");
-    let bad_helper_dir = user_skill_dir(
-        &storage_root,
-        "runtime-bad-skill-tenant",
-        "runtime-bad-skill-owner",
-        "bad-helper",
-    );
-    std::fs::create_dir_all(&bad_helper_dir).expect("bad skill dir");
-    std::fs::write(
-        bad_helper_dir.join("SKILL.md"),
-        skill_md(
-            "different-name",
-            "bad helper description",
-            "BAD_HELPER_PROMPT_SENTINEL",
-        ),
-    )
-    .expect("write bad skill");
     let requests = Arc::new(StdMutex::new(Vec::new()));
     let gateway = Arc::new(RecordingGateway {
         reply: "invalid skill skipped".to_string(),
@@ -4887,6 +4893,18 @@ async fn local_dev_runtime_skips_invalid_filesystem_skill_before_model_call() {
     .with_model_gateway_override(gateway);
 
     let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    seed_user_skill(
+        &runtime,
+        "runtime-bad-skill-tenant",
+        "runtime-bad-skill-owner",
+        "bad-helper",
+        &[("SKILL.md", skill_md(
+            "different-name",
+            "bad helper description",
+            "BAD_HELPER_PROMPT_SENTINEL",
+        ))],
+    )
+    .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
     let reply = tokio::time::timeout(
         RUNTIME_SEND_TIMEOUT,
@@ -6053,22 +6071,6 @@ async fn local_dev_webui_bundle_routes_auth_gates_into_interaction_service() {
 async fn local_dev_webui_bundle_records_selectable_filesystem_skill_context() {
     let root = tempfile::tempdir().expect("tempdir");
     let storage_root = root.path().join("local-dev");
-    let webui_helper_dir = user_skill_dir(
-        &storage_root,
-        "runtime-webui-skill-tenant",
-        "runtime-webui-skill-user",
-        "webui-helper",
-    );
-    std::fs::create_dir_all(&webui_helper_dir).expect("user skill dir");
-    std::fs::write(
-        webui_helper_dir.join("SKILL.md"),
-        skill_md(
-            "webui-helper",
-            "webui helper description",
-            "WEBUI_HELPER_PROMPT_SENTINEL",
-        ),
-    )
-    .expect("write user skill");
     let requests = Arc::new(StdMutex::new(Vec::new()));
     let gateway = Arc::new(RecordingGateway {
         reply: "webui skill context ok".to_string(),
@@ -6091,6 +6093,18 @@ async fn local_dev_webui_bundle_records_selectable_filesystem_skill_context() {
     .with_model_gateway_override(gateway);
 
     let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    seed_user_skill(
+        &runtime,
+        "runtime-webui-skill-tenant",
+        "runtime-webui-skill-user",
+        "webui-helper",
+        &[("SKILL.md", skill_md(
+            "webui-helper",
+            "webui helper description",
+            "WEBUI_HELPER_PROMPT_SENTINEL",
+        ))],
+    )
+    .await;
     let bundle = runtime.product_surface(None).expect("product surface");
     let webui_user_id = UserId::new("runtime-webui-skill-user").unwrap();
     let caller = ProductSurfaceCaller::new(

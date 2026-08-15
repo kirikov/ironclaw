@@ -75,9 +75,7 @@ pub use management::{
 };
 pub use parser::{ParsedSkill, SkillParseError, parse_skill_md, set_skill_auto_activate};
 pub use scoped_management::{
-    ScopedSkillManagementBuildError, ScopedSkillManagementError,
-    ScopedSkillManagementMountResolver, ScopedSkillManagementPort,
-    build_existing_local_dev_skill_management_port, build_scoped_skill_management_port,
+    ScopedSkillManagementError, ScopedSkillManagementMountResolver, ScopedSkillManagementPort,
 };
 pub use selector::{
     MAX_SKILL_CONTEXT_TOKENS, SelectionOutcome, SkillSelectionOptions, extract_skill_mentions,

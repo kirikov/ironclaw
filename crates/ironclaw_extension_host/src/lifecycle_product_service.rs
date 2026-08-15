@@ -11,8 +11,6 @@ use ironclaw_product::{
     LifecycleProductService, LifecycleReadinessBlocker, LifecycleSkillSource,
     LifecycleSkillSummary, ProductSurfaceFailure, lifecycle_product_surface_error,
 };
-#[cfg(test)]
-use ironclaw_skills::build_scoped_skill_management_port;
 use ironclaw_skills::{
     ScopedSkillManagementError, ScopedSkillManagementPort, SkillManagementError,
     SkillManagementErrorKind,
@@ -893,10 +891,28 @@ mod tests {
                 HostPath::from_path_buf(storage_root.clone()),
             )
             .expect("mount storage root");
-        let skill_management = build_scoped_skill_management_port(
+        let skill_management = Arc::new(ScopedSkillManagementPort::new_with_mount_resolver(
             UserId::new("runtime-owner").expect("valid user"),
             Arc::new(filesystem),
-        );
+            Arc::new(|scope: &ResourceScope| {
+                MountView::new(vec![
+                    MountGrant::new(
+                        MountAlias::new("/skills")?,
+                        VirtualPath::new(format!(
+                            "/projects/tenants/{}/users/{}/skills",
+                            scope.tenant_id.as_str(),
+                            scope.user_id.as_str()
+                        ))?,
+                        MountPermissions::read_write_list_delete(),
+                    ),
+                    MountGrant::new(
+                        MountAlias::new("/system/skills")?,
+                        VirtualPath::new("/projects/system/skills")?,
+                        MountPermissions::read_only(),
+                    ),
+                ])
+            }),
+        ));
         let alice_scope = skill_management_test_scope("tenant-alpha", "alice");
         let bob_scope = skill_management_test_scope("tenant-alpha", "bob");
 

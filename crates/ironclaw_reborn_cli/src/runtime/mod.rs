@@ -1184,7 +1184,7 @@ pub(crate) fn read_config_file(
 
 // CLI-local operator config only. Product/WebUI identity must come from
 // trusted host installation/binding resolution, not inbound payloads.
-fn runtime_identity(
+pub(crate) fn runtime_identity(
     config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
 ) -> RebornRuntimeIdentity {
     let default = RebornRuntimeIdentity::reborn_cli();
