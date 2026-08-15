@@ -673,6 +673,12 @@ pub fn webui_v2_app_with_lifecycle(
         // as defense in depth. v2 routes are tighter via the per-route
         // body-limit middleware above.
         .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
+        // axum's built-in DefaultBodyLimit (2 MiB) sits UNDER the tower
+        // layer above and silently overrode every 14 MiB budget declared
+        // here and in the route descriptors — real photo attachments got
+        // 413 while tiny test files passed. Raise it to the same cap so
+        // the declared limits are the effective ones.
+        .layer(axum::extract::DefaultBodyLimit::max(config.max_body_bytes))
         .layer(CatchPanicLayer::custom(panic_handler))
         .layer(cors)
         .layer(SetResponseHeaderLayer::if_not_present(
