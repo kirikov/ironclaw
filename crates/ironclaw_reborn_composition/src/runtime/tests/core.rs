@@ -4444,6 +4444,20 @@ async fn local_dev_runtime_backfills_legacy_owner_skill_root() {
         "legacy helper policy",
     )
     .expect("write legacy helper asset");
+    // The previous release wrote here, under an unconfigured owner.
+    std::fs::create_dir_all(
+        storage_root.join("tenants/hosted-tenant/users/alice/skills/deploy-notes"),
+    )
+    .expect("disk scoped skill dir");
+    std::fs::write(
+        storage_root.join("tenants/hosted-tenant/users/alice/skills/deploy-notes/SKILL.md"),
+        skill_md(
+            "deploy-notes",
+            "deploy notes description",
+            "DEPLOY_NOTES_PROMPT_SENTINEL",
+        ),
+    )
+    .expect("write disk scoped skill");
 
     let input = RebornRuntimeInput::from_build_input(
         crate::deployment::local_dev_build_input(
@@ -4484,6 +4498,18 @@ async fn local_dev_runtime_backfills_legacy_owner_skill_root() {
             "migrated '{relative}' must carry its legacy contents"
         );
     }
+
+    // Disk-written skills move too, for every owner.
+    let migrated_disk_skill = filesystem
+        .read_file(
+            &ironclaw_host_api::VirtualPath::new(
+                "/tenants/hosted-tenant/users/alice/skills/deploy-notes/SKILL.md",
+            )
+            .expect("migrated skill virtual path"),
+        )
+        .await
+        .expect("disk scoped skill migrates onto the durable backend");
+    assert!(String::from_utf8_lossy(&migrated_disk_skill).contains("DEPLOY_NOTES_PROMPT_SENTINEL"));
 
     runtime.shutdown().await.expect("runtime shutdown");
 }
@@ -4703,12 +4729,15 @@ async fn local_dev_runtime_suppresses_explicit_setup_skill_when_workspace_marker
         "runtime-setup-marker-tenant",
         "runtime-setup-marker-owner",
         "marker-helper",
-        &[("SKILL.md", skill_md_with_setup_marker(
-            "marker-helper",
-            "marker helper description",
-            "markers/marker-helper.done",
-            "MARKER_HELPER_PROMPT_SENTINEL",
-        ))],
+        &[(
+            "SKILL.md",
+            skill_md_with_setup_marker(
+                "marker-helper",
+                "marker helper description",
+                "markers/marker-helper.done",
+                "MARKER_HELPER_PROMPT_SENTINEL",
+            ),
+        )],
     )
     .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
@@ -4784,12 +4813,15 @@ async fn local_dev_runtime_activates_setup_skill_when_workspace_marker_is_absent
         "runtime-setup-marker-absent-tenant",
         "runtime-setup-marker-absent-owner",
         "marker-helper",
-        &[("SKILL.md", skill_md_with_setup_marker(
-            "marker-helper",
-            "marker helper description",
-            "markers/marker-helper.done",
-            "MARKER_HELPER_PROMPT_SENTINEL",
-        ))],
+        &[(
+            "SKILL.md",
+            skill_md_with_setup_marker(
+                "marker-helper",
+                "marker helper description",
+                "markers/marker-helper.done",
+                "MARKER_HELPER_PROMPT_SENTINEL",
+            ),
+        )],
     )
     .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
@@ -4898,11 +4930,14 @@ async fn local_dev_runtime_skips_invalid_filesystem_skill_before_model_call() {
         "runtime-bad-skill-tenant",
         "runtime-bad-skill-owner",
         "bad-helper",
-        &[("SKILL.md", skill_md(
-            "different-name",
-            "bad helper description",
-            "BAD_HELPER_PROMPT_SENTINEL",
-        ))],
+        &[(
+            "SKILL.md",
+            skill_md(
+                "different-name",
+                "bad helper description",
+                "BAD_HELPER_PROMPT_SENTINEL",
+            ),
+        )],
     )
     .await;
     let conversation = runtime.new_conversation().await.expect("conversation");
@@ -6098,11 +6133,14 @@ async fn local_dev_webui_bundle_records_selectable_filesystem_skill_context() {
         "runtime-webui-skill-tenant",
         "runtime-webui-skill-user",
         "webui-helper",
-        &[("SKILL.md", skill_md(
-            "webui-helper",
-            "webui helper description",
-            "WEBUI_HELPER_PROMPT_SENTINEL",
-        ))],
+        &[(
+            "SKILL.md",
+            skill_md(
+                "webui-helper",
+                "webui helper description",
+                "WEBUI_HELPER_PROMPT_SENTINEL",
+            ),
+        )],
     )
     .await;
     let bundle = runtime.product_surface(None).expect("product surface");

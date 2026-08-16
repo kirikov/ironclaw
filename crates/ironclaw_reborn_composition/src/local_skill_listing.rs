@@ -7,39 +7,46 @@
 
 use std::{path::Path, sync::Arc};
 
+use ironclaw_extension_host::skill_listing::{
+    RebornSkillListError, list_reborn_local_skills_for_owner,
+};
 use ironclaw_filesystem::{
     CompositeRootFilesystem, DiskFilesystem, FileType, FilesystemError, RootFilesystem,
 };
 use ironclaw_host_api::{AgentId, HostPath, ResourceScope, TenantId, UserId, VirtualPath};
-use ironclaw_skills::ScopedSkillManagementPort;
+use ironclaw_skills::{ScopedSkillManagementPort, SkillSummary};
 
 use crate::error::RebornBuildError;
 use crate::factory::{
-    build_default_local_dev_database_roots, mount_local_dev_project_roots,
+    mount_existing_local_dev_database_roots, mount_local_dev_project_roots,
     owner_scope_from_runtime_identity,
 };
 use crate::local_dev_mounts::scoped_skill_management_mount_view;
 
 /// One `(tenant, user)` skill owner backed by the durable store.
 #[derive(Debug, Clone)]
-pub struct LocalSkillOwner {
+pub struct SkillOwner {
     pub tenant_id: TenantId,
     pub user_id: UserId,
     pub scope: ResourceScope,
 }
 
 /// Skill-management port plus every owner the store knows about.
-pub struct LocalSkillListingSource {
+pub struct SkillListingSource {
     port: Arc<ScopedSkillManagementPort>,
-    owners: Vec<LocalSkillOwner>,
+    owners: Vec<SkillOwner>,
 }
 
-impl LocalSkillListingSource {
-    pub fn port(&self) -> &ScopedSkillManagementPort {
-        &self.port
+impl SkillListingSource {
+    /// Skills for one owner; the port behind it stays private.
+    pub async fn list_for_owner(
+        &self,
+        owner: &SkillOwner,
+    ) -> Result<Vec<SkillSummary>, RebornSkillListError> {
+        list_reborn_local_skills_for_owner(&self.port, owner.scope.clone()).await
     }
 
-    pub fn owners(&self) -> &[LocalSkillOwner] {
+    pub fn owners(&self) -> &[SkillOwner] {
         &self.owners
     }
 }
@@ -49,12 +56,12 @@ impl LocalSkillListingSource {
 /// `None` when `root` does not exist yet, so listing reports bundled skills
 /// without creating state. The configured owner is always included even with an
 /// empty skill root, so a fresh store still lists under its own heading.
-pub async fn open_local_skill_listing_source(
+pub async fn open_skill_listing_source(
     root: &Path,
     tenant_id: TenantId,
     agent_id: AgentId,
     owner_id: UserId,
-) -> Result<Option<LocalSkillListingSource>, RebornBuildError> {
+) -> Result<Option<SkillListingSource>, RebornBuildError> {
     let exists = root
         .try_exists()
         .map_err(|error| RebornBuildError::InvalidConfig {
@@ -70,13 +77,12 @@ pub async fn open_local_skill_listing_source(
     }
 
     let mut composite = CompositeRootFilesystem::new();
-    build_default_local_dev_database_roots(root, &mut composite).await?;
+    // With no database yet the configured owner is the only one.
+    let durable_mounted = mount_existing_local_dev_database_roots(root, &mut composite).await?;
     // Only `/projects` is mounted, rooted at the storage root: `mount_local`
     // requires the host directory to exist, and listing must not create skill
     // dirs. Bundled system skills resolve through `/projects/system/skills` and
-    // list as empty when that directory has not been written yet. Opening the
-    // database does create `reborn-local-dev.db` under an existing root -- the
-    // same file `serve` opens, never a second store.
+    // list as empty when that directory has not been written yet.
     let mut disk = DiskFilesystem::new();
     disk.mount_local(
         VirtualPath::new("/projects").map_err(RebornBuildError::Mount)?,
@@ -85,7 +91,7 @@ pub async fn open_local_skill_listing_source(
     mount_local_dev_project_roots(&mut composite, Arc::new(disk))?;
     let filesystem: Arc<dyn RootFilesystem> = Arc::new(composite);
 
-    let configured = LocalSkillOwner {
+    let configured = SkillOwner {
         scope: owner_scope_from_runtime_identity(
             owner_id.clone(),
             tenant_id.clone(),
@@ -94,16 +100,52 @@ pub async fn open_local_skill_listing_source(
         tenant_id,
         user_id: owner_id.clone(),
     };
-    let owners = discover_skill_owners(filesystem.as_ref(), &agent_id, configured).await?;
+    let owners = match durable_mounted {
+        true => discover_skill_owners(filesystem.as_ref(), &agent_id, configured).await?,
+        false => vec![configured],
+    };
     let port = ScopedSkillManagementPort::new_with_mount_resolver(
         owner_id,
         filesystem,
         Arc::new(scoped_skill_management_mount_view),
     );
-    Ok(Some(LocalSkillListingSource {
+    Ok(Some(SkillListingSource {
         port: Arc::new(port),
         owners,
     }))
+}
+
+/// Test-only: stand the durable store up the way `serve` does on first boot and
+/// install one user skill, so a test can seed the store listing then reads.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn seed_skill_for_test(
+    root: &Path,
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    user_id: UserId,
+    name: &str,
+    content: &str,
+) -> Result<(), RebornBuildError> {
+    let mut composite = CompositeRootFilesystem::new();
+    crate::factory::build_default_local_dev_database_roots(root, &mut composite).await?;
+    let mut disk = DiskFilesystem::new();
+    disk.mount_local(
+        VirtualPath::new("/projects").map_err(RebornBuildError::Mount)?,
+        HostPath::from_path_buf(root.to_path_buf()),
+    )?;
+    mount_local_dev_project_roots(&mut composite, Arc::new(disk))?;
+    let scope = owner_scope_from_runtime_identity(user_id.clone(), tenant_id, agent_id);
+    ScopedSkillManagementPort::new_with_mount_resolver(
+        user_id,
+        Arc::new(composite),
+        Arc::new(scoped_skill_management_mount_view),
+    )
+    .install_for_scope(scope, Some(name), content)
+    .await
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("seed skill '{name}' could not be installed: {error}"),
+    })?;
+    Ok(())
 }
 
 /// Walk `/tenants/*/users/*/skills` for owners with a non-empty skill root.
@@ -111,16 +153,25 @@ pub async fn open_local_skill_listing_source(
 async fn discover_skill_owners(
     filesystem: &dyn RootFilesystem,
     agent_id: &AgentId,
-    configured: LocalSkillOwner,
-) -> Result<Vec<LocalSkillOwner>, RebornBuildError> {
+    configured: SkillOwner,
+) -> Result<Vec<SkillOwner>, RebornBuildError> {
     let mut owners = vec![configured];
     for tenant in child_directories(filesystem, "/tenants").await? {
         let Ok(tenant_id) = TenantId::new(tenant.clone()) else {
+            tracing::warn!(
+                tenant = %tenant,
+                "Skipping stored skill owner whose tenant directory is not a valid tenant id"
+            );
             continue;
         };
         let users_root = format!("/tenants/{tenant}/users");
         for user in child_directories(filesystem, &users_root).await? {
             let Ok(user_id) = UserId::new(user.clone()) else {
+                tracing::warn!(
+                    tenant = %tenant,
+                    user = %user,
+                    "Skipping stored skill owner whose user directory is not a valid user id"
+                );
                 continue;
             };
             let already_listed = owners.iter().any(|owner| {
@@ -130,10 +181,13 @@ async fn discover_skill_owners(
                 continue;
             }
             let skills_root = format!("{users_root}/{user}/skills");
-            if child_directories(filesystem, &skills_root).await?.is_empty() {
+            if child_directories(filesystem, &skills_root)
+                .await?
+                .is_empty()
+            {
                 continue;
             }
-            owners.push(LocalSkillOwner {
+            owners.push(SkillOwner {
                 scope: owner_scope_from_runtime_identity(
                     user_id.clone(),
                     tenant_id.clone(),
@@ -147,7 +201,8 @@ async fn discover_skill_owners(
     Ok(owners)
 }
 
-/// Direct child directories of `path`; an absent path lists as empty.
+/// Direct child directories. An absent path lists as empty; every other error
+/// propagates, so a wrong mount set cannot read as "no owners".
 async fn child_directories(
     filesystem: &dyn RootFilesystem,
     path: &str,
@@ -159,8 +214,8 @@ async fn child_directories(
             .filter(|entry| entry.file_type == FileType::Directory)
             .map(|entry| entry.name)
             .collect()),
+        // silent-ok: an owner root never written is empty, not a failure.
         Err(FilesystemError::NotFound { .. }) => Ok(Vec::new()),
-        Err(FilesystemError::MountNotFound { .. }) => Ok(Vec::new()),
         Err(error) => Err(RebornBuildError::Filesystem(error)),
     }
 }
@@ -183,7 +238,7 @@ mod tests {
         let root = dir.path().join("missing-local-dev");
         let (tenant_id, agent_id, owner_id) = identity();
 
-        let source = open_local_skill_listing_source(&root, tenant_id, agent_id, owner_id)
+        let source = open_skill_listing_source(&root, tenant_id, agent_id, owner_id)
             .await
             .expect("listing source");
 
@@ -198,9 +253,7 @@ mod tests {
         std::fs::write(&root, "not a directory").expect("storage root file");
         let (tenant_id, agent_id, owner_id) = identity();
 
-        let error = match open_local_skill_listing_source(&root, tenant_id, agent_id, owner_id)
-            .await
-        {
+        let error = match open_skill_listing_source(&root, tenant_id, agent_id, owner_id).await {
             Ok(_) => panic!("file storage root must fail"),
             Err(error) => error,
         };
@@ -208,6 +261,27 @@ mod tests {
         assert!(
             error.to_string().contains("not a directory"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// A storage root with no database lists the configured owner only.
+    #[tokio::test]
+    async fn listing_does_not_create_the_durable_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("local-dev");
+        std::fs::create_dir_all(&root).expect("storage root");
+        let (tenant_id, agent_id, owner_id) = identity();
+
+        let source = open_skill_listing_source(&root, tenant_id, agent_id, owner_id)
+            .await
+            .expect("listing source")
+            .expect("source for existing root");
+
+        assert_eq!(source.owners().len(), 1);
+        assert_eq!(source.owners()[0].user_id.as_str(), "reborn-cli");
+        assert!(
+            !crate::factory::local_dev_db_path(&root).exists(),
+            "listing must not create the durable store"
         );
     }
 
@@ -221,32 +295,18 @@ mod tests {
         std::fs::create_dir_all(&root).expect("storage root");
         let (tenant_id, agent_id, owner_id) = identity();
 
-        let seeded = open_local_skill_listing_source(
+        seed_skill_for_test(
             &root,
-            tenant_id.clone(),
-            agent_id.clone(),
-            owner_id.clone(),
-        )
-        .await
-        .expect("listing source")
-        .expect("source for existing root");
-        let dynamic_scope = owner_scope_from_runtime_identity(
-            UserId::new("alice@corp.example").expect("user"),
             TenantId::new("hosted-tenant").expect("tenant"),
             agent_id.clone(),
-        );
-        seeded
-            .port()
-            .install_for_scope(
-                dynamic_scope,
-                Some("deploy-notes"),
-                "---\nname: deploy-notes\ndescription: dynamic user skill\n---\nUse it.\n",
-            )
-            .await
-            .expect("install skill for dynamically created user");
-        drop(seeded);
+            UserId::new("alice@corp.example").expect("user"),
+            "deploy-notes",
+            "---\nname: deploy-notes\ndescription: dynamic user skill\n---\nUse it.\n",
+        )
+        .await
+        .expect("install skill for dynamically created user");
 
-        let source = open_local_skill_listing_source(&root, tenant_id, agent_id, owner_id)
+        let source = open_skill_listing_source(&root, tenant_id, agent_id, owner_id)
             .await
             .expect("listing source")
             .expect("source for existing root");

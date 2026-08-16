@@ -812,7 +812,11 @@ type WorkspaceFilesystems = (
 
 const LOCAL_DEV_DEFAULT_SYSTEM_PROMPT_PATH: &str = "system/prompts/default-system.md";
 const LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MARKER: &str = ".legacy-skills-backfilled";
+// Distinct from the legacy marker: either pass may finish first.
+const LOCAL_DEV_DISK_SKILLS_BACKFILL_MARKER: &str = ".disk-skills-backfilled";
 const LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MAX_DEPTH: usize = 64;
+// Files stream one at a time, so this bounds peak migration memory.
+const LOCAL_DEV_SKILLS_BACKFILL_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// Filename of the cached local-dev secrets master-key dotfile under a
 /// Reborn home / local-dev root directory. `pub` (re-exported from `lib.rs`)
 /// so onboarding (`ironclaw_reborn_cli::commands::onboard`) can check for its
@@ -2153,9 +2157,23 @@ pub(crate) async fn build_default_local_dev_database_roots(
     }
 }
 
-// `pub(crate)` so `local_skill_listing` can compose the same disk roots the
-// runtime does instead of hand-rolling a second mount set for the CLI.
-pub(crate) fn local_dev_project_filesystem(
+/// Mount the durable roots only if the database exists, reporting whether it
+/// did. An inspection command must not create the store by reading it.
+pub(crate) async fn mount_existing_local_dev_database_roots(
+    root: &Path,
+    composite: &mut CompositeRootFilesystem,
+) -> Result<bool, RebornBuildError> {
+    if !local_dev_db_path(root).exists() {
+        return Ok(false);
+    }
+    let db = open_local_dev_libsql_database(root).await?;
+    let database = Arc::new(LibSqlRootFilesystem::new(db));
+    database.run_migrations().await?;
+    mount_local_dev_database_roots(composite, database)?;
+    Ok(true)
+}
+
+fn local_dev_project_filesystem(
     root: &Path,
     workspace_root: &Path,
     host_home_root: Option<&HostHomeRoot>,
@@ -2818,7 +2836,7 @@ fn canonicalize_local_dev_path(path: &Path, label: &str) -> Result<PathBuf, Rebo
     })
 }
 
-pub(crate) struct HostHomeRoot {
+struct HostHomeRoot {
     canonical_root: PathBuf,
     raw_alias: PathBuf,
 }
@@ -2903,46 +2921,186 @@ fn canonicalize_local_dev_host_home_root(path: &Path) -> Result<PathBuf, RebornB
     Ok(path)
 }
 
-/// Migrate a legacy `<storage_root>/skills` tree into the owner's scoped skill
-/// root. Writes through the composed filesystem, not `std::fs`: the scoped root
-/// resolves onto the `/tenants` backend. Marker record makes it idempotent.
-async fn backfill_local_dev_legacy_user_skills(
+/// Migrate disk skill trees onto the durable `/tenants` backend: both the
+/// pre-scoping `<storage_root>/skills` and the per-owner roots a release wrote
+/// while `/skills` still resolved onto `/projects`. Markers keep it one-time.
+async fn backfill_local_dev_disk_user_skills(
     storage_root: &Path,
     filesystem: &dyn RootFilesystem,
     owner_scope: &ResourceScope,
 ) -> Result<(), RebornBuildError> {
-    let legacy_root = storage_root.join("skills");
-    if !legacy_root.is_dir() {
+    backfill_local_dev_skill_tree(
+        storage_root.join("skills"),
+        filesystem,
+        &crate::local_dev_mounts::scoped_user_skills_target(
+            owner_scope.tenant_id.as_str(),
+            owner_scope.user_id.as_str(),
+        ),
+        LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MARKER,
+    )
+    .await?;
+
+    for (tenant_id, user_id, source_root) in
+        discover_local_dev_disk_skill_roots(storage_root).await?
+    {
+        backfill_local_dev_skill_tree(
+            source_root,
+            filesystem,
+            &crate::local_dev_mounts::scoped_user_skills_target(
+                tenant_id.as_str(),
+                user_id.as_str(),
+            ),
+            LOCAL_DEV_DISK_SKILLS_BACKFILL_MARKER,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Copy one disk tree into `scoped_root`, a file at a time, unless `marker_name` is already there.
+async fn backfill_local_dev_skill_tree(
+    source_root: PathBuf,
+    filesystem: &dyn RootFilesystem,
+    scoped_root: &str,
+    marker_name: &str,
+) -> Result<(), RebornBuildError> {
+    if !source_root.is_dir() {
         return Ok(());
     }
-    let scoped_root = format!(
-        "/tenants/{}/users/{}/skills",
-        owner_scope.tenant_id.as_str(),
-        owner_scope.user_id.as_str()
-    );
-    let marker = legacy_skill_virtual_path(&scoped_root, LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MARKER)?;
+    let marker = legacy_skill_virtual_path(scoped_root, marker_name)?;
     if scoped_entry_exists(filesystem, &marker).await? {
         return Ok(());
     }
 
-    for (relative, contents) in read_local_dev_legacy_skill_files(&legacy_root)? {
-        let path = legacy_skill_virtual_path(&scoped_root, &relative)?;
+    let entries =
+        spawn_blocking_backfill_step("scan", move || list_local_dev_skill_files(&source_root))
+            .await?;
+
+    for (relative, source) in entries {
+        let path = legacy_skill_virtual_path(scoped_root, &relative)?;
         if scoped_entry_exists(filesystem, &path).await? {
             continue;
         }
-        filesystem.write_file(&path, &contents).await.map_err(|error| {
-            RebornBuildError::InvalidConfig {
-                reason: format!("local-dev legacy skill '{relative}' could not be migrated: {error}"),
-            }
-        })?;
+        let contents =
+            spawn_blocking_backfill_step("read", move || read_local_dev_skill_file(&source))
+                .await?;
+        filesystem
+            .write_file(&path, &contents)
+            .await
+            .map_err(|error| RebornBuildError::InvalidConfig {
+                reason: format!("local-dev skill '{relative}' could not be migrated: {error}"),
+            })?;
     }
 
     filesystem
         .write_file(&marker, b"")
         .await
         .map_err(|error| RebornBuildError::InvalidConfig {
-            reason: format!("local-dev legacy skill migration marker could not be written: {error}"),
+            reason: format!("local-dev skill migration marker could not be written: {error}"),
         })
+}
+
+/// Run one synchronous `std::fs` step off the runtime; this happens at startup.
+async fn spawn_blocking_backfill_step<T, F>(
+    label: &'static str,
+    step: F,
+) -> Result<T, RebornBuildError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RebornBuildError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(step)
+        .await
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: format!("local-dev skill backfill {label} task failed: {error}"),
+        })?
+}
+
+/// `(tenant, user, skills root)` for every disk skill root a pre-`/tenants`
+/// release wrote. Names that are not valid identities are skipped.
+async fn discover_local_dev_disk_skill_roots(
+    storage_root: &Path,
+) -> Result<Vec<(ironclaw_host_api::TenantId, UserId, PathBuf)>, RebornBuildError> {
+    let tenants_root = storage_root.join("tenants");
+    spawn_blocking_backfill_step("discover", move || {
+        if !tenants_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut roots = Vec::new();
+        for (tenant_name, tenant_dir) in local_dev_child_directories(&tenants_root)? {
+            let Ok(tenant_id) = ironclaw_host_api::TenantId::new(tenant_name.clone()) else {
+                tracing::warn!(
+                    tenant = %tenant_name,
+                    "Skipping disk skill root under a directory that is not a valid tenant id"
+                );
+                continue;
+            };
+            let users_root = tenant_dir.join("users");
+            if !users_root.is_dir() {
+                continue;
+            }
+            for (user_name, user_dir) in local_dev_child_directories(&users_root)? {
+                let Ok(user_id) = UserId::new(user_name.clone()) else {
+                    tracing::warn!(
+                        user = %user_name,
+                        "Skipping disk skill root under a directory that is not a valid user id"
+                    );
+                    continue;
+                };
+                let skills_root = user_dir.join("skills");
+                if skills_root.is_dir() {
+                    roots.push((tenant_id.clone(), user_id, skills_root));
+                }
+            }
+        }
+        Ok(roots)
+    })
+    .await
+}
+
+/// Direct child directories, skipping symlinks so none redirects the walk out.
+fn local_dev_child_directories(path: &Path) -> Result<Vec<(String, PathBuf)>, RebornBuildError> {
+    let mut children = Vec::new();
+    for entry in std::fs::read_dir(path).map_err(|error| local_dev_inspect_error(path, error))? {
+        let entry = entry.map_err(|error| local_dev_inspect_error(path, error))?;
+        let child = entry.path();
+        let metadata = std::fs::symlink_metadata(&child)
+            .map_err(|error| local_dev_inspect_error(&child, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        children.push((name, child));
+    }
+    Ok(children)
+}
+
+fn local_dev_inspect_error(path: &Path, error: std::io::Error) -> RebornBuildError {
+    RebornBuildError::InvalidConfig {
+        reason: format!(
+            "local-dev skill entry '{}' could not be inspected: {error}",
+            path.display()
+        ),
+    }
+}
+
+/// Read one file, refusing anything past the ceiling rather than exhausting memory.
+fn read_local_dev_skill_file(source: &Path) -> Result<Vec<u8>, RebornBuildError> {
+    let metadata =
+        std::fs::metadata(source).map_err(|error| local_dev_inspect_error(source, error))?;
+    if metadata.len() > LOCAL_DEV_SKILLS_BACKFILL_MAX_FILE_BYTES {
+        return Err(RebornBuildError::InvalidConfig {
+            reason: format!(
+                "local-dev skill file '{}' is {} bytes, over the {} byte migration limit",
+                source.display(),
+                metadata.len(),
+                LOCAL_DEV_SKILLS_BACKFILL_MAX_FILE_BYTES
+            ),
+        });
+    }
+    std::fs::read(source).map_err(|error| local_dev_inspect_error(source, error))
 }
 
 fn legacy_skill_virtual_path(
@@ -2965,17 +3123,12 @@ async fn scoped_entry_exists(
     }
 }
 
-/// Depth-bounded walk returning `(path relative to the root, contents)`.
-/// Symlinks are skipped, not followed.
-fn read_local_dev_legacy_skill_files(
+/// Depth-bounded walk of `(relative path, source path)`. Paths only, so the
+/// caller reads a file at a time. Symlinks are skipped, not followed.
+fn list_local_dev_skill_files(
     legacy_root: &Path,
-) -> Result<Vec<(String, Vec<u8>)>, RebornBuildError> {
-    let inspect_error = |path: &Path, error: std::io::Error| RebornBuildError::InvalidConfig {
-        reason: format!(
-            "local-dev legacy skill entry '{}' could not be inspected: {error}",
-            path.display()
-        ),
-    };
+) -> Result<Vec<(String, PathBuf)>, RebornBuildError> {
+    let inspect_error = local_dev_inspect_error;
 
     let mut files = Vec::new();
     let mut pending = VecDeque::from([(legacy_root.to_path_buf(), String::new(), 0usize)]);
@@ -2983,20 +3136,21 @@ fn read_local_dev_legacy_skill_files(
         if depth > LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MAX_DEPTH {
             return Err(RebornBuildError::InvalidConfig {
                 reason: format!(
-                    "local-dev legacy skill entry '{}' exceeds max copy depth {}",
+                    "local-dev skill entry '{}' exceeds max copy depth {}",
                     directory.display(),
                     LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MAX_DEPTH
                 ),
             });
         }
-        let entries = std::fs::read_dir(&directory).map_err(|error| inspect_error(&directory, error))?;
+        let entries =
+            std::fs::read_dir(&directory).map_err(|error| inspect_error(&directory, error))?;
         for entry in entries {
             let entry = entry.map_err(|error| inspect_error(&directory, error))?;
             let source = entry.path();
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 return Err(RebornBuildError::InvalidConfig {
                     reason: format!(
-                        "local-dev legacy skill entry '{}' is not valid UTF-8",
+                        "local-dev skill entry '{}' is not valid UTF-8",
                         source.display()
                     ),
                 });
@@ -3006,12 +3160,12 @@ fn read_local_dev_legacy_skill_files(
             } else {
                 format!("{prefix}/{name}")
             };
-            let metadata =
-                std::fs::symlink_metadata(&source).map_err(|error| inspect_error(&source, error))?;
+            let metadata = std::fs::symlink_metadata(&source)
+                .map_err(|error| inspect_error(&source, error))?;
             if metadata.file_type().is_symlink() {
                 tracing::warn!(
                     path = %source.display(),
-                    "Skipping symlinked local-dev legacy skill entry during backfill"
+                    "Skipping symlinked local-dev skill entry during backfill"
                 );
                 continue;
             }
@@ -3019,9 +3173,7 @@ fn read_local_dev_legacy_skill_files(
                 pending.push_back((source, relative, depth.saturating_add(1)));
                 continue;
             }
-            let contents =
-                std::fs::read(&source).map_err(|error| inspect_error(&source, error))?;
-            files.push((relative, contents));
+            files.push((relative, source));
         }
     }
     Ok(files)
@@ -3754,7 +3906,7 @@ async fn build_local_storage_production_shaped(
             default_runtime_owner_scope(owner_user_id.clone()).map_err(RebornBuildError::Mount)?
         }
     };
-    backfill_local_dev_legacy_user_skills(&root, filesystem.as_ref(), &backfill_scope).await?;
+    backfill_local_dev_disk_user_skills(&root, filesystem.as_ref(), &backfill_scope).await?;
     context.workspace_filesystems = Some(build_workspace_filesystems(
         Arc::clone(&filesystem),
         &workspace_root,

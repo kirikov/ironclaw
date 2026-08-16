@@ -133,12 +133,12 @@ pub use ironclaw_skills::{
     ManagedSkillSource as RebornSkillSource, SkillSummary as RebornSkillSummary,
     skill_summary_json as reborn_skill_summary_json,
 };
-pub use local_skill_listing::{
-    LocalSkillListingSource, LocalSkillOwner, open_local_skill_listing_source,
-};
 pub use ironclaw_triggers::TriggerId;
 pub use ironclaw_turns::TurnStatus;
 pub use llm_admin::openai_compat_serve::build_openai_compat_route_mount;
+#[cfg(any(test, feature = "test-support"))]
+pub use local_skill_listing::seed_skill_for_test;
+pub use local_skill_listing::{SkillListingSource, SkillOwner, open_skill_listing_source};
 pub use memory_binding::{memory_binding_diagnostics, resolve_memory_binding_policy};
 pub use memory_provider_factory::{
     Mem0ConnectionConfig, MemoryLifecycleConsumers, MemoryProviderDeps, ResolvedMemoryProvider,
