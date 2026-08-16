@@ -1,8 +1,8 @@
 //! Reborn integration-test framework local-dev boot accessors.
 //!
 //! `build_approval_gate_evidence_for_test`,
-//! `build_default_local_dev_database_roots_for_test`,
-//! `mount_local_dev_database_roots_for_test`,
+//! `open_or_create_libsql_roots_for_test`,
+//! `mount_durable_roots_for_test`,
 //! `build_secret_store_for_test` — mirror the production local-dev
 //! boot sequence so the integration-test harness (`tests/support/reborn/`)
 //! drives the real local-dev composition paths without duplicating the wiring
@@ -15,7 +15,7 @@
 pub const LOCAL_DEV_DB_FILENAME: &str = crate::factory::LOCAL_DEV_DB_FILENAME;
 
 /// Test-only accessor mirroring the full local-dev database-roots boot path
-/// (`build_local_runtime_root_filesystem` → `build_default_local_dev_database_roots`).
+/// (`build_local_runtime_root_filesystem` → `open_or_create_libsql_roots`).
 ///
 /// Constructs the durable database backend and mounts it across the
 /// control-plane roots (`/tenants`, `/memory`, `/events`) of `composite`,
@@ -26,10 +26,10 @@ pub const LOCAL_DEV_DB_FILENAME: &str = crate::factory::LOCAL_DEV_DB_FILENAME;
 /// Called by the Reborn integration-test framework's `StorageMode::LibSql`
 /// builder arm (`tests/support/reborn/builder.rs:build_storage_composite`) so
 /// the 4-step libSQL setup sequence lives once (production call site:
-/// `build_local_runtime_root_filesystem` → `build_default_local_dev_database_roots`).
+/// `build_local_runtime_root_filesystem` → `open_or_create_libsql_roots`).
 /// For tests only — gated behind `test-support`, ships zero bytes in production.
 #[cfg(feature = "test-support")]
-pub async fn build_default_local_dev_database_roots_for_test(
+pub async fn open_or_create_libsql_roots_for_test(
     root: &std::path::Path,
     composite: &mut ironclaw_filesystem::CompositeRootFilesystem,
 ) -> Result<(), crate::RebornBuildError> {
@@ -37,7 +37,7 @@ pub async fn build_default_local_dev_database_roots_for_test(
 }
 
 /// Test-only accessor mirroring the production local-dev boot path
-/// (`build_local_runtime_root_filesystem` → `mount_local_dev_database_roots`).
+/// (`build_local_runtime_root_filesystem` → `mount_durable_roots`).
 ///
 /// Mounts `database` across the control-plane roots (`/tenants`, `/memory`,
 /// `/events`) of `root` exactly as the libSQL local-dev boot path does, so
@@ -47,14 +47,14 @@ pub async fn build_default_local_dev_database_roots_for_test(
 /// For tests only — gated behind `test-support`, so it ships zero bytes in
 /// production binaries.
 #[cfg(feature = "test-support")]
-pub fn mount_local_dev_database_roots_for_test<F>(
+pub fn mount_durable_roots_for_test<F>(
     root: &mut ironclaw_filesystem::CompositeRootFilesystem,
     database: std::sync::Arc<F>,
 ) -> Result<(), crate::RebornBuildError>
 where
     F: ironclaw_filesystem::RootFilesystem + 'static,
 {
-    crate::factory::mount_local_dev_database_roots(root, database)
+    crate::factory::mount_durable_roots(root, database)
 }
 
 /// Test-only entry point for building a local-dev

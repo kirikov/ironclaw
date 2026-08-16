@@ -804,18 +804,18 @@ pub struct RebornApprovalTestParts {
     pub replay_payload_store: Arc<dyn ironclaw_capabilities::ReplayPayloadStorePort>,
 }
 
-/// Thin void wrapper over [`build_default_local_dev_database_roots`] for
+/// Thin void wrapper over [`open_or_create_libsql_roots`] for
 /// `#[cfg(feature = "test-support")]` callers that need to mount the local-dev
 /// database roots but don't need the opaque `DurableBackend` handle
 /// (which is private to this module).
 ///
-/// Used by `test_support::build_default_local_dev_database_roots_for_test`.
+/// Used by `test_support::open_or_create_libsql_roots_for_test`.
 #[cfg(feature = "test-support")]
 pub(crate) async fn mount_default_local_dev_database_roots(
     root: &Path,
     composite: &mut CompositeRootFilesystem,
 ) -> Result<(), RebornBuildError> {
-    build_default_local_dev_database_roots(root, composite)
+    open_or_create_libsql_roots(root, composite)
         .await
         .map(|_| ())
 }

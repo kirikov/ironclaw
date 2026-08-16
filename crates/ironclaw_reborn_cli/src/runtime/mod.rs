@@ -1153,7 +1153,7 @@ pub(crate) fn local_runtime_storage_root(
         .join(profile.local_runtime_storage_subdir())
 }
 
-fn composition_profile(profile: RebornProfile) -> RebornCompositionProfile {
+pub(crate) fn composition_profile(profile: RebornProfile) -> RebornCompositionProfile {
     match profile {
         RebornProfile::LocalDev => RebornCompositionProfile::LocalDev,
         RebornProfile::LocalDevYolo => RebornCompositionProfile::LocalDevYolo,
@@ -1184,7 +1184,7 @@ pub(crate) fn read_config_file(
 
 // CLI-local operator config only. Product/WebUI identity must come from
 // trusted host installation/binding resolution, not inbound payloads.
-fn runtime_identity(
+pub(crate) fn runtime_identity(
     config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
 ) -> RebornRuntimeIdentity {
     let default = RebornRuntimeIdentity::reborn_cli();

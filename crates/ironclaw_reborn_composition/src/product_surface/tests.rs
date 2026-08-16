@@ -530,14 +530,7 @@ async fn skills_product_service_surfaces_shared_auto_activate_learned_flag() {
     let storage_root = dir.path().join("local-dev");
     std::fs::create_dir_all(&storage_root).expect("storage root");
 
-    let mut filesystem = DiskFilesystem::new();
-    filesystem
-        .mount_local(
-            VirtualPath::new("/projects").expect("valid virtual path"),
-            HostPath::from_path_buf(storage_root.clone()),
-        )
-        .expect("mount storage root");
-    let filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem> = Arc::new(filesystem);
+    let filesystem = skill_test_filesystem(&storage_root);
     let skill_management = Arc::new(ScopedSkillManagementPort::new_with_mount_resolver(
         UserId::new("runtime-owner").expect("user"),
         filesystem,
@@ -588,14 +581,7 @@ async fn skills_product_service_defaults_auto_activate_learned_when_no_selector_
     let storage_root = dir.path().join("local-dev");
     std::fs::create_dir_all(&storage_root).expect("storage root");
 
-    let mut filesystem = DiskFilesystem::new();
-    filesystem
-        .mount_local(
-            VirtualPath::new("/projects").expect("valid virtual path"),
-            HostPath::from_path_buf(storage_root.clone()),
-        )
-        .expect("mount storage root");
-    let filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem> = Arc::new(filesystem);
+    let filesystem = skill_test_filesystem(&storage_root);
     let skill_management = Arc::new(ScopedSkillManagementPort::new_with_mount_resolver(
         UserId::new("runtime-owner").expect("user"),
         filesystem,
@@ -624,14 +610,7 @@ async fn skills_product_service_hides_owner_user_skills_from_other_callers() {
     )
     .expect("system skill");
 
-    let mut filesystem = DiskFilesystem::new();
-    filesystem
-        .mount_local(
-            VirtualPath::new("/projects").expect("valid virtual path"),
-            HostPath::from_path_buf(storage_root.clone()),
-        )
-        .expect("mount storage root");
-    let filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem> = Arc::new(filesystem);
+    let filesystem = skill_test_filesystem(&storage_root);
     let skill_management = Arc::new(ScopedSkillManagementPort::new_with_mount_resolver(
         UserId::new("runtime-owner").expect("user"),
         filesystem,
@@ -796,13 +775,34 @@ fn caller_in_tenant(tenant_id: &str, user_id: &str) -> ProductSurfaceCaller {
     )
 }
 
+/// Disk stand-in for the composed filesystem, with `/tenants` split from
+/// `/projects` so `scoped_skill_mounts` resolves production's real targets.
+fn skill_test_filesystem(
+    storage_root: &std::path::Path,
+) -> Arc<dyn ironclaw_filesystem::RootFilesystem> {
+    std::fs::create_dir_all(storage_root.join("tenants")).expect("tenants root");
+    let mut filesystem = DiskFilesystem::new();
+    filesystem
+        .mount_local(
+            VirtualPath::new("/projects").expect("valid virtual path"),
+            HostPath::from_path_buf(storage_root.to_path_buf()),
+        )
+        .expect("mount storage root");
+    filesystem
+        .mount_local(
+            VirtualPath::new("/tenants").expect("valid virtual path"),
+            HostPath::from_path_buf(storage_root.join("tenants")),
+        )
+        .expect("mount tenants root");
+    Arc::new(filesystem)
+}
+
 fn scoped_skill_mounts(
     scope: &ResourceScope,
 ) -> Result<MountView, ironclaw_host_api::HostApiError> {
-    let user_skills = format!(
-        "/projects/tenants/{}/users/{}/skills",
+    let user_skills = crate::local_dev_mounts::scoped_user_skills_target(
         scope.tenant_id.as_str(),
-        scope.user_id.as_str()
+        scope.user_id.as_str(),
     );
     MountView::new(vec![
         MountGrant::new(

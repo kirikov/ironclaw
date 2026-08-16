@@ -54,17 +54,23 @@ pub(crate) fn ambient_workspace_mount_view(
     MountView::new(mounts)
 }
 
+/// Per-user skill root, and the sole owner of this path shape. No `/projects`
+/// prefix: `/tenants` is the durable backend, and installs go there.
+pub(crate) fn scoped_user_skills_target(tenant_id: &str, user_id: &str) -> String {
+    format!("/tenants/{tenant_id}/users/{user_id}/skills")
+}
+
+fn scoped_user_skills_target_for(scope: &ResourceScope) -> String {
+    scoped_user_skills_target(scope.tenant_id.as_str(), scope.user_id.as_str())
+}
+
 pub(crate) fn scoped_skill_context_mount_view(
     scope: &ResourceScope,
 ) -> Result<MountView, HostApiError> {
     MountView::new(vec![
         grant(
             "/skills",
-            &format!(
-                "/projects/tenants/{}/users/{}/skills",
-                scope.tenant_id.as_str(),
-                scope.user_id.as_str()
-            ),
+            &scoped_user_skills_target_for(scope),
             MountPermissions::read_only(),
         )?,
         grant(
@@ -101,11 +107,7 @@ pub(crate) fn scoped_skill_management_mount_view(
     MountView::new(vec![
         grant(
             "/skills",
-            &format!(
-                "/projects/tenants/{}/users/{}/skills",
-                scope.tenant_id.as_str(),
-                scope.user_id.as_str()
-            ),
+            &scoped_user_skills_target_for(scope),
             MountPermissions::read_write_list_delete(),
         )?,
         grant(

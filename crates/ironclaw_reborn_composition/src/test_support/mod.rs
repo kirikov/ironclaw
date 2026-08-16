@@ -14,8 +14,8 @@
 //!    `build_google_oauth_product_auth_for_test` — real store / real client /
 //!    scripted HTTP egress for OAuth connect, refresh, and error-path tests.
 //! 3. [`local_dev_boot`] — `build_approval_gate_evidence_for_test`,
-//!    `build_default_local_dev_database_roots_for_test`,
-//!    `mount_local_dev_database_roots_for_test`,
+//!    `open_or_create_libsql_roots_for_test`,
+//!    `mount_durable_roots_for_test`,
 //!    `build_secret_store_for_test` — mirror the production
 //!    local-dev boot sequence so the integration-test harness
 //!    (`tests/support/reborn/`) drives the real local-dev composition paths
@@ -104,8 +104,8 @@ pub use local_dev_boot::LOCAL_DEV_DB_FILENAME;
 pub use local_dev_boot::build_secret_store_for_test;
 #[cfg(feature = "test-support")]
 pub use local_dev_boot::{
-    build_approval_gate_evidence_for_test, build_default_local_dev_database_roots_for_test,
-    mount_local_dev_database_roots_for_test,
+    build_approval_gate_evidence_for_test, mount_durable_roots_for_test,
+    open_or_create_libsql_roots_for_test,
 };
 #[cfg(feature = "test-support")]
 pub use local_dev_capability_io::{

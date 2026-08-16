@@ -2171,6 +2171,48 @@ async fn local_dev_setup_marker_workspace_filesystem_is_read_only() {
     assert!(matches!(error, FilesystemError::PermissionDenied { .. }));
 }
 
+/// Install through the port, list through the loop mount view: the two resolve
+/// `/skills` separately and must name the same backend. The round-trip test
+/// below drives both ends through the loop view and cannot see that split.
+#[tokio::test]
+async fn local_dev_port_installed_skill_is_visible_to_loop_skill_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let services = build_runtime_substrate(crate::deployment::local_dev_build_input(
+        "local-dev-port-install-owner",
+        dir.path().join("local-dev"),
+    ))
+    .await
+    .expect("local-dev services build");
+
+    services
+        .skill_management
+        .install_for_scope(
+            skill_scope(),
+            Some("port-installed"),
+            &skill_md("port-installed", "port installed skill", "PORT_SENTINEL"),
+        )
+        .await
+        .expect("port skill install succeeds");
+
+    let list_output = invoke_json(
+        &services,
+        SKILL_LIST_CAPABILITY_ID,
+        skill_context(SKILL_LIST_CAPABILITY_ID),
+        serde_json::json!({}),
+    )
+    .await
+    .expect("skill list succeeds");
+
+    assert!(
+        list_output["skills"]
+            .as_array()
+            .expect("skills array")
+            .iter()
+            .any(|skill| skill["name"] == "port-installed" && skill["source"] == "user"),
+        "loop skill_list must see the port-installed skill: {list_output}"
+    );
+}
+
 #[tokio::test]
 async fn local_dev_skill_management_invokes_through_first_party_runtime() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2194,11 +2236,12 @@ async fn local_dev_skill_management_invokes_through_first_party_runtime() {
     .expect("skill install succeeds");
     assert_eq!(install_output["installed"], true);
     assert_eq!(install_output["name"], "runtime-sentinel");
-    assert!(
-        storage_root
-            .join("tenants/default/users/local-dev-test-user/skills/runtime-sentinel/SKILL.md")
-            .exists()
-    );
+    let installed = services
+        .skill_management
+        .read_content_for_scope(skill_scope(), "runtime-sentinel")
+        .await
+        .expect("installed skill is readable");
+    assert!(installed.content.contains("RUNTIME_SENTINEL"));
 
     let list_output = invoke_json(
         &services,
@@ -2244,12 +2287,12 @@ async fn local_dev_skill_management_invokes_through_first_party_runtime() {
     assert_eq!(auto_activate_output["updated"], true);
     assert_eq!(auto_activate_output["name"], "runtime-sentinel");
     assert_eq!(auto_activate_output["auto_activate"], false);
-    let updated_skill = std::fs::read_to_string(
-        storage_root
-            .join("tenants/default/users/local-dev-test-user/skills/runtime-sentinel/SKILL.md"),
-    )
-    .expect("updated skill");
-    assert!(updated_skill.contains("auto_activate: false"));
+    let updated_skill = services
+        .skill_management
+        .read_content_for_scope(skill_scope(), "runtime-sentinel")
+        .await
+        .expect("updated skill is readable");
+    assert!(updated_skill.content.contains("auto_activate: false"));
 
     let remove_output = invoke_json(
         &services,
@@ -2260,11 +2303,11 @@ async fn local_dev_skill_management_invokes_through_first_party_runtime() {
     .await
     .expect("skill remove succeeds");
     assert_eq!(remove_output["removed"], true);
-    assert!(
-        !storage_root
-            .join("tenants/default/users/local-dev-test-user/skills/runtime-sentinel/SKILL.md")
-            .exists()
-    );
+    services
+        .skill_management
+        .read_content_for_scope(skill_scope(), "runtime-sentinel")
+        .await
+        .expect_err("removed skill is no longer readable");
 }
 
 #[tokio::test]
@@ -2294,11 +2337,11 @@ async fn local_dev_workspace_mounts_do_not_authorize_skill_writes() {
     // path refused) where the retired vocabulary coarsened it to
     // Authorization; same ModelVisible fate and policy-denied bucket.
     assert_eq!(failure, FailureKind::FilesystemDenied);
-    assert!(
-        !storage_root
-            .join("tenants/default/users/local-dev-test-user/skills/blocked/SKILL.md")
-            .exists()
-    );
+    services
+        .skill_management
+        .read_content_for_scope(skill_scope(), "blocked")
+        .await
+        .expect_err("denied workspace write must not create a skill");
 }
 
 #[test]
@@ -2330,33 +2373,77 @@ fn local_dev_workspace_root_overlapping_skill_root_is_rejected() {
     }
 }
 
-#[test]
-fn local_dev_legacy_skill_backfill_marker_preserves_deletions() {
+/// `/tenants` on its own backend, as composition mounts it.
+fn backfill_target_filesystem() -> Arc<CompositeRootFilesystem> {
+    let mut root = CompositeRootFilesystem::new();
+    root.mount(
+        local_dev_mount_descriptor(
+            "/tenants",
+            "backfill-target",
+            BackendKind::Custom("test".to_string()),
+            StorageClass::StructuredRecords,
+            ContentKind::StructuredRecord,
+            IndexPolicy::NotIndexed,
+            BackendCapabilities::default(),
+        )
+        .expect("mount descriptor"),
+        Arc::new(ironclaw_filesystem::InMemoryBackend::new()),
+    )
+    .expect("mount tenants root");
+    Arc::new(root)
+}
+
+fn backfill_scope(user_id: &str) -> ResourceScope {
+    ResourceScope::local_default(
+        UserId::new(user_id).expect("valid user id"),
+        InvocationId::new(),
+    )
+    .expect("valid resource scope")
+}
+
+async fn migrated_skill_exists(filesystem: &CompositeRootFilesystem, scoped_path: &str) -> bool {
+    filesystem
+        .stat(&VirtualPath::new(scoped_path).expect("virtual path"))
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn local_dev_legacy_skill_backfill_marker_preserves_deletions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let storage_root = dir.path().join("local-dev");
     let legacy_skill_dir = storage_root.join("skills/legacy-skill");
     std::fs::create_dir_all(&legacy_skill_dir).expect("legacy skill dir");
     std::fs::write(legacy_skill_dir.join("SKILL.md"), "legacy skill").expect("legacy skill");
-    let owner_user_id = UserId::new("owner").expect("owner");
+    let filesystem = backfill_target_filesystem();
+    let scope = backfill_scope("owner");
+    let migrated = format!(
+        "/tenants/{}/users/owner/skills/legacy-skill/SKILL.md",
+        scope.tenant_id.as_str()
+    );
 
-    backfill_local_dev_legacy_user_skills(&storage_root, &owner_user_id).expect("initial backfill");
-    let scoped_skill_dir = storage_root.join("tenants/default/users/owner/skills/legacy-skill");
-    let reborn_cli_skill_dir =
-        storage_root.join("tenants/reborn-cli/users/owner/skills/legacy-skill");
-    assert!(scoped_skill_dir.join("SKILL.md").exists());
-    assert!(reborn_cli_skill_dir.join("SKILL.md").exists());
+    backfill_local_dev_disk_user_skills(&storage_root, filesystem.as_ref(), &scope)
+        .await
+        .expect("initial backfill");
+    assert!(migrated_skill_exists(&filesystem, &migrated).await);
 
-    std::fs::remove_dir_all(&scoped_skill_dir).expect("delete migrated skill");
-    backfill_local_dev_legacy_user_skills(&storage_root, &owner_user_id).expect("second backfill");
+    filesystem
+        .delete(&VirtualPath::new(migrated.clone()).expect("virtual path"))
+        .await
+        .expect("delete migrated skill");
+    backfill_local_dev_disk_user_skills(&storage_root, filesystem.as_ref(), &scope)
+        .await
+        .expect("second backfill");
+
     assert!(
-        !scoped_skill_dir.exists(),
+        !migrated_skill_exists(&filesystem, &migrated).await,
         "one-time legacy backfill must not resurrect user-deleted migrated skills"
     );
 }
 
 #[cfg(unix)]
-#[test]
-fn local_dev_legacy_skill_backfill_skips_symlinks() {
+#[tokio::test]
+async fn local_dev_legacy_skill_backfill_skips_symlinks() {
     let dir = tempfile::tempdir().expect("tempdir");
     let storage_root = dir.path().join("local-dev");
     let legacy_root = storage_root.join("skills");
@@ -2365,21 +2452,24 @@ fn local_dev_legacy_skill_backfill_skips_symlinks() {
     std::fs::create_dir_all(&target_dir).expect("target dir");
     std::os::unix::fs::symlink(&target_dir, legacy_root.join("linked-skill"))
         .expect("legacy symlink");
-    let owner_user_id = UserId::new("owner").expect("owner");
+    let filesystem = backfill_target_filesystem();
+    let scope = backfill_scope("owner");
+    let scoped_root = format!("/tenants/{}/users/owner/skills", scope.tenant_id.as_str());
 
-    backfill_local_dev_legacy_user_skills(&storage_root, &owner_user_id)
+    backfill_local_dev_disk_user_skills(&storage_root, filesystem.as_ref(), &scope)
+        .await
         .expect("symlink should be skipped, not fail startup");
+
     assert!(
-        !storage_root
-            .join("tenants/default/users/owner/skills/linked-skill")
-            .exists()
+        !migrated_skill_exists(&filesystem, &format!("{scoped_root}/linked-skill")).await,
+        "symlinked legacy entries must not be migrated"
     );
     assert!(
-        storage_root
-            .join(format!(
-                "tenants/default/users/owner/skills/{LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MARKER}"
-            ))
-            .exists(),
+        migrated_skill_exists(
+            &filesystem,
+            &format!("{scoped_root}/{LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MARKER}")
+        )
+        .await,
         "migration should still be marked complete after skipping symlinks"
     );
 }
@@ -2706,13 +2796,17 @@ fn capability_grant(
     }
 }
 
-fn skill_mounts() -> MountView {
-    let scope = ironclaw_host_api::ResourceScope::local_default(
+fn skill_scope() -> ResourceScope {
+    ironclaw_host_api::ResourceScope::local_default(
         UserId::new("local-dev-test-user").expect("valid user id"),
         ironclaw_host_api::InvocationId::new(),
     )
-    .expect("valid resource scope");
-    crate::local_dev_mounts::scoped_skill_management_mount_view(&scope).expect("valid skill mounts")
+    .expect("valid resource scope")
+}
+
+fn skill_mounts() -> MountView {
+    crate::local_dev_mounts::scoped_skill_management_mount_view(&skill_scope())
+        .expect("valid skill mounts")
 }
 
 fn workspace_mounts() -> MountView {

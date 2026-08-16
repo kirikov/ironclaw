@@ -442,15 +442,6 @@ async fn skill_execution_adapter_prepares_filesystem_bundles_end_to_end() {
     let _guard = runtime_composition_test_guard().await;
     let root = tempfile::tempdir().unwrap();
     let storage_root = root.path().join("local-dev");
-    let skill_root = storage_root
-        .join("tenants/runtime-skill-execution-tenant/users/runtime-skill-execution-owner/skills/policy-helper");
-    std::fs::create_dir_all(skill_root.join("references")).unwrap();
-    std::fs::write(
-        skill_root.join("SKILL.md"),
-        skill_md("policy-helper", "policy-helper", "Use policy guidance."),
-    )
-    .unwrap();
-    std::fs::write(skill_root.join("references/policy.md"), "filesystem policy").unwrap();
     let input = RebornRuntimeInput::from_build_input(
         ironclaw_reborn_composition::local_dev_build_input(
             "runtime-skill-execution-owner",
@@ -470,6 +461,26 @@ async fn skill_execution_adapter_prepares_filesystem_bundles_end_to_end() {
     });
 
     let runtime = build_reborn_runtime(input).await.unwrap();
+    // The scoped skill root is on `/tenants`, not the storage dir.
+    let filesystem = runtime
+        .local_dev_profile_filesystem_for_test()
+        .expect("local-dev composed filesystem");
+    for (relative, contents) in [
+        (
+            "SKILL.md",
+            skill_md("policy-helper", "policy-helper", "Use policy guidance."),
+        ),
+        ("references/policy.md", "filesystem policy".to_string()),
+    ] {
+        let path = ironclaw_host_api::VirtualPath::new(format!(
+            "/tenants/runtime-skill-execution-tenant/users/runtime-skill-execution-owner/skills/policy-helper/{relative}"
+        ))
+        .unwrap();
+        filesystem
+            .write_file(&path, contents.as_bytes())
+            .await
+            .unwrap();
+    }
     let conversation = runtime.new_conversation().await.unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(15),

@@ -1608,21 +1608,18 @@ fn assert_not_implemented(args: &[&str], expected_message: &str) {
 }
 
 fn write_reborn_skill(reborn_home: &std::path::Path, name: &str, description: &str) {
-    let skill_dir = reborn_cli_skill_root(reborn_home).join(name);
-    std::fs::create_dir_all(&skill_dir).expect("skill dir");
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        format!("---\nname: {name}\ndescription: {description}\n---\nUse {name}.\n"),
-    )
-    .expect("skill file");
+    seed_reborn_skill(
+        reborn_home,
+        name,
+        &format!("---\nname: {name}\ndescription: {description}\n---\nUse {name}.\n"),
+    );
 }
 
 fn write_verbose_reborn_skill(reborn_home: &std::path::Path, name: &str, description: &str) {
-    let skill_dir = reborn_cli_skill_root(reborn_home).join(name);
-    std::fs::create_dir_all(&skill_dir).expect("skill dir");
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        format!(
+    seed_reborn_skill(
+        reborn_home,
+        name,
+        &format!(
             r#"---
 name: {name}
 version: "1.2.3"
@@ -1636,12 +1633,28 @@ requires:
 Use {name}.
 "#
         ),
-    )
-    .expect("skill file");
+    );
 }
 
-fn reborn_cli_skill_root(reborn_home: &std::path::Path) -> std::path::PathBuf {
-    reborn_home.join("local-dev/tenants/default/users/reborn-cli/skills")
+/// Seed a user skill through the same composition-owned port `ironclaw skills
+/// list` reads: user skills live on the durable `/tenants` mount, not on disk.
+fn seed_reborn_skill(reborn_home: &std::path::Path, name: &str, content: &str) {
+    let root = reborn_home.join("local-dev");
+    std::fs::create_dir_all(&root).expect("local-dev root");
+    tokio::runtime::Runtime::new()
+        .expect("tokio runtime")
+        .block_on(async {
+            ironclaw_reborn_composition::seed_skill_for_test(
+                &root,
+                ironclaw_host_api::TenantId::new("reborn-cli").expect("tenant"),
+                ironclaw_host_api::AgentId::new("reborn-cli-agent").expect("agent"),
+                ironclaw_host_api::UserId::new("reborn-cli").expect("owner"),
+                name,
+                content,
+            )
+            .await
+            .expect("seed user skill");
+        });
 }
 
 #[test]

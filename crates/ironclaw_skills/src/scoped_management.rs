@@ -1,10 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
-use ironclaw_filesystem::{DiskFilesystem, FilesystemError, RootFilesystem};
-use ironclaw_host_api::{
-    HostApiError, HostPath, InvocationId, MountAlias, MountGrant, MountPermissions, MountView,
-    ResourceScope, UserId, VirtualPath,
-};
+use ironclaw_filesystem::RootFilesystem;
+use ironclaw_host_api::{HostApiError, InvocationId, MountView, ResourceScope, UserId};
 
 use crate::{
     SkillContentRequest, SkillContentResult, SkillInstallRequest, SkillInstallResult,
@@ -16,25 +13,6 @@ use crate::{
 
 pub type ScopedSkillManagementMountResolver =
     dyn Fn(&ResourceScope) -> Result<MountView, HostApiError> + Send + Sync;
-
-fn scoped_skill_management_mount_view(scope: &ResourceScope) -> Result<MountView, HostApiError> {
-    MountView::new(vec![
-        MountGrant::new(
-            MountAlias::new("/skills")?,
-            VirtualPath::new(format!(
-                "/projects/tenants/{}/users/{}/skills",
-                scope.tenant_id.as_str(),
-                scope.user_id.as_str()
-            ))?,
-            MountPermissions::read_write_list_delete(),
-        ),
-        MountGrant::new(
-            MountAlias::new("/system/skills")?,
-            VirtualPath::new("/projects/system/skills")?,
-            MountPermissions::read_only(),
-        ),
-    ])
-}
 
 #[derive(Clone)]
 pub struct ScopedSkillManagementPort {
@@ -169,67 +147,6 @@ impl From<SkillManagementError> for ScopedSkillManagementError {
     fn from(error: SkillManagementError) -> Self {
         Self::Skill(error)
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ScopedSkillManagementBuildError {
-    #[error("invalid skill management configuration: {reason}")]
-    InvalidConfig { reason: String },
-    #[error("skill management filesystem build failed")]
-    Filesystem(#[from] FilesystemError),
-    #[error("skill management mount view construction failed")]
-    Mount(#[from] HostApiError),
-}
-
-pub fn build_scoped_skill_management_port<F>(
-    owner_user_id: UserId,
-    filesystem: Arc<F>,
-) -> Arc<ScopedSkillManagementPort>
-where
-    F: RootFilesystem + 'static,
-{
-    let mount_resolver: Arc<ScopedSkillManagementMountResolver> =
-        Arc::new(scoped_skill_management_mount_view);
-    let filesystem: Arc<dyn RootFilesystem> = filesystem;
-    Arc::new(ScopedSkillManagementPort::new_with_mount_resolver(
-        owner_user_id,
-        filesystem,
-        mount_resolver,
-    ))
-}
-
-pub fn build_existing_local_dev_skill_management_port(
-    owner_id: impl Into<String>,
-    local_dev_storage_root: impl Into<PathBuf>,
-) -> Result<Option<Arc<ScopedSkillManagementPort>>, ScopedSkillManagementBuildError> {
-    let owner_id = owner_id.into();
-    let local_dev_storage_root = local_dev_storage_root.into();
-    if !local_dev_storage_root.try_exists().map_err(|error| {
-        ScopedSkillManagementBuildError::InvalidConfig {
-            reason: format!("local-dev skill storage root could not be inspected: {error}"),
-        }
-    })? {
-        return Ok(None);
-    }
-    if !local_dev_storage_root.is_dir() {
-        return Err(ScopedSkillManagementBuildError::InvalidConfig {
-            reason: "local-dev skill storage root is not a directory".to_string(),
-        });
-    }
-
-    let mut filesystem = DiskFilesystem::new();
-    filesystem.mount_local(
-        VirtualPath::new("/projects")?,
-        HostPath::from_path_buf(local_dev_storage_root),
-    )?;
-    let owner_user_id =
-        UserId::new(owner_id).map_err(|error| ScopedSkillManagementBuildError::InvalidConfig {
-            reason: error.to_string(),
-        })?;
-    Ok(Some(build_scoped_skill_management_port(
-        owner_user_id,
-        Arc::new(filesystem),
-    )))
 }
 
 fn invalid_skill_context(error: impl std::fmt::Display) -> ScopedSkillManagementError {

@@ -557,13 +557,19 @@ cargo run -q -p ironclaw --bin ironclaw -- serve --host 127.0.0.1 --port 3000
 
 ### `skills list`
 
-Reports configured Reborn skills from `<reborn-home>/<profile-subdir>/skills`
-and `<reborn-home>/<profile-subdir>/system/skills` through the Reborn
-composition skill listing function, where `<profile-subdir>` is
-`hosted-single-tenant` or `hosted-single-tenant-volume` for those profiles and
+Reports the bundled system skills compiled into the binary, then one group per
+skill owner the durable store knows about. User skills live on the `/tenants`
+mount. That mount is PostgreSQL for `hosted-single-tenant` and
+`<reborn-home>/<profile-subdir>/reborn-local-dev.db` otherwise, where
+`<profile-subdir>` is `hosted-single-tenant-volume` for that profile and
 `local-dev` for `local-dev`, `local-dev-yolo`, `production`, and
-`migration-dry-run`. It does not read v1 skill discovery paths, and a missing
-storage root is reported as an empty skill list without creating directories.
+`migration-dry-run`. Owners are discovered by walking
+`/tenants/*/users/*/skills`, because the CLI cannot know which users WebUI login
+minted; `--tenant` and `--user` filter that list.
+
+It does not read v1 skill discovery paths. Listing never creates state: a
+missing storage root reports the bundled skills only, and a storage root with no
+database yet reports the configured owner only, without creating the database.
 
 ```bash
 cargo run -q -p ironclaw --bin ironclaw -- skills list
