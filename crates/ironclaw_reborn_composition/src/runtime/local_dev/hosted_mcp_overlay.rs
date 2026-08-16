@@ -314,8 +314,8 @@ fn per_user_secret_discovery_template(
     let template = package.manifest.capabilities.first()?;
     // Both credential kinds qualify: a raw `SecretHandle` credential, and a
     // vendor-recipe (`ProductAuthAccount`) credential delivered through the
-    // extension's setup channel (the v3 `[mcp]` + `[auth.<vendor>]` shape —
-    // e.g. the agent-market bearer). Staging routes by the requirement's
+    // extension's setup channel (the v3 `[mcp]` + `[auth.<vendor>]` shape,
+    // e.g. a vendor bearer). Staging routes by the requirement's
     // SOURCE (`stage_credential_requirement_once`), and a user without the
     // credential fails closed into the AuthRequired skip.
     let requirement = template

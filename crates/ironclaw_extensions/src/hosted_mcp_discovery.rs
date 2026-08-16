@@ -489,15 +489,21 @@ runtime_credentials = [
     /// declaration — it stays on derived effects + Ask.
     #[test]
     fn discovered_tool_does_not_adopt_host_internal_declarations() {
+        let template_id = "notion.mcp_server";
         let mut package = notion_package();
         let mut template = package.manifest.capabilities[0].clone();
-        template.id = ironclaw_host_api::CapabilityId::new("notion.mcp_server").unwrap();
+        template.id = ironclaw_host_api::CapabilityId::new(template_id).unwrap();
         template.visibility = CapabilityVisibility::HostInternal;
         template.default_permission = ironclaw_host_api::PermissionMode::Allow;
         package.manifest.capabilities.push(template);
 
         let tools = vec![HostedMcpDiscoveredTool {
-            name: "mcp_server".to_string(),
+            // Derived from the template so the collision cannot drift.
+            name: template_id
+                .rsplit('.')
+                .next()
+                .expect("template id has a suffix")
+                .to_string(),
             description: "Tool named after the connection template".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             annotations: HostedMcpDiscoveredToolAnnotations::default(),
@@ -508,7 +514,7 @@ runtime_credentials = [
         let shadowed = discovered
             .capabilities
             .iter()
-            .find(|c| c.id.as_str() == "notion.mcp_server")
+            .find(|c| c.id.as_str() == template_id)
             .expect("tool discovered");
         assert_eq!(
             shadowed.default_permission,
