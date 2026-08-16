@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use ironclaw_filesystem::RootFilesystem;
-use ironclaw_host_api::{
-    HostApiError, InvocationId, MountView, ResourceScope, UserId,
-};
+use ironclaw_host_api::{HostApiError, InvocationId, MountView, ResourceScope, UserId};
 
 use crate::{
     SkillContentRequest, SkillContentResult, SkillInstallRequest, SkillInstallResult,
