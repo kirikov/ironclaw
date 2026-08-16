@@ -2157,6 +2157,29 @@ pub(crate) async fn build_default_local_dev_database_roots(
     }
 }
 
+/// Mount `/tenants` from the backend this deployment actually uses, reporting
+/// whether it was mounted. Hosted single-tenant is Postgres; the rest is the
+/// local libSQL file.
+pub(crate) async fn mount_existing_skill_store_roots(
+    root: &Path,
+    profile: RebornCompositionProfile,
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+    composite: &mut CompositeRootFilesystem,
+) -> Result<bool, RebornBuildError> {
+    if crate::deployment::DeploymentConfig::for_profile(profile, false).storage_shape()
+        != crate::deployment::StorageShape::HostedSingleTenantPool
+    {
+        return mount_existing_local_dev_database_roots(root, composite).await;
+    }
+    let resolved =
+        crate::input::resolve_postgres_storage_from_config_and_env(profile, config_file)?;
+    let pool = open_postgres_pool_from_source(PostgresPoolSource::Config(resolved.connection))?;
+    // No migrations here: `serve` owns the hosted schema, and an inspection
+    // command must not run DDL against it.
+    mount_local_dev_database_roots(composite, Arc::new(PostgresRootFilesystem::new(pool)))?;
+    Ok(true)
+}
+
 /// Mount the durable roots only if the database exists, reporting whether it
 /// did. An inspection command must not create the store by reading it.
 pub(crate) async fn mount_existing_local_dev_database_roots(

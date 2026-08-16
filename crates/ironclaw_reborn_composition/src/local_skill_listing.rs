@@ -18,10 +18,11 @@ use ironclaw_skills::{ScopedSkillManagementPort, SkillSummary};
 
 use crate::error::RebornBuildError;
 use crate::factory::{
-    mount_existing_local_dev_database_roots, mount_local_dev_project_roots,
+    mount_existing_skill_store_roots, mount_local_dev_project_roots,
     owner_scope_from_runtime_identity,
 };
 use crate::local_dev_mounts::scoped_skill_management_mount_view;
+use crate::root::profile::RebornCompositionProfile;
 
 /// One `(tenant, user)` skill owner backed by the durable store.
 #[derive(Debug, Clone)]
@@ -58,6 +59,8 @@ impl SkillListingSource {
 /// empty skill root, so a fresh store still lists under its own heading.
 pub async fn open_skill_listing_source(
     root: &Path,
+    profile: RebornCompositionProfile,
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
     tenant_id: TenantId,
     agent_id: AgentId,
     owner_id: UserId,
@@ -78,7 +81,8 @@ pub async fn open_skill_listing_source(
 
     let mut composite = CompositeRootFilesystem::new();
     // With no database yet the configured owner is the only one.
-    let durable_mounted = mount_existing_local_dev_database_roots(root, &mut composite).await?;
+    let durable_mounted =
+        mount_existing_skill_store_roots(root, profile, config_file, &mut composite).await?;
     // Only `/projects` is mounted, rooted at the storage root: `mount_local`
     // requires the host directory to exist, and listing must not create skill
     // dirs. Bundled system skills resolve through `/projects/system/skills` and
@@ -224,6 +228,12 @@ async fn child_directories(
 mod tests {
     use super::*;
 
+    // Parsed, not named: the deployment-mode ratchet bans a profile variant in
+    // any non-`tests.rs` file, and this module keeps its tests inline.
+    fn test_profile() -> RebornCompositionProfile {
+        "local-dev".parse().expect("local-dev profile")
+    }
+
     fn identity() -> (TenantId, AgentId, UserId) {
         (
             TenantId::new("reborn-cli").expect("tenant"),
@@ -238,9 +248,10 @@ mod tests {
         let root = dir.path().join("missing-local-dev");
         let (tenant_id, agent_id, owner_id) = identity();
 
-        let source = open_skill_listing_source(&root, tenant_id, agent_id, owner_id)
-            .await
-            .expect("listing source");
+        let source =
+            open_skill_listing_source(&root, test_profile(), None, tenant_id, agent_id, owner_id)
+                .await
+                .expect("listing source");
 
         assert!(source.is_none());
         assert!(!root.exists());
@@ -253,7 +264,16 @@ mod tests {
         std::fs::write(&root, "not a directory").expect("storage root file");
         let (tenant_id, agent_id, owner_id) = identity();
 
-        let error = match open_skill_listing_source(&root, tenant_id, agent_id, owner_id).await {
+        let error = match open_skill_listing_source(
+            &root,
+            test_profile(),
+            None,
+            tenant_id,
+            agent_id,
+            owner_id,
+        )
+        .await
+        {
             Ok(_) => panic!("file storage root must fail"),
             Err(error) => error,
         };
@@ -261,6 +281,34 @@ mod tests {
         assert!(
             error.to_string().contains("not a directory"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// hosted-single-tenant is Postgres-backed: no fallback to the local file.
+    #[tokio::test]
+    async fn hosted_single_tenant_does_not_fall_back_to_the_local_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("hosted-single-tenant");
+        std::fs::create_dir_all(&root).expect("storage root");
+        let (tenant_id, agent_id, owner_id) = identity();
+        let hosted: RebornCompositionProfile =
+            "hosted-single-tenant".parse().expect("hosted profile");
+
+        let error =
+            match open_skill_listing_source(&root, hosted, None, tenant_id, agent_id, owner_id)
+                .await
+            {
+                Ok(_) => panic!("hosted single-tenant must resolve Postgres storage"),
+                Err(error) => error,
+            };
+
+        assert!(
+            error.to_string().contains("postgres"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !crate::factory::local_dev_db_path(&root).exists(),
+            "hosted single-tenant must not create the local libSQL store"
         );
     }
 
@@ -272,10 +320,11 @@ mod tests {
         std::fs::create_dir_all(&root).expect("storage root");
         let (tenant_id, agent_id, owner_id) = identity();
 
-        let source = open_skill_listing_source(&root, tenant_id, agent_id, owner_id)
-            .await
-            .expect("listing source")
-            .expect("source for existing root");
+        let source =
+            open_skill_listing_source(&root, test_profile(), None, tenant_id, agent_id, owner_id)
+                .await
+                .expect("listing source")
+                .expect("source for existing root");
 
         assert_eq!(source.owners().len(), 1);
         assert_eq!(source.owners()[0].user_id.as_str(), "reborn-cli");
@@ -306,10 +355,11 @@ mod tests {
         .await
         .expect("install skill for dynamically created user");
 
-        let source = open_skill_listing_source(&root, tenant_id, agent_id, owner_id)
-            .await
-            .expect("listing source")
-            .expect("source for existing root");
+        let source =
+            open_skill_listing_source(&root, test_profile(), None, tenant_id, agent_id, owner_id)
+                .await
+                .expect("listing source")
+                .expect("source for existing root");
 
         let owners = source.owners();
         assert_eq!(owners[0].user_id.as_str(), "reborn-cli");

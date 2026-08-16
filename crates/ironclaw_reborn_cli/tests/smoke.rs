@@ -1637,34 +1637,23 @@ Use {name}.
 }
 
 /// Seed a user skill through the same composition-owned port `ironclaw skills
-/// list` reads: user skills live on the durable `/tenants` mount, not on disk,
-/// so the CLI's own store is the only place a seeded skill can be seen from.
+/// list` reads: user skills live on the durable `/tenants` mount, not on disk.
 fn seed_reborn_skill(reborn_home: &std::path::Path, name: &str, content: &str) {
     let root = reborn_home.join("local-dev");
     std::fs::create_dir_all(&root).expect("local-dev root");
     tokio::runtime::Runtime::new()
         .expect("tokio runtime")
         .block_on(async {
-            let source = ironclaw_reborn_composition::open_local_skill_listing_source(
+            ironclaw_reborn_composition::seed_skill_for_test(
                 &root,
                 ironclaw_host_api::TenantId::new("reborn-cli").expect("tenant"),
                 ironclaw_host_api::AgentId::new("reborn-cli-agent").expect("agent"),
                 ironclaw_host_api::UserId::new("reborn-cli").expect("owner"),
+                name,
+                content,
             )
             .await
-            .expect("skill listing source")
-            .expect("source for existing local-dev root");
-            let scope = source
-                .owners()
-                .first()
-                .expect("configured owner is always listed")
-                .scope
-                .clone();
-            source
-                .port()
-                .install_for_scope(scope, Some(name), content)
-                .await
-                .expect("seed user skill");
+            .expect("seed user skill");
         });
 }
 

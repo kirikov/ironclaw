@@ -1153,7 +1153,7 @@ pub(crate) fn local_runtime_storage_root(
         .join(profile.local_runtime_storage_subdir())
 }
 
-fn composition_profile(profile: RebornProfile) -> RebornCompositionProfile {
+pub(crate) fn composition_profile(profile: RebornProfile) -> RebornCompositionProfile {
     match profile {
         RebornProfile::LocalDev => RebornCompositionProfile::LocalDev,
         RebornProfile::LocalDevYolo => RebornCompositionProfile::LocalDevYolo,

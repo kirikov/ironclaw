@@ -1,10 +1,8 @@
 use clap::{Args, Subcommand};
-use ironclaw_extension_host::skill_listing::{
-    list_reborn_bundled_skills, list_reborn_local_skills_for_owner,
-};
+use ironclaw_extension_host::skill_listing::list_reborn_bundled_skills;
 use ironclaw_reborn_composition::{
     RebornSkillSummary, host_api::AgentId, host_api::TenantId, host_api::UserId,
-    open_local_skill_listing_source, reborn_skill_summary_json,
+    open_skill_listing_source, reborn_skill_summary_json,
 };
 use ironclaw_reborn_config::{RebornBootConfig, RebornProfile};
 use std::path::PathBuf;
@@ -59,13 +57,24 @@ impl SkillsCommand {
 
 impl SkillsListCommand {
     fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
-        let config = build_skill_list_config(context.boot_config())?;
+        let (config, config_file) = build_skill_list_config(context.boot_config())?;
         let filter = SkillOwnerFilter {
             tenant: self.tenant.clone(),
             user: self.user.clone(),
         };
-        let groups = crate::runtime::block_on_cli(collect_skill_groups(config.clone(), filter))?;
+        let groups = crate::runtime::block_on_cli(collect_skill_groups(
+            config.clone(),
+            config_file,
+            filter.clone(),
+        ))?;
         let configured = groups.iter().map(|group| group.skills.len()).sum::<usize>();
+        // A filter matching nothing is usually a typo, not an empty store.
+        if !filter.is_empty() && groups.is_empty() {
+            eprintln!(
+                "warning: no skill owner matches {}; run without --tenant/--user to list known owners",
+                crate::render::terminal_safe_text(&filter.describe())
+            );
+        }
 
         if self.json {
             let mut output = skills_json(configured, &groups);
@@ -123,10 +132,13 @@ impl SkillOwnerFilter {
             && self.user.as_deref().is_none_or(|value| value == user)
     }
 
-    /// An owner named on the command line is shown even with no skills, so an
-    /// empty result is distinguishable from a filter typo.
-    fn names_explicitly(&self, tenant: &str, user: &str) -> bool {
-        self.tenant.as_deref() == Some(tenant) || self.user.as_deref() == Some(user)
+    fn describe(&self) -> String {
+        match (self.tenant.as_deref(), self.user.as_deref()) {
+            (Some(tenant), Some(user)) => format!("tenant {tenant} / user {user}"),
+            (Some(tenant), None) => format!("tenant {tenant}"),
+            (None, Some(user)) => format!("user {user}"),
+            (None, None) => "no filter".to_string(),
+        }
     }
 }
 
@@ -135,6 +147,7 @@ impl SkillOwnerFilter {
 /// exist, because WebUI login mints them at runtime.
 async fn collect_skill_groups(
     config: SkillListConfig,
+    config_file: Option<ironclaw_reborn_config::RebornConfigFile>,
     filter: SkillOwnerFilter,
 ) -> anyhow::Result<Vec<SkillGroup>> {
     let mut groups = Vec::new();
@@ -151,9 +164,15 @@ async fn collect_skill_groups(
         .map_err(|error| anyhow::anyhow!("invalid runtime agent identity: {error}"))?;
     let owner_id = UserId::new(config.owner_id)
         .map_err(|error| anyhow::anyhow!("invalid runtime owner identity: {error}"))?;
-    let Some(source) =
-        open_local_skill_listing_source(&config.local_dev_root, tenant_id, agent_id, owner_id)
-            .await?
+    let Some(source) = open_skill_listing_source(
+        &config.local_dev_root,
+        config.composition_profile,
+        config_file.as_ref(),
+        tenant_id,
+        agent_id,
+        owner_id,
+    )
+    .await?
     else {
         return Ok(groups);
     };
@@ -164,8 +183,8 @@ async fn collect_skill_groups(
         if !filter.matches(&tenant, &user) {
             continue;
         }
-        let skills = list_reborn_local_skills_for_owner(source.port(), owner.scope.clone()).await?;
-        if skills.is_empty() && !filter.names_explicitly(&tenant, &user) {
+        let skills = source.list_for_owner(owner).await?;
+        if skills.is_empty() && filter.is_empty() {
             continue;
         }
         groups.push(SkillGroup {
@@ -194,9 +213,17 @@ struct SkillListConfig {
     agent_id: String,
     local_dev_root: PathBuf,
     profile: RebornProfile,
+    composition_profile: ironclaw_reborn_composition::RebornCompositionProfile,
 }
 
-fn build_skill_list_config(config: &RebornBootConfig) -> anyhow::Result<SkillListConfig> {
+/// Returns the config file alongside the resolved config: the hosted
+/// single-tenant skill store is Postgres, and its connection lives there.
+fn build_skill_list_config(
+    config: &RebornBootConfig,
+) -> anyhow::Result<(
+    SkillListConfig,
+    Option<ironclaw_reborn_config::RebornConfigFile>,
+)> {
     let config_file = crate::runtime::read_config_file(config)?;
     let profile = crate::runtime::effective_profile(config, config_file.as_ref())?;
     if !profile.supports_local_runtime_skill_management() {
@@ -205,13 +232,17 @@ fn build_skill_list_config(config: &RebornBootConfig) -> anyhow::Result<SkillLis
         );
     }
     let identity = crate::runtime::runtime_identity(config_file.as_ref());
-    Ok(SkillListConfig {
-        owner_id: crate::runtime::default_owner_id(config_file.as_ref()).to_string(),
-        tenant_id: identity.tenant_id,
-        agent_id: identity.agent_id,
-        local_dev_root: crate::runtime::local_runtime_storage_root(config, profile),
-        profile,
-    })
+    Ok((
+        SkillListConfig {
+            owner_id: crate::runtime::default_owner_id(config_file.as_ref()).to_string(),
+            tenant_id: identity.tenant_id,
+            agent_id: identity.agent_id,
+            local_dev_root: crate::runtime::local_runtime_storage_root(config, profile),
+            profile,
+            composition_profile: crate::runtime::composition_profile(profile),
+        },
+        config_file,
+    ))
 }
 
 fn print_skill(skill: &RebornSkillSummary, verbose: bool) {
