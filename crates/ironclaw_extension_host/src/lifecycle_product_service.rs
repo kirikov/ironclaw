@@ -884,6 +884,8 @@ mod tests {
         )
         .expect("system skill");
 
+        // `/tenants` is its own mount, as composition wires it.
+        std::fs::create_dir_all(storage_root.join("tenants")).expect("tenants root");
         let mut filesystem = DiskFilesystem::new();
         filesystem
             .mount_local(
@@ -891,6 +893,12 @@ mod tests {
                 HostPath::from_path_buf(storage_root.clone()),
             )
             .expect("mount storage root");
+        filesystem
+            .mount_local(
+                VirtualPath::new("/tenants").expect("valid virtual path"),
+                HostPath::from_path_buf(storage_root.join("tenants")),
+            )
+            .expect("mount tenants root");
         let skill_management = Arc::new(ScopedSkillManagementPort::new_with_mount_resolver(
             UserId::new("runtime-owner").expect("valid user"),
             Arc::new(filesystem),
@@ -899,7 +907,7 @@ mod tests {
                     MountGrant::new(
                         MountAlias::new("/skills")?,
                         VirtualPath::new(format!(
-                            "/projects/tenants/{}/users/{}/skills",
+                            "/tenants/{}/users/{}/skills",
                             scope.tenant_id.as_str(),
                             scope.user_id.as_str()
                         ))?,

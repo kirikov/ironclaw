@@ -2373,7 +2373,107 @@ fn local_dev_workspace_root_overlapping_skill_root_is_rejected() {
     }
 }
 
+/// `/tenants` on its own backend, as composition mounts it.
+fn backfill_target_filesystem() -> Arc<CompositeRootFilesystem> {
+    let mut root = CompositeRootFilesystem::new();
+    root.mount(
+        local_dev_mount_descriptor(
+            "/tenants",
+            "backfill-target",
+            BackendKind::Custom("test".to_string()),
+            StorageClass::StructuredRecords,
+            ContentKind::StructuredRecord,
+            IndexPolicy::NotIndexed,
+            BackendCapabilities::default(),
+        )
+        .expect("mount descriptor"),
+        Arc::new(ironclaw_filesystem::InMemoryBackend::new()),
+    )
+    .expect("mount tenants root");
+    Arc::new(root)
+}
+
+fn backfill_scope(user_id: &str) -> ResourceScope {
+    ResourceScope::local_default(
+        UserId::new(user_id).expect("valid user id"),
+        InvocationId::new(),
+    )
+    .expect("valid resource scope")
+}
+
+async fn migrated_skill_exists(filesystem: &CompositeRootFilesystem, scoped_path: &str) -> bool {
+    filesystem
+        .stat(&VirtualPath::new(scoped_path).expect("virtual path"))
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn local_dev_legacy_skill_backfill_marker_preserves_deletions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage_root = dir.path().join("local-dev");
+    let legacy_skill_dir = storage_root.join("skills/legacy-skill");
+    std::fs::create_dir_all(&legacy_skill_dir).expect("legacy skill dir");
+    std::fs::write(legacy_skill_dir.join("SKILL.md"), "legacy skill").expect("legacy skill");
+    let filesystem = backfill_target_filesystem();
+    let scope = backfill_scope("owner");
+    let migrated = format!(
+        "/tenants/{}/users/owner/skills/legacy-skill/SKILL.md",
+        scope.tenant_id.as_str()
+    );
+
+    backfill_local_dev_disk_user_skills(&storage_root, filesystem.as_ref(), &scope)
+        .await
+        .expect("initial backfill");
+    assert!(migrated_skill_exists(&filesystem, &migrated).await);
+
+    filesystem
+        .delete(&VirtualPath::new(migrated.clone()).expect("virtual path"))
+        .await
+        .expect("delete migrated skill");
+    backfill_local_dev_disk_user_skills(&storage_root, filesystem.as_ref(), &scope)
+        .await
+        .expect("second backfill");
+
+    assert!(
+        !migrated_skill_exists(&filesystem, &migrated).await,
+        "one-time legacy backfill must not resurrect user-deleted migrated skills"
+    );
+}
+
 #[cfg(unix)]
+#[tokio::test]
+async fn local_dev_legacy_skill_backfill_skips_symlinks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage_root = dir.path().join("local-dev");
+    let legacy_root = storage_root.join("skills");
+    let target_dir = storage_root.join("target-skill");
+    std::fs::create_dir_all(&legacy_root).expect("legacy root");
+    std::fs::create_dir_all(&target_dir).expect("target dir");
+    std::os::unix::fs::symlink(&target_dir, legacy_root.join("linked-skill"))
+        .expect("legacy symlink");
+    let filesystem = backfill_target_filesystem();
+    let scope = backfill_scope("owner");
+    let scoped_root = format!("/tenants/{}/users/owner/skills", scope.tenant_id.as_str());
+
+    backfill_local_dev_disk_user_skills(&storage_root, filesystem.as_ref(), &scope)
+        .await
+        .expect("symlink should be skipped, not fail startup");
+
+    assert!(
+        !migrated_skill_exists(&filesystem, &format!("{scoped_root}/linked-skill")).await,
+        "symlinked legacy entries must not be migrated"
+    );
+    assert!(
+        migrated_skill_exists(
+            &filesystem,
+            &format!("{scoped_root}/{LOCAL_DEV_LEGACY_SKILLS_BACKFILL_MARKER}")
+        )
+        .await,
+        "migration should still be marked complete after skipping symlinks"
+    );
+}
+
 #[test]
 fn builtin_first_party_package_declares_skill_management_tools() {
     let package = builtin_first_party_package().expect("built-in package builds");

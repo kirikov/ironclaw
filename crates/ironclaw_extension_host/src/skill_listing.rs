@@ -147,10 +147,9 @@ mod tests {
         let bundled = list_reborn_bundled_skills().expect("list bundled skills");
 
         assert!(
-            owned
-                .iter()
-                .any(|skill| skill.name == "code-review"
-                    && skill.source == ManagedSkillSource::User)
+            owned.iter().any(
+                |skill| skill.name == "code-review" && skill.source == ManagedSkillSource::User
+            )
         );
         assert!(
             bundled
@@ -177,8 +176,10 @@ mod tests {
             .expect("list owner skills");
 
         assert!(
-            !owned.iter().any(|skill| skill.name == "code-review"
-                && skill.source == ManagedSkillSource::System),
+            !owned
+                .iter()
+                .any(|skill| skill.name == "code-review"
+                    && skill.source == ManagedSkillSource::System),
             "storage system skill must not duplicate the bundled summary"
         );
         assert_ne!(bundled_code_review.description, "old system description");
@@ -208,10 +209,10 @@ mod tests {
             .expect("mount tenants root");
         filesystem
             .mount_local(
-                VirtualPath::new("/system/skills").expect("valid virtual path"),
-                HostPath::from_path_buf(storage_root.join("system/skills")),
+                VirtualPath::new("/projects").expect("valid virtual path"),
+                HostPath::from_path_buf(storage_root.to_path_buf()),
             )
-            .expect("mount system skills root");
+            .expect("mount projects root");
         ScopedSkillManagementPort::new_with_mount_resolver(
             UserId::new("list-owner").expect("valid user"),
             Arc::new(filesystem),
@@ -228,7 +229,7 @@ mod tests {
                     ),
                     MountGrant::new(
                         MountAlias::new("/system/skills")?,
-                        VirtualPath::new("/system/skills")?,
+                        VirtualPath::new("/projects/system/skills")?,
                         MountPermissions::read_only(),
                     ),
                 ])
