@@ -791,7 +791,7 @@ struct RootFilesystemBundle {
     durable_backend: DurableBackend,
 }
 
-// `pub(crate)` to match `build_default_local_dev_database_roots` (also
+// `pub(crate)` to match `open_or_create_libsql_roots` (also
 // `pub(crate)` for the `test_support` accessor): a `pub(crate)` fn returning a
 // private enum trips `private_interfaces`. The enum stays crate-internal.
 pub(crate) enum DurableBackend {
@@ -2028,14 +2028,14 @@ async fn build_local_runtime_root_filesystem(
         StorageBackendInput::Postgres(pool) => {
             let database = Arc::new(PostgresRootFilesystem::new(pool.clone()));
             database.run_migrations().await?;
-            mount_local_dev_database_roots(&mut composite, database)?;
+            mount_durable_roots(&mut composite, database)?;
             DurableBackend::Postgres(pool)
         }
         StorageBackendInput::LocalDefault => {
-            build_default_local_dev_database_roots(root, &mut composite).await?
+            open_or_create_libsql_roots(root, &mut composite).await?
         }
     };
-    mount_local_dev_project_roots(&mut composite, local)?;
+    mount_project_roots(&mut composite, local)?;
     Ok(RootFilesystemBundle {
         filesystem: Arc::new(composite),
         durable_backend,
@@ -2056,7 +2056,7 @@ pub fn local_dev_db_path(root: &Path) -> PathBuf {
 
 /// Open (or create) the local-dev libSQL database file at `root` — just the
 /// connection, no migrations/mount. One owner for the `libsql::Builder::new_local`
-/// sequence: [`build_default_local_dev_database_roots`] (production) and the
+/// sequence: [`open_or_create_libsql_roots`] (production) and the
 /// C-DURABLE test-support trigger-repository reopen
 /// (`open_local_dev_trigger_repository_for_test`) both call this rather than
 /// each opening their own connection to the same file.
@@ -2140,11 +2140,11 @@ fn is_remote_libsql_target(path_or_url: &str) -> bool {
 }
 
 // `pub(crate)` so the `test_support` accessor
-// (`build_default_local_dev_database_roots_for_test`) can call this
+// (`open_or_create_libsql_roots_for_test`) can call this
 // without duplicating the 4-step libSQL setup sequence (Builder →
 // LibSqlRootFilesystem → run_migrations → mount). Production callers
 // stay inside this module (`build_local_runtime_root_filesystem`).
-pub(crate) async fn build_default_local_dev_database_roots(
+pub(crate) async fn open_or_create_libsql_roots(
     root: &Path,
     composite: &mut CompositeRootFilesystem,
 ) -> Result<DurableBackend, RebornBuildError> {
@@ -2152,7 +2152,7 @@ pub(crate) async fn build_default_local_dev_database_roots(
         let db = open_local_dev_libsql_database(root).await?;
         let database = Arc::new(LibSqlRootFilesystem::new(Arc::clone(&db)));
         database.run_migrations().await?;
-        mount_local_dev_database_roots(composite, database)?;
+        mount_durable_roots(composite, database)?;
         Ok(DurableBackend::LibSql(db))
     }
 }
@@ -2160,7 +2160,7 @@ pub(crate) async fn build_default_local_dev_database_roots(
 /// Mount `/tenants` from the backend this deployment actually uses, reporting
 /// whether it was mounted. Hosted single-tenant is Postgres; the rest is the
 /// local libSQL file.
-pub(crate) async fn mount_existing_skill_store_roots(
+pub(crate) async fn mount_skill_store_for_profile(
     root: &Path,
     profile: RebornCompositionProfile,
     config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
@@ -2169,20 +2169,20 @@ pub(crate) async fn mount_existing_skill_store_roots(
     if crate::deployment::DeploymentConfig::for_profile(profile, false).storage_shape()
         != crate::deployment::StorageShape::HostedSingleTenantPool
     {
-        return mount_existing_local_dev_database_roots(root, composite).await;
+        return mount_libsql_roots_if_present(root, composite).await;
     }
     let resolved =
         crate::input::resolve_postgres_storage_from_config_and_env(profile, config_file)?;
     let pool = open_postgres_pool_from_source(PostgresPoolSource::Config(resolved.connection))?;
     // No migrations here: `serve` owns the hosted schema, and an inspection
     // command must not run DDL against it.
-    mount_local_dev_database_roots(composite, Arc::new(PostgresRootFilesystem::new(pool)))?;
+    mount_durable_roots(composite, Arc::new(PostgresRootFilesystem::new(pool)))?;
     Ok(true)
 }
 
 /// Mount the durable roots only if the database exists, reporting whether it
 /// did. An inspection command must not create the store by reading it.
-pub(crate) async fn mount_existing_local_dev_database_roots(
+pub(crate) async fn mount_libsql_roots_if_present(
     root: &Path,
     composite: &mut CompositeRootFilesystem,
 ) -> Result<bool, RebornBuildError> {
@@ -2192,7 +2192,7 @@ pub(crate) async fn mount_existing_local_dev_database_roots(
     let db = open_local_dev_libsql_database(root).await?;
     let database = Arc::new(LibSqlRootFilesystem::new(db));
     database.run_migrations().await?;
-    mount_local_dev_database_roots(composite, database)?;
+    mount_durable_roots(composite, database)?;
     Ok(true)
 }
 
@@ -2250,11 +2250,11 @@ where
 }
 
 // `pub(crate)` (not private) so the `test_support` accessor
-// (`mount_local_dev_database_roots_for_test`) can forward to it across the
+// (`mount_durable_roots_for_test`) can forward to it across the
 // crate boundary for downstream integration tests without a second copy of the
 // mount truth. Production callers stay inside this module
-// (`build_local_runtime_root_filesystem` / `build_default_local_dev_database_roots`).
-pub(crate) fn mount_local_dev_database_roots<F>(
+// (`build_local_runtime_root_filesystem` / `open_or_create_libsql_roots`).
+pub(crate) fn mount_durable_roots<F>(
     root: &mut CompositeRootFilesystem,
     database: Arc<F>,
 ) -> Result<(), RebornBuildError>
@@ -2352,7 +2352,7 @@ where
     Ok(Arc::new(root))
 }
 
-pub(crate) fn mount_local_dev_project_roots(
+pub(crate) fn mount_project_roots(
     root: &mut CompositeRootFilesystem,
     local: Arc<DiskFilesystem>,
 ) -> Result<(), RebornBuildError> {

@@ -18,8 +18,7 @@ use ironclaw_skills::{ScopedSkillManagementPort, SkillSummary};
 
 use crate::error::RebornBuildError;
 use crate::factory::{
-    mount_existing_skill_store_roots, mount_local_dev_project_roots,
-    owner_scope_from_runtime_identity,
+    mount_project_roots, mount_skill_store_for_profile, owner_scope_from_runtime_identity,
 };
 use crate::local_dev_mounts::scoped_skill_management_mount_view;
 use crate::root::profile::RebornCompositionProfile;
@@ -82,18 +81,8 @@ pub async fn open_skill_listing_source(
     let mut composite = CompositeRootFilesystem::new();
     // With no database yet the configured owner is the only one.
     let durable_mounted =
-        mount_existing_skill_store_roots(root, profile, config_file, &mut composite).await?;
-    // Only `/projects` is mounted, rooted at the storage root: `mount_local`
-    // requires the host directory to exist, and listing must not create skill
-    // dirs. Bundled system skills resolve through `/projects/system/skills` and
-    // list as empty when that directory has not been written yet.
-    let mut disk = DiskFilesystem::new();
-    disk.mount_local(
-        VirtualPath::new("/projects").map_err(RebornBuildError::Mount)?,
-        HostPath::from_path_buf(root.to_path_buf()),
-    )?;
-    mount_local_dev_project_roots(&mut composite, Arc::new(disk))?;
-    let filesystem: Arc<dyn RootFilesystem> = Arc::new(composite);
+        mount_skill_store_for_profile(root, profile, config_file, &mut composite).await?;
+    let filesystem = add_project_roots(root, composite)?;
 
     let configured = SkillOwner {
         scope: owner_scope_from_runtime_identity(
@@ -104,19 +93,38 @@ pub async fn open_skill_listing_source(
         tenant_id,
         user_id: owner_id.clone(),
     };
-    let owners = match durable_mounted {
-        true => discover_skill_owners(filesystem.as_ref(), &agent_id, configured).await?,
-        false => vec![configured],
+    let owners = if durable_mounted {
+        discover_skill_owners(filesystem.as_ref(), &agent_id, configured).await?
+    } else {
+        vec![configured]
     };
-    let port = ScopedSkillManagementPort::new_with_mount_resolver(
+    Ok(Some(SkillListingSource {
+        port: Arc::new(skill_port(owner_id, filesystem)),
+        owners,
+    }))
+}
+
+/// Mounts `/projects` only. Production mounts more, but `mount_local` requires
+/// each directory to already exist, and `skills list` must not create any.
+fn add_project_roots(
+    root: &Path,
+    mut composite: CompositeRootFilesystem,
+) -> Result<Arc<dyn RootFilesystem>, RebornBuildError> {
+    let mut disk = DiskFilesystem::new();
+    disk.mount_local(
+        VirtualPath::new("/projects").map_err(RebornBuildError::Mount)?,
+        HostPath::from_path_buf(root.to_path_buf()),
+    )?;
+    mount_project_roots(&mut composite, Arc::new(disk))?;
+    Ok(Arc::new(composite))
+}
+
+fn skill_port(owner_id: UserId, filesystem: Arc<dyn RootFilesystem>) -> ScopedSkillManagementPort {
+    ScopedSkillManagementPort::new_with_mount_resolver(
         owner_id,
         filesystem,
         Arc::new(scoped_skill_management_mount_view),
-    );
-    Ok(Some(SkillListingSource {
-        port: Arc::new(port),
-        owners,
-    }))
+    )
 }
 
 /// Test-only: stand the durable store up the way `serve` does on first boot and
@@ -131,24 +139,15 @@ pub async fn seed_skill_for_test(
     content: &str,
 ) -> Result<(), RebornBuildError> {
     let mut composite = CompositeRootFilesystem::new();
-    crate::factory::build_default_local_dev_database_roots(root, &mut composite).await?;
-    let mut disk = DiskFilesystem::new();
-    disk.mount_local(
-        VirtualPath::new("/projects").map_err(RebornBuildError::Mount)?,
-        HostPath::from_path_buf(root.to_path_buf()),
-    )?;
-    mount_local_dev_project_roots(&mut composite, Arc::new(disk))?;
+    crate::factory::open_or_create_libsql_roots(root, &mut composite).await?;
+    let filesystem = add_project_roots(root, composite)?;
     let scope = owner_scope_from_runtime_identity(user_id.clone(), tenant_id, agent_id);
-    ScopedSkillManagementPort::new_with_mount_resolver(
-        user_id,
-        Arc::new(composite),
-        Arc::new(scoped_skill_management_mount_view),
-    )
-    .install_for_scope(scope, Some(name), content)
-    .await
-    .map_err(|error| RebornBuildError::InvalidConfig {
-        reason: format!("seed skill '{name}' could not be installed: {error}"),
-    })?;
+    skill_port(user_id, filesystem)
+        .install_for_scope(scope, Some(name), content)
+        .await
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: format!("seed skill '{name}' could not be installed: {error}"),
+        })?;
     Ok(())
 }
 
