@@ -2,14 +2,15 @@
 //!
 //! When a transcript message carries [`AttachmentRef`]s, the model-visible
 //! projection of that message ([`crate::ContextMessage`]) appends a rendered
-//! `<attachments>` block so the model can reason about the files: documents and
-//! audio contribute their extracted text / transcript, and every attachment
-//! contributes its stored project path (`storage_key`) so the agent can
-//! `file_read` it. Image pixels reach a vision-capable model through the
-//! multimodal path (the model port reads the bytes back and the gateway sends
-//! them as `ContentPart::ImageUrl`; see `ContextMessage::image_attachments`);
-//! this textual block contributes a pointer to the stored file, which is the
-//! fallback a text-only model relies on.
+//! `<attachments>` block so the model can reason about the files: audio
+//! contributes its transcript, documents only their stored project path
+//! (`storage_key`) so the agent pages them with `read_file`, and every
+//! attachment contributes that path. Image pixels reach a vision-capable
+//! model through the multimodal path (the model port reads the bytes back and
+//! the gateway sends them as `ContentPart::ImageUrl`; see
+//! `ContextMessage::image_attachments`); this textual block contributes a
+//! pointer to the stored file, which is the fallback a text-only model relies
+//! on.
 
 use ironclaw_common::{AttachmentKind, AttachmentRef};
 
@@ -97,10 +98,13 @@ fn body_text(attachment: &AttachmentRef, has_project_path: bool) -> String {
             Some(text) => format!("Transcript: {}", escape_xml_text(text)),
             None => "Audio transcript unavailable.".to_string(),
         },
-        AttachmentKind::Document => match &attachment.extracted_text {
-            Some(text) => escape_xml_text(text),
-            None => "[Document attached — text extraction unavailable]".to_string(),
-        },
+        // Document text is never inlined: one PDF is ~25K tokens and a job can
+        // carry several. The agent pages the file with `read_file` instead.
+        AttachmentKind::Document if has_project_path => {
+            "[Document attached - read it in pages with read_file at the project path above.]"
+                .to_string()
+        }
+        AttachmentKind::Document => "[Document attached - not yet stored.]".to_string(),
         // An image's pixels reach the model through the multimodal path; here it
         // only contributes a pointer to its stored file, so the body is useful
         // only when the file was actually landed.
@@ -159,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn document_extracted_text_is_folded_into_content() {
+    fn document_text_is_not_inlined() {
         let out = augment_model_content(
             "see attached".to_string(),
             &[doc_ref(Some("Quarterly revenue up 12%"))],
@@ -174,14 +178,19 @@ mod tests {
                 "Saved to project file: /workspace/attachments/2026-06-09/m1-0-report.pdf"
             )
         );
-        assert!(out.contains("Quarterly revenue up 12%"));
+        assert!(out.contains("read it in pages with read_file"));
+        assert!(!out.contains("Quarterly revenue up 12%"));
         assert!(out.ends_with("</attachments>"));
     }
 
     #[test]
-    fn document_without_text_notes_unavailable() {
-        let out = augment_model_content("x".to_string(), &[doc_ref(None)]);
-        assert!(out.contains("[Document attached — text extraction unavailable]"));
+    fn document_without_storage_key_is_marked_not_stored() {
+        let mut att = doc_ref(Some("Quarterly revenue up 12%"));
+        att.storage_key = None;
+        let out = augment_model_content("x".to_string(), &[att]);
+        assert!(out.contains("[Document attached - not yet stored.]"));
+        assert!(!out.contains("project_path="));
+        assert!(!out.contains("Quarterly revenue up 12%"));
     }
 
     #[test]
@@ -238,11 +247,13 @@ mod tests {
 
     #[test]
     fn special_characters_are_escaped() {
-        let mut att = doc_ref(Some("a < b & c > d"));
-        att.filename = Some("a\"&<>.txt".to_string());
+        let mut att = doc_ref(None);
+        att.kind = AttachmentKind::Audio;
+        att.extracted_text = Some("a < b & c > d".to_string());
+        att.filename = Some("a\"&<>.ogg".to_string());
         let out = augment_model_content("x".to_string(), &[att]);
-        assert!(out.contains("filename=\"a&quot;&amp;&lt;&gt;.txt\""));
-        assert!(out.contains("a &lt; b &amp; c &gt; d"));
+        assert!(out.contains("filename=\"a&quot;&amp;&lt;&gt;.ogg\""));
+        assert!(out.contains("Transcript: a &lt; b &amp; c &gt; d"));
     }
 
     fn image_ref(id: &str, storage_key: Option<&str>) -> AttachmentRef {
