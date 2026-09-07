@@ -4,27 +4,22 @@
   "properties": {
     "title": {
       "type": "string",
-      "description": "Short title for the job (max 200 chars).",
-      "maxLength": 200
+      "description": "Short title for the job (max 200 chars)."
     },
     "description": {
       "type": "string",
-      "description": "A clear brief of the work to be done (max 8192 chars).",
-      "maxLength": 8192
+      "description": "A clear brief of the work to be done (max 8192 chars)."
     },
     "tags": {
       "type": "array",
       "items": {
-        "type": "string",
-        "maxLength": 64
+        "type": "string"
       },
-      "description": "Optional topical tags.",
-      "maxItems": 16
+      "description": "Optional topical tags, e.g. [\"python\", \"data\"]."
     },
     "budget": {
       "type": "number",
-      "description": "Optional budget: a positive amount. Omit unless the user stated one.",
-      "exclusiveMinimum": 0
+      "description": "Optional budget for the job: a positive amount, at most 1000000000 with at most 12 decimal places. Omit unless the user stated a budget."
     },
     "currency": {
       "type": "string",
@@ -32,17 +27,17 @@
         "USD",
         "USDC"
       ],
-      "description": "Currency for the budget. Required when a budget is set."
+      "description": "Currency for the budget. REQUIRED when you set a budget; omit otherwise."
+    },
+    "attachment_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ids of files the user attached earlier in this chat (from a message's attachments) that belong on this job — at most 5; more is refused, ask the user which to keep. Omit if none apply. An id that no longer exists is silently dropped and reported back to you; tell the user if that happens."
     }
   },
   "required": [
     "title",
     "description"
   ],
-  "additionalProperties": false,
-  "dependencies": {
-    "budget": [
-      "currency"
-    ]
-  }
+  "additionalProperties": false
 }

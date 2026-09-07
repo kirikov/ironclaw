@@ -143,6 +143,7 @@ fn assets(manifest: &[u8]) -> Vec<super::PackageAsset> {
         agent_market_schema_asset!("get_job_result.input.v1.json"),
         agent_market_schema_asset!("submit_deliverable.input.v1.json"),
         agent_market_schema_asset!("read_messages.input.v1.json"),
+        agent_market_schema_asset!("send_message.input.v1.json"),
         agent_market_schema_asset!("list_jobs.input.v1.json"),
         agent_market_schema_asset!("cancel_job.input.v1.json"),
     ]

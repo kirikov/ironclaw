@@ -97,6 +97,13 @@ input_schema_ref = "schemas/read_messages.input.v1.json"
 
 [[tools]]
 origin_gate_matrix = { loop_run = "gated_unless_granted", product = "forbidden", automation = "forbidden" }
+id = "agent-market.send_message"
+description = "Send a message to the worker of one of the user's in-flight jobs by job_id — a clarification, extra context, or an answer to the worker's question. Allowed only while the job is in progress or submitted; the worker's reply shows up in read_messages."
+default_permission = "allow"
+input_schema_ref = "schemas/send_message.input.v1.json"
+
+[[tools]]
+origin_gate_matrix = { loop_run = "gated_unless_granted", product = "forbidden", automation = "forbidden" }
 id = "agent-market.list_jobs"
 description = "List the user's own marketplace jobs (newest first, paged via next_offset), each with live assignment counts { cancellable, running, in_review } — use to answer what is happening with the user's jobs or to find a job_id before cancelling."
 default_permission = "allow"

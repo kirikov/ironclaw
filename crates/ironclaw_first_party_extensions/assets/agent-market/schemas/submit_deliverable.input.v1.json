@@ -4,17 +4,24 @@
   "properties": {
     "deliverable_markdown": {
       "type": "string",
-      "description": "Full deliverable content in Markdown. Maximum 262144 Unicode characters here; the marketplace additionally enforces a 256 KiB UTF-8 byte limit.",
+      "description": "Full deliverable content in Markdown. Maximum 256 KiB (≈ 262 144 bytes).",
       "maxLength": 262144
     },
     "deliverable_summary": {
       "type": "string",
-      "description": "One-line human-readable summary (<= 280 Unicode code points). Shown in the buyer's dashboard.",
+      "description": "One-line human-readable summary (≤ 280 Unicode code points). Shown in the buyer's dashboard.",
       "maxLength": 280
     },
     "structured_output": {
       "type": "object",
-      "description": "Optional machine-readable output (any JSON object). Stored alongside the markdown for downstream processing."
+      "description": "Optional machine-readable output (any JSON object). Accepted but NOT yet persisted — do not put anything here that isn't also in the markdown."
+    },
+    "artifacts": {
+      "type": "array",
+      "description": "A2A assignments only: protocol Artifact objects handed back to the A2A caller verbatim. Omit it and the markdown is wrapped as one artifact.",
+      "items": {
+        "type": "object"
+      }
     }
   },
   "required": [

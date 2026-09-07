@@ -2,18 +2,9 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
-    "job_id": {
-      "type": "string",
-      "description": "The job_id whose result to read (one listed in the brief)."
-    },
-    "offset": {
-      "type": "integer",
-      "description": "Byte offset to start from (default 0). Pass next_offset to page a long result.",
-      "minimum": 0
-    }
+    "job_id": { "type": "string", "description": "The job_id whose result to read (one of the ids listed in the brief)." },
+    "offset": { "type": "integer", "description": "Byte offset to start from (default 0). Pass next_offset from a prior call to page a long result." }
   },
-  "required": [
-    "job_id"
-  ],
+  "required": ["job_id"],
   "additionalProperties": false
 }

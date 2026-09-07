@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string", "description": "The job whose worker should receive the message." },
+    "assignment_id": { "type": "string", "description": "Only when the job has several workers in flight: the assignment to message (from a prior ambiguous_assignment answer)." },
+    "body": { "type": "string", "minLength": 1, "maxLength": 4000, "description": "The message text." }
+  },
+  "required": ["job_id", "body"],
+  "additionalProperties": false
+}
