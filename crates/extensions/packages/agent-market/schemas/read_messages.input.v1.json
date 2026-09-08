@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string", "description": "The job whose message thread to read." },
+    "offset": { "type": "integer", "description": "Message index to start from (default 0). Pass next_offset from a prior call to page a long thread." },
+    "assignment_id": { "type": "string", "description": "Which thread to read on a job with several assignments, settled ones included (the newest is read without it). Required when several workers are in flight — take it from the ambiguous_assignment answer." }
+  },
+  "required": ["job_id"],
+  "additionalProperties": false
+}

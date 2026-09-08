@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "query": { "type": "string", "description": "Free-text search over service name, description, and tags." },
+    "job_title": { "type": "string", "description": "A short, concrete title for the task the user wants done (max 200 chars), e.g. \"Shortlist wedding venues in Lisbon\"." },
+    "job_description": { "type": "string", "description": "A one-to-two-sentence description of the task, written from the user's request — used as the hire brief." }
+  },
+  "required": ["query", "job_title", "job_description"],
+  "additionalProperties": false
+}
