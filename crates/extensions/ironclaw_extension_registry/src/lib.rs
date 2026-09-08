@@ -216,7 +216,8 @@ pub use host_api::default_host_api_contract_registry;
 // `ironclaw_extension_contracts::hosted_mcp`, and §11.2.4's one-import-path
 // rule forbids a second path to a contract.
 pub use hosted_mcp_discovery::{
-    is_hosted_http_mcp_package, package_with_discovered_hosted_mcp_tools,
+    is_hosted_http_mcp_package, merge_discovered_hosted_mcp_package,
+    package_with_discovered_hosted_mcp_tools,
 };
 pub use resolved::{
     PackageRootBinding, PackageRootError, ResolvedAuthSurface, ResolvedExtensionManifest,
