@@ -14,45 +14,64 @@ use ironclaw_host_api::{
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 
 use crate::extension_lifecycle::RebornLocalExtensionManagementPort;
+use ironclaw_extension_registry::{InstallationOwner, OverlayScope, ScopedPackageOverlay};
 use ironclaw_product_contracts::error::ProductOperationFailure;
 
 #[derive(Clone, Default)]
-pub enum ExtensionCapabilitySurfaceSource {
-    #[default]
-    Empty,
-    Management(Arc<RebornLocalExtensionManagementPort>),
+pub struct ExtensionCapabilitySurfaceSource {
+    extension_management: Option<Arc<RebornLocalExtensionManagementPort>>,
+    scoped_overlay: Option<Arc<ScopedPackageOverlay>>,
     #[cfg(any(test, feature = "test-support"))]
-    Static(ExtensionCapabilitySurface),
+    static_surface: Option<ExtensionCapabilitySurface>,
 }
 
 impl ExtensionCapabilitySurfaceSource {
     pub fn new(extension_management: Option<Arc<RebornLocalExtensionManagementPort>>) -> Self {
-        match extension_management {
-            Some(extension_management) => Self::Management(extension_management),
-            None => Self::Empty,
+        Self {
+            extension_management,
+            scoped_overlay: None,
+            #[cfg(any(test, feature = "test-support"))]
+            static_surface: None,
         }
+    }
+
+    /// Attach the per-user discovered-package overlay so grants and provider
+    /// trust cover the caller's discovered hosted-MCP surface (P2b).
+    pub fn with_scoped_overlay(mut self, overlay: Arc<ScopedPackageOverlay>) -> Self {
+        self.scoped_overlay = Some(overlay);
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_surface(surface: ExtensionCapabilitySurface) -> Self {
-        Self::Static(surface)
+        Self {
+            extension_management: None,
+            scoped_overlay: None,
+            static_surface: Some(surface),
+        }
     }
 
     pub async fn snapshot(&self) -> Result<ExtensionCapabilitySurface, ProductOperationFailure> {
-        match self {
-            Self::Empty => Ok(ExtensionCapabilitySurface::default()),
-            Self::Management(extension_management) => {
-                ExtensionCapabilitySurface::from_extension_management(extension_management).await
-            }
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Static(surface) => Ok(surface.clone()),
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(surface) = &self.static_surface {
+            return Ok(surface.clone());
         }
+        let Some(extension_management) = self.extension_management.as_deref() else {
+            return Ok(ExtensionCapabilitySurface::default());
+        };
+        let mut surface =
+            ExtensionCapabilitySurface::from_extension_management(extension_management).await?;
+        // The caller's discovered-package overlay rides with the surface, so
+        // grants and provider trust see the same catalog dispatch will (P2b).
+        surface.scoped_overlay = self.scoped_overlay.clone();
+        Ok(surface)
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ExtensionCapabilitySurface {
     active_capabilities: Vec<ActiveExtensionCapability>,
+    scoped_overlay: Option<Arc<ScopedPackageOverlay>>,
 }
 
 impl ExtensionCapabilitySurface {
@@ -60,6 +79,7 @@ impl ExtensionCapabilitySurface {
     pub fn from_active_capabilities(active_capabilities: Vec<ActiveExtensionCapability>) -> Self {
         Self {
             active_capabilities,
+            scoped_overlay: None,
         }
     }
 
@@ -70,7 +90,60 @@ impl ExtensionCapabilitySurface {
             active_capabilities: extension_management
                 .active_model_visible_capabilities()
                 .await?,
+            scoped_overlay: None,
         })
+    }
+
+    /// The caller's effective capability set: active capabilities visible to
+    /// the caller, with any extension the caller holds a discovered overlay
+    /// for replaced by its discovered (per-principal) capability set. The
+    /// overlay applies only to extensions with a caller-visible active
+    /// installation (fail closed).
+    fn caller_capabilities(&self, caller: &OverlayScope) -> Vec<ActiveExtensionCapability> {
+        let user = caller.user_id();
+        let overlay_capabilities = self.overlay_capabilities(caller);
+        let overlaid_providers: Vec<&ExtensionId> = overlay_capabilities
+            .iter()
+            .map(|capability| &capability.provider)
+            .collect();
+        let mut merged: Vec<ActiveExtensionCapability> = self
+            .active_capabilities
+            .iter()
+            .filter(|capability| capability.owner.visible_to(user))
+            .filter(|capability| !overlaid_providers.contains(&&capability.provider))
+            .cloned()
+            .collect();
+        merged.extend(overlay_capabilities);
+        merged
+    }
+
+    fn overlay_capabilities(&self, caller: &OverlayScope) -> Vec<ActiveExtensionCapability> {
+        let Some(overlay) = &self.scoped_overlay else {
+            return Vec::new();
+        };
+        let user = caller.user_id();
+        let mut capabilities = Vec::new();
+        for package in overlay.packages_for(caller) {
+            let caller_sees_provider = self.active_capabilities.iter().any(|capability| {
+                capability.provider == package.id && capability.owner.visible_to(user)
+            });
+            if !caller_sees_provider {
+                continue;
+            }
+            for descriptor in &package.capabilities {
+                capabilities.push(ActiveExtensionCapability {
+                    id: descriptor.id.clone(),
+                    provider: descriptor.provider.clone(),
+                    effects: descriptor.effects.clone(),
+                    default_permission: descriptor.default_permission,
+                    runtime_credentials: descriptor.runtime_credentials.clone(),
+                    network_targets: descriptor.network_targets.clone(),
+                    max_egress_bytes: None,
+                    owner: InstallationOwner::user(user.clone()),
+                });
+            }
+        }
+        capabilities
     }
 
     /// Mint capability grants for one request (#5459 P1: filtered to the
@@ -82,11 +155,10 @@ impl ExtensionCapabilitySurface {
     pub fn grants(
         &self,
         grantee: &ExtensionId,
-        caller: &ironclaw_host_api::ids::UserId,
+        caller: &OverlayScope,
     ) -> Vec<CapabilityGrant> {
-        self.active_capabilities
+        self.caller_capabilities(caller)
             .iter()
-            .filter(|capability| capability.owner.visible_to(caller))
             .map(|capability| CapabilityGrant {
                 id: CapabilityGrantId::new(),
                 capability: capability.id.clone(),
@@ -130,13 +202,10 @@ impl ExtensionCapabilitySurface {
     /// advertised to other users' surfaces.
     pub fn provider_trust(
         &self,
-        caller: &ironclaw_host_api::ids::UserId,
+        caller: &OverlayScope,
     ) -> BTreeMap<ExtensionId, TrustDecision> {
         let mut effects_by_provider: BTreeMap<ExtensionId, Vec<EffectKind>> = BTreeMap::new();
-        for capability in &self.active_capabilities {
-            if !capability.owner.visible_to(caller) {
-                continue;
-            }
+        for capability in &self.caller_capabilities(caller) {
             let effects = effects_by_provider
                 .entry(capability.provider.clone())
                 .or_default();
@@ -230,6 +299,11 @@ pub fn extension_network_policy(capability: &ActiveExtensionCapability) -> Netwo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironclaw_host_api::ids::TenantId;
+
+    fn test_owner(user: &ironclaw_host_api::ids::UserId) -> OverlayScope {
+        OverlayScope::new(TenantId::new("tenant-a").unwrap(), user.clone(), None)
+    }
     use ironclaw_host_api::{
         action::{NetworkScheme, NetworkTargetPattern},
         capability::PermissionMode,
@@ -312,7 +386,7 @@ mod tests {
 
         for member in [&alice, &bob] {
             let member_capabilities: Vec<_> = surface
-                .grants(&grantee, member)
+                .grants(&grantee, &test_owner(member))
                 .into_iter()
                 .map(|grant| grant.capability.as_str().to_string())
                 .collect();
@@ -324,7 +398,7 @@ mod tests {
         }
 
         let carol_capabilities: Vec<_> = surface
-            .grants(&grantee, &carol)
+            .grants(&grantee, &test_owner(&carol))
             .into_iter()
             .map(|grant| grant.capability.as_str().to_string())
             .collect();
@@ -335,10 +409,10 @@ mod tests {
         assert!(carol_capabilities.contains(&"hacker-news.top_stories".to_string()));
 
         for member in [&alice, &bob] {
-            let member_trust = surface.provider_trust(member);
+            let member_trust = surface.provider_trust(&test_owner(member));
             assert!(member_trust.contains_key(&ExtensionId::new("market-data").unwrap()));
         }
-        let carol_trust = surface.provider_trust(&carol);
+        let carol_trust = surface.provider_trust(&test_owner(&carol));
         assert!(
             !carol_trust.contains_key(&ExtensionId::new("market-data").unwrap()),
             "a member-held provider must not be advertised to a non-member"
