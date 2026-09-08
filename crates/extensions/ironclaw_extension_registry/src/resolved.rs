@@ -143,6 +143,10 @@ pub struct ResolvedMcpDeclaration {
     /// here because their concrete auth recipe remains the authority.
     #[serde(default)]
     pub registration_auth: ironclaw_extension_contracts::hosted_mcp::HostedMcpAuthSelection,
+    /// Opt-in SEP-414 caller attribution (`[mcp] attribution = "sep414"`).
+    /// `None` — the default — keeps today's wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<crate::McpAttribution>,
 }
 
 /// One vendor the extension authenticates against: the account setup this
@@ -341,6 +345,8 @@ impl ResolvedExtensionManifest {
             capabilities: self.tools.clone(),
             host_api_surfaces,
             hooks: self.hooks.clone(),
+            // v2 manifests have no `[mcp]` section, so no attribution opt-in.
+            mcp_attribution: None,
         })
     }
 }
