@@ -214,8 +214,14 @@ impl ExtensionPackage {
         let consistent = match self.descriptor_schema_mode {
             CapabilityDescriptorSchemaMode::ManifestRefs => self.capabilities == expected,
             CapabilityDescriptorSchemaMode::InlineDynamic => {
-                (self.manifest.source == ManifestSource::HostBundled
-                    || matches!(self.root_binding, PackageRootBinding::Virtual))
+                // Must mirror the sources
+                // `from_host_bundled_manifest_with_inline_dynamic_schemas`
+                // accepts, or an InstalledLocal (operator-installed volume)
+                // package constructs fine and then fails validation.
+                (matches!(
+                    self.manifest.source,
+                    ManifestSource::HostBundled | ManifestSource::InstalledLocal
+                ) || matches!(self.root_binding, PackageRootBinding::Virtual))
                     && descriptors_match_except_schema(&self.capabilities, &expected)
             }
         };
