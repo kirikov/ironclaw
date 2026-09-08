@@ -212,6 +212,33 @@ profile `production`) — the same service the sync was deployed to.
 - **Slack is not in play:** disabled on the stand and in the deployment, so the retired `[slack]`
   config section is a non-issue.
 
+### End-to-end on the stand
+
+Run against the deployed service on port 3010, which is wired to the stand's real Postgres
+(`ironclaw_reborn2` on `127.0.0.1:5436` — confirmed from the running process's environment and its
+open connections). The sync's migrations ran against that same database, after the dump below.
+
+**Multi-step tool loop.** Asked the agent to write a file, read it back, and report the contents. It
+dispatched `builtin__write_file` then `builtin__read_file` and returned the exact marker. The file is
+in the database at a per-caller path —
+`/projects/workspace/tenants/reborn-cli/users/reborn-cli/e2e-check.txt` — which also confirms the
+production profile's `workspace_scoped_per_caller` wiring. Row counts moved 12066 → 12104 entries and
+7303 → 7321 events.
+
+**Attachment end-to-end, which is the live proof of the new flag.** Uploaded a `text/plain` note
+containing a unique codeword through the real HTTP surface
+(`POST /api/webchat/v2/channels/web-app/messages` with an inline `data_base64` attachment). The file
+landed in Postgres under
+`/projects/workspace/tenants/reborn-cli/users/reborn-cli/attachments/<date>/<action>/1-note.txt`, and
+the agent answered with the exact codeword.
+
+The decisive part: for that run the **only** capability dispatched was `builtin.read_file`. Under the
+old behavior the text would have been inlined and the model would have answered with no tool call at
+all. So pointer mode is demonstrably active on the deployed binary — the model received a pointer and
+paged the file. The assistant reply is persisted in the thread transcript.
+
+**WebUI** renders the resulting conversations with no console errors and no failed requests.
+
 ### Database
 
 The cutover runs three new forward-only migrations against `ironclaw_reborn2`:
