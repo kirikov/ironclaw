@@ -80,9 +80,13 @@ pub fn package_with_discovered_hosted_mcp_tools(
 }
 
 fn hosted_http_mcp_url(package: &ExtensionPackage) -> Option<&str> {
+    // An operator-installed package is reviewed by whoever installed it, the
+    // same trust story a compiled-in one has, so it gets the same discovery
+    // treatment. Discovery still runs under the caller's scope and leases the
+    // caller's credential.
     if !matches!(
         package.manifest.source,
-        ManifestSource::HostBundled | ManifestSource::UserRegistered
+        ManifestSource::HostBundled | ManifestSource::InstalledLocal | ManifestSource::UserRegistered
     ) {
         return None;
     }
