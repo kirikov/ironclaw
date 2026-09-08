@@ -108,11 +108,26 @@ conversation without inventing its own argument conventions.
 Now sits correctly in upstream's module charter: helpers in `jsonrpc`, the stamp decision in `client`,
 the flag on the egress plan. Privacy test (`non_opted_provider_gets_no_attribution`) included.
 
-**PR 4 — `fix(attachments): stop inlining extracted document text into model context`**
+**PR 4 — `feat(attachments): opt-in pointer mode for document text in model context`**
 One PDF is roughly 25k tokens and a job can carry several, so a couple of attachments can consume the
-whole context before the model does any work. The stored project path is already in the block; the
-agent pages the file with `read_file` instead. Upstream's credential redaction is kept and its test
-retargeted to audio transcripts, which still inline.
+whole context before the model does any work. Pointer mode contributes the stored project path and a
+`read_file` instruction instead of the extracted text.
+
+**This PR must be opt-in, and that is not a stylistic preference — it is what the integration suite
+proved.** Upstream encodes the opposite behavior as a tested contract in four integration tests
+(`doc_attachment_reaches_the_model_with_extracted_text`,
+`pdf_attachment_reaches_the_model_with_extracted_text`,
+`multiple_attachments_in_one_turn_all_reach_the_model`, and
+`uploaded_docx_edit_request_is_refused_and_the_document_comes_back_byte_identical`). An unconditional
+change fails all four, and one of them is also where upstream's document credential-redaction coverage
+lives. So the fork now ships the behavior behind `IRONCLAW_ATTACHMENT_DOCUMENT_TEXT`
+(`inline` = upstream default, `pointer` = opt in); every upstream test passes unmodified and the fork
+touches one file instead of four.
+
+*Next step, agreed with the owner:* the flag is the first cut. The behavior should eventually be
+per-model and per-format — some models handle inlined document text well and some formats are worth
+inlining regardless — so the knob should grow into a policy rather than stay a global switch.
+
 *Note:* the fork's 500k budget bump is deliberately **not** part of this PR — that is a deployment
 choice, and upstream would want it configurable rather than a constant.
 
@@ -152,9 +167,48 @@ deployment-specific; they stay fork-only.
   features verified present in the deployed binary (`agent-market` manifest, `io.ironclaw/invocationId`,
   the per-user discovery lane).
 
+### Configuration added by this sync
+
+`IRONCLAW_ATTACHMENT_DOCUMENT_TEXT` — `inline` (default, upstream behavior) or `pointer` (document
+attachments contribute a stored path plus a `read_file` instruction instead of their extracted text).
+Set to `pointer` on the stand through the systemd drop-in. Unset or unrecognized values fall back to
+`inline`, so a typo cannot silently withhold document text from the model.
+
 One stale fork assertion was removed during the sync: upstream retired
 `builtin.outbound_delivery_target_route_current` (it is in their retired-taxonomy ratchet now) while the
 fork's policy test still demanded a trigger grant and an approval-gate exemption for it.
+
+### Integration + live verification on the stand
+
+Run against the live stand configuration (`deployment_mode = "hosted_multi_tenant"`, postgres backend,
+profile `production`) — the same service the sync was deployed to.
+
+- **Integration suite: 106 suites, 2186 tests.** First run surfaced 4 red suites / 8 tests, in two
+  groups. Both are now green.
+- **A real regression this sync introduced, caught here and fixed:** a second user installing the same
+  extension got `400 invalid_value`. Cause: the merge widened
+  `from_host_bundled_manifest_with_inline_dynamic_schemas` to accept `InstalledLocal` but left
+  `validate_consistency` accepting only `HostBundled`/virtual-rooted packages, so the package
+  constructed and then failed validation. The fork had this alignment before the sync and it was lost
+  in the reorg. Two suites, four tests.
+- **The other four failures were our attachment feature** hitting upstream's tested contract — see PR 4.
+- **Live turns through the full agent loop:** plain completion; real tool dispatch (`builtin__time`
+  called, result returned); `builtin__skill_list` returning the bundled skills.
+- **The per-user MCP overlay runs on every turn**, which is the strongest evidence the riskiest
+  re-port is correct:
+  `hosted MCP per-user discovery refreshed the user's tool surface extension_id=nearai
+  user_id=reborn-cli capability_count=1`, and for a provider the caller has no credential for,
+  `hosted MCP per-user discovery skipped: credential not provisioned extension_id=agent-market`.
+  Discovery runs under the caller's scope and degrades without failing the turn. The stand has
+  `agent-market` installed for **75 distinct users**, so this is a genuine multi-principal surface.
+- **No skills were lost.** The one user skill on the stand is intact; it is invisible to a turn running
+  as `reborn-cli` because it belongs to a different (WebUI-login) user, and `/skills` maps to
+  `/tenants/<tenant>/users/<user>/skills`. Correct isolation — and a live illustration of PR 5.
+- **WebUI (headless Playwright):** 0 console errors, 0 failed requests. NEAR AI shows ACTIVE with
+  "1 capability" (matching the overlay log) and the bundled Agent Market extension renders with its
+  manifest description.
+- **Slack is not in play:** disabled on the stand and in the deployment, so the retired `[slack]`
+  config section is a non-issue.
 
 ### Database
 
