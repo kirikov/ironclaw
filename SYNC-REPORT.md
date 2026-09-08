@@ -133,10 +133,14 @@ deployment-specific; they stay fork-only.
 - ✅ All 160 conflicts resolved; `cargo check --workspace --all-targets` clean.
 - ✅ Family digests recomputed against the 500k fingerprint (`families/{mod,subagent}.rs`).
 - ✅ Merge committed on `sync/upstream-main-2026-09-08`; `deploy/ironclaw2` untouched.
-- ✅ `ironclaw_composition --lib`: **555 passed, 0 real failures**. Two caveats, neither a merge regression:
-  `runtime_nearai_mcp_prebuild_api_key_is_not_replaced_by_stored_key` overflows the debug stack unless
-  `RUST_MIN_STACK` is set (CI sets `67108864`), and
-  `standalone_runtime_webui_bundle_reuses_thread_and_turn_services` flakes under load but passes alone.
+- ✅ `cargo test --workspace --lib`: **64 of 66 suites green**. The two red suites are load flakes, not
+  merge regressions — all six named tests pass when run individually, and one of them
+  (`filesystem_governor::journal::tests::busy_retry_window_...`, a deadline test) lives in
+  `ironclaw_resources`, a crate this fork does not touch at all. Load average during the run was 23–34
+  on 8 cores because another build was running on the box.
+  One real environment requirement: `runtime_nearai_mcp_prebuild_api_key_is_not_replaced_by_stored_key`
+  overflows the debug stack unless `RUST_MIN_STACK` is set — CI sets `67108864`, so set it locally too.
+  Run the suite alone and composition is **555 passed / 1 flake**.
 - ✅ Binary built (`ironclaw 1.2.0`); `ironclaw doctor` **7 passed / 0 failed / 1 skipped** against the
   live ironclaw2 config.
 - ✅ **Deployed.** `ironclaw2.service` now runs `~/ironclaw2-home/bin/ironclaw` via a systemd drop-in
