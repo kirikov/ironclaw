@@ -183,8 +183,10 @@ fork's policy test still demanded a trigger grant and an approval-gate exemption
 Run against the live stand configuration (`deployment_mode = "hosted_multi_tenant"`, postgres backend,
 profile `production`) — the same service the sync was deployed to.
 
-- **Integration suite: 106 suites, 2186 tests.** First run surfaced 4 red suites / 8 tests, in two
-  groups. Both are now green.
+- **Integration suite: 109 suites, 2271 tests, 0 real failures** after the fixes below. The single red
+  test in the final run (`wedged_tool_call_is_reaped_by_lease_expiry_not_left_running_forever`, a
+  lease-expiry timing test) passes 20/20 twice in isolation — a load flake. The first run surfaced 4
+  red suites / 8 tests in two groups; both groups are fixed.
 - **A real regression this sync introduced, caught here and fixed:** a second user installing the same
   extension got `400 invalid_value`. Cause: the merge widened
   `from_host_bundled_manifest_with_inline_dynamic_schemas` to accept `InstalledLocal` but left
@@ -220,6 +222,17 @@ The cutover runs three new forward-only migrations against `ironclaw_reborn2`:
 
 Pre-cutover backup taken: `~/backups/ironclaw_reborn2-pre-upstream-sync-20260908-114202.dump`
 (`pg_dump -Fc`, 9.1 MB). Restore with `pg_restore --clean --if-exists -d <url> <dump>`.
+
+### Running these suites on this box
+
+Two things bite:
+
+- `RUST_MIN_STACK=67108864` is required (CI sets it); without it a composition test aborts on a debug
+  stack overflow.
+- Linking ~40 integration test binaries (~500 MB each) in parallel spikes memory hard. With another
+  build running on the same box it exhausts swap and the run gets killed mid-link. Build and run in
+  two steps — `cargo test --no-run -j 4`, then `cargo test -j 2 -- --test-threads=4` — and drop page
+  cache first if swap is already full.
 
 ### Watch items after deploy
 
