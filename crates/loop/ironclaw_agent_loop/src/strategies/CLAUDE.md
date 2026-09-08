@@ -1,0 +1,63 @@
+# ironclaw_agent_loop::strategies
+
+Owns sealed built-in strategy traits and their default implementations. Each
+file is one loop decision axis.
+
+## Files
+
+Re-derive this list with `ls crates/loop/ironclaw_agent_loop/src/strategies/`
+before trusting it — each file is one decision axis, so a new file here means
+a new axis.
+
+- `context.rs` chooses prompt/context request shape, not prompt assembly.
+- `capability.rs` narrows an already-resolved capability surface.
+- `model.rs` chooses model preference.
+- `gate.rs` handles approval/auth/resource gates.
+- `recovery.rs` handles model and capability failures.
+- `reply_admission.rs` classifies assistant replies before transcript finalization.
+- `stop.rs` decides whether the loop is done.
+- `drain.rs` decides when steering/followup inputs are drained.
+- `budget.rs` owns iteration and wall-clock limits.
+- `compaction.rs` chooses the transcript-compaction boundary.
+- `active_task_compaction.rs` is the active-task-preserving compaction policy.
+- `progress.rs` is the loop-detection/diminishing-returns strategy.
+- `mod.rs` declares strategy modules and crate-internal re-exports only.
+
+## Boundaries
+
+- Strategies are crate-private implementation details of built-in families.
+- Strategies receive `&LoopExecutionState` and return typed decisions or typed
+  slot updates. They do not own the canonical tick.
+- Each strategy is one immutable, independent decision axis. Executor stages
+  apply its typed outcome and own checkpoint, cancellation, acknowledgement,
+  dispatch, and lifecycle transitions; do not append a second same-axis
+  predicate after the strategy decision.
+- Batch reporting and execution vocabulary belongs to
+  `ironclaw_loop_contracts` and the capability executor. Use the contract's
+  `BatchPolicyKind` directly; do not recreate it as a strategy type or an
+  identity mapper.
+- Prompt file loading, skill loading, identity file reads, model message
+  materialization, tool invocation, approvals, persistence, and product routing
+  belong to host ports and downstream crates.
+- Capability strategies can only narrow a resolved surface; profile grants and
+  host authorization stay outside this crate.
+
+## Adding code
+
+- Add a new strategy only for a stable, independent decision axis.
+- Put default behavior in the same file as the trait when it exactly matches
+  that axis.
+- Add new outcome variants only when the executor can handle them generically.
+- If logic needs host/runtime/product details, add a host adapter or context
+  source elsewhere instead of widening a strategy.
+- Keep host/profile/origin exceptions at a documented executor-stage boundary
+  instead of widening a strategy contract for a one-off caller condition.
+
+## Common mistakes
+
+- Do not create a catch-all strategy for unrelated policy.
+- Do not pass raw content into strategy decisions except for
+  `reply_admission.rs`, whose whole boundary is classifying the candidate
+  assistant reply before it becomes user-visible transcript.
+- Do not smuggle host calls through strategy types.
+- Do not add public strategy exports to make an external family compile.

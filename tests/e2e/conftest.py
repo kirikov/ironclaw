@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
+from hermetic_process import forward_hermetic_process_env
 from helpers import (
     AUTH_TOKEN,
     EMULATE_GITHUB_BEARER,
@@ -80,6 +81,22 @@ EMULATE_STARTUP_POLL_SECONDS = 0.5
 TEST_TOOLS_DIR = ROOT / "test-tools"
 BUILD_TEST_TOOLS_SCRIPT = ROOT / "scripts" / "build-test-tools.sh"
 TEST_TOOL_NAMES = ("ascii-renderer", "hacker-news", "market-data")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Forward final pytest outcomes to the optional Reborn artifact recorder."""
+    outcome = yield
+    report = outcome.get_result()
+    from reborn_webui_harness import (
+        _finalize_registered_artifact_bundles,
+        _mark_registered_artifact_bundles_failed,
+    )
+
+    if report.failed:
+        _mark_registered_artifact_bundles_failed(item.nodeid)
+    if report.when == "teardown":
+        _finalize_registered_artifact_bundles(item.nodeid)
 
 
 def _latest_mtime(path: Path) -> float:
@@ -300,12 +317,13 @@ def test_tool_zips() -> dict[str, Path]:
 
 
 def _forward_coverage_env(env: dict[str, str]) -> None:
-    """Forward cargo-llvm-cov env vars into child processes when present."""
+    """Forward CI instrumentation and hermetic controls to child processes."""
     cov_env_prefixes = ("CARGO_LLVM_COV", "LLVM_")
     cov_env_extras = ("CARGO_ENCODED_RUSTFLAGS", "CARGO_INCREMENTAL")
     for key, val in os.environ.items():
         if key.startswith(cov_env_prefixes) or key in cov_env_extras:
             env[key] = val
+    forward_hermetic_process_env(env)
 
 
 def _build_gateway_env(
@@ -485,6 +503,32 @@ def ironclaw_reborn_binary():
 
 
 @pytest.fixture(scope="session")
+def ironclaw_reborn_sso_binary():
+    """Build the debug-only Reborn binary variant used by the SSO mock."""
+    target_dir = _cargo_target_dir() / "e2e-sso"
+    binary = target_dir / "debug" / "ironclaw"
+    if _binary_needs_rebuild(binary):
+        print("Building Reborn ironclaw with test support (this may take a while)...")
+        subprocess.run(
+            [
+                "cargo", "build",
+                "-p", "ironclaw",
+                "--bin", "ironclaw",
+                "--features", "test-support",
+                "--target-dir", str(target_dir),
+            ],
+            cwd=ROOT,
+            check=True,
+            timeout=600,
+        )
+    assert binary.exists(), (
+        f"Binary not found at {binary}. "
+        f"Cargo target dir resolved to: {target_dir}"
+    )
+    return str(binary)
+
+
+@pytest.fixture(scope="session")
 def ironclaw_reborn_openai_compat_binary():
     """Ensure Reborn `ironclaw` is built for the OpenAI-compatible scenarios.
 
@@ -562,6 +606,65 @@ async def mock_llm_server():
             await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:
             proc.kill()
+
+
+@pytest.fixture(autouse=True)
+async def assert_prompt_cache_reuse(request):
+    """Fail any mock-LLM test that churns the provider-cached prompt prefix.
+
+    Prompt-cache regressions are invisible to functional assertions — the model
+    still answers correctly, it just costs several times more (#6985 measured
+    the hit rate collapsing 82% -> 29%). Rather than pin this in one dedicated
+    scenario, every test that drives the mock asserts it: the mock records each
+    request's leading system block and flags a change that the advertised tool
+    surface does not explain.
+
+    Only requests made by THIS test are considered — the counters reset first.
+    Tests that legitimately rewrite the prefix (e.g. deliberately reconfiguring
+    the system prompt mid-conversation) opt out with
+    `@pytest.mark.allow_prompt_cache_churn("reviewable reason")`.
+    """
+    if "mock_llm_server" not in request.fixturenames:
+        yield
+        return
+    allow_churn = _required_marker_reason(request, "allow_prompt_cache_churn")
+    disable_gate = _required_marker_reason(request, "disable_prompt_cache_gate")
+    if disable_gate is not None:
+        yield
+        return
+    url = request.getfixturevalue("mock_llm_server")
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{url}/__mock/cache_stats/reset", timeout=5)
+        response.raise_for_status()
+        yield
+        if allow_churn is not None:
+            return
+        response = await client.get(f"{url}/__mock/cache_stats", timeout=5)
+        response.raise_for_status()
+        stats = response.json()
+    violations = stats.get("violations") or []
+    assert not violations, (
+        "the provider-cached system prompt changed while the advertised tool "
+        "surface stayed identical — per-call content (a clock, a nudge, a "
+        "counter) is sitting in the cached prefix and every model call is "
+        f"paying full input cost for it (#6985):\n{json.dumps(violations, indent=2)}"
+    )
+
+
+def _required_marker_reason(request, marker_name: str) -> str | None:
+    marker = request.node.get_closest_marker(marker_name)
+    if marker is None:
+        return None
+    if (
+        len(marker.args) != 1
+        or marker.kwargs
+        or not isinstance(marker.args[0], str)
+        or not marker.args[0].strip()
+    ):
+        pytest.fail(
+            f"@pytest.mark.{marker_name} requires exactly one non-empty reason string"
+        )
+    return marker.args[0].strip()
 
 
 async def _run_emulate_server(

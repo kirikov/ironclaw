@@ -15,7 +15,7 @@ mod support;
 
 use std::{future::Future, time::Duration};
 
-use ironclaw_host_api::CapabilityId;
+use ironclaw_host_api::ids::CapabilityId;
 use ironclaw_host_runtime::{
     APPLY_PATCH_CAPABILITY_ID, JSON_CAPABILITY_ID, LIST_DIR_CAPABILITY_ID, READ_FILE_CAPABILITY_ID,
     SHELL_CAPABILITY_ID, SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID,
@@ -40,6 +40,17 @@ use reborn_support::{
     github as github_support,
     harness::RecordingTestCapabilityPort,
 };
+
+fn trigger_execution_contract(goal: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "goal": goal.into(),
+        "success_criteria": ["Complete the requested task"],
+        "output_instructions": "Return a concise result",
+        "no_result_text": "No result",
+        "policy": { "result_delivery": "deliver" }
+    })
+}
 
 const COVERED_QA_SCENARIOS: &[&str] = &[
     "three_step_time_write_read_summary",
@@ -212,7 +223,7 @@ async fn qa_trigger_automation_smokes_create_view_and_cleanup() {
                 "qa_heartbeat_create",
                 serde_json::json!({
                     "name": "qa-reborn-heartbeat-smoke",
-                    "prompt": "reborn heartbeat smoke",
+                    "execution_contract": trigger_execution_contract("reborn heartbeat smoke"),
                     "schedule": {
                         "kind": "cron",
                         "expression": "*/2 * * * *",
@@ -236,7 +247,7 @@ async fn qa_trigger_automation_smokes_create_view_and_cleanup() {
                 "qa_cron_create",
                 serde_json::json!({
                     "name": "qa-reborn-cron-smoke",
-                    "prompt": "summarize repo status",
+                    "execution_contract": trigger_execution_contract("summarize repo status"),
                     "schedule": {
                         "kind": "cron",
                         "expression": "0 9 * * 1",
@@ -1057,7 +1068,7 @@ fn call(
     RebornScriptedProviderToolCall::new(capability_id.clone(), call_id, arguments)
 }
 
-fn capability_order(invocations: &[ironclaw_turns::run_profile::LoopRequest]) -> Vec<&str> {
+fn capability_order(invocations: &[ironclaw_loop_contracts::LoopRequest]) -> Vec<&str> {
     invocations
         .iter()
         .map(|invocation| invocation.capability_id.as_str())

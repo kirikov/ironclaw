@@ -198,8 +198,12 @@ async def _get_file_outcome(emulate_url: str, preview: dict) -> None:
     )
     assert isinstance(resource, dict)
     assert _decode_content(resource) == CODE_MARKER, resource
+    assert preview["truncated"] is False, preview
+    assert preview["output_kind"] == "text", preview
+    assert preview["output_preview"] == CODE_MARKER, preview
     assert (
-        base64.b64decode(preview["output_preview"]).decode() == CODE_MARKER
+        base64.b64encode(CODE_MARKER.encode()).decode()
+        not in preview["output_preview"]
     ), preview
 
 
@@ -283,6 +287,7 @@ GITHUB_REPO_PROVIDER_OPERATION_CASES = (
         },
         assert_baseline=_repo_baseline,
         assert_outcome=_create_branch_outcome,
+        expected_request_count=2,
     ),
     ProviderOperationCase(
         case_id="github_list_branches",

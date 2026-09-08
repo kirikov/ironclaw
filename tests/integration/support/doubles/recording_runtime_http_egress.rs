@@ -1,12 +1,12 @@
 /// Test double substituting the production `RuntimeHttpEgress` impl
-/// (`HostHttpEgressService`, `crates/ironclaw_host_runtime/src/egress/mod.rs`).
+/// (`HostHttpEgressService`, `crates/kernel/ironclaw_host_runtime/src/egress/mod.rs`).
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
-use ironclaw_host_api::{
+use ironclaw_host_api::http::{
     RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressRequest, RuntimeHttpEgressResponse,
 };
 

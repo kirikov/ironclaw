@@ -7,12 +7,12 @@ use std::{
     path::PathBuf,
 };
 
+use ironclaw_stress::db_probe::DbProbeSummary;
 use serde_json::Value;
 
 use crate::{
     Args, RunSummary,
     capture::CapturedRun,
-    db_probe::DbProbeSummary,
     process_metrics::{ProcessMetrics, aggregate_process_metrics},
     summary::FailureCauseSummary,
     trace,
@@ -245,7 +245,7 @@ fn operation_attribution_probe(name: &str) -> String {
             "Sweep --context-max-messages and --prefill-turns-per-thread to measure context read amplification.".to_string()
         }
         "turn_store" => {
-            "Compare --scenario chat-turn against reserve-reconcile; high turn_store points at run claim/complete state transitions.".to_string()
+            "Compare --scenario chat-turn against turn-lifecycle-churn; high turn_store points at process-journal submit/claim/complete transitions.".to_string()
         }
         "resource_governor" => {
             "Run reserve-release and resource-contention presets to isolate governor reservation/reconcile/release writes.".to_string()

@@ -3,7 +3,7 @@
 //! model-visible artifact of instruction-safety context is the
 //! `InstructionSafetyContext` banner rendered as a `system`-role prompt
 //! message (`push_safety_context`,
-//! `crates/ironclaw_turns/src/run_profile/instruction_bundle.rs:523`). These
+//! `crates/contracts/ironclaw_loop_contracts/src/instruction_bundle.rs:538`). These
 //! tests prove the banner reaches the model when wired, and that the
 //! `assert_system_prompt_contains` assertion actually discriminates on real
 //! content rather than passing vacuously.
@@ -15,7 +15,7 @@ mod reborn_support;
 #[path = "../support/mod.rs"]
 mod support;
 
-use ironclaw_turns::run_profile::InstructionSafetyContext;
+use ironclaw_loop_contracts::InstructionSafetyContext;
 use reborn_support::builder::RebornIntegrationHarness;
 use reborn_support::reply::RebornScriptedReply;
 

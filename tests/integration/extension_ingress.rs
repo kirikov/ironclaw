@@ -32,10 +32,11 @@ use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::BodyExt;
 use ironclaw_extension_host::extension_ingress::{
     ChannelInboundSinkConfig, ChannelIngressDrain, ChannelIngressRegistration,
-    ExtensionIngressParts, GenericChannelInboundSink, PostAdmissionObserver, StaticIngressSecrets,
-    VerifiedEvidenceMint, extension_ingress_route_mount,
+    ExtensionIngressParts, GenericChannelInboundSink, PostAdmissionObserver,
+    StaticIngressConfiguration, StaticIngressSecrets, VerifiedEvidenceMint,
+    extension_ingress_route_mount,
 };
-use ironclaw_host_api::ChannelInboundProductSurface;
+use ironclaw_product_contracts::surface::ChannelInboundProductSurface;
 use reborn_support::builder::StorageMode;
 use reborn_support::group::RebornIntegrationGroup;
 use reborn_support::reply::RebornScriptedReply;
@@ -75,7 +76,7 @@ fn acme_signature(timestamp: &str, body: &str) -> String {
 /// message entered the existing binding + turn-submission pipeline).
 #[derive(Default)]
 struct RecordingAdmissionObserver {
-    acks: Mutex<Vec<ironclaw_product::ProductInboundAck>>,
+    acks: Mutex<Vec<ironclaw_product_contracts::inbound::ProductInboundAck>>,
     errors: Mutex<Vec<String>>,
 }
 
@@ -83,16 +84,16 @@ struct RecordingAdmissionObserver {
 impl PostAdmissionObserver for RecordingAdmissionObserver {
     async fn observe_ack(
         &self,
-        _envelope: ironclaw_product::ProductInboundEnvelope,
-        ack: ironclaw_product::ProductInboundAck,
+        _envelope: ironclaw_product_contracts::inbound::ProductInboundEnvelope,
+        ack: ironclaw_product_contracts::inbound::ProductInboundAck,
     ) {
         self.acks.lock().expect("acks lock").push(ack);
     }
 
     async fn observe_error(
         &self,
-        _envelope: ironclaw_product::ProductInboundEnvelope,
-        error: ironclaw_product::ProductAdapterError,
+        _envelope: ironclaw_product_contracts::inbound::ProductInboundEnvelope,
+        error: ironclaw_host_api::product_adapter::ProductAdapterError,
     ) {
         self.errors
             .lock()
@@ -120,13 +121,12 @@ impl AcmeIngress {
         let observer = Arc::new(RecordingAdmissionObserver::default());
         let surface = harness.product_surface_for_test() as Arc<dyn ChannelInboundProductSurface>;
         let sink = Arc::new(GenericChannelInboundSink::new(ChannelInboundSinkConfig {
-            adapter_id: ironclaw_product::ProductAdapterId::new("acme-messenger")
+            adapter_id: ironclaw_host_api::product_adapter::ProductAdapterId::new("acme-messenger")
                 .expect("adapter id"),
             evidence: VerifiedEvidenceMint::RequestSignature {
                 signature_header: "X-Acme-Signature".to_string(),
                 timestamp_header: Some("X-Acme-Request-Timestamp".to_string()),
             },
-            classifier: None,
             surface,
             observer: Some(Arc::clone(&observer) as Arc<dyn PostAdmissionObserver>),
         }));
@@ -139,6 +139,7 @@ impl AcmeIngress {
                         secret: ACME_SECRET.to_vec(),
                     },
                 ])),
+                configuration: Arc::new(StaticIngressConfiguration::default()),
                 sink: sink.clone() as Arc<dyn ironclaw_extension_host::ingress::InboundSink>,
                 drain: Some(sink as Arc<dyn ChannelIngressDrain>),
             },
@@ -200,7 +201,12 @@ impl AcmeIngress {
             .lock()
             .expect("acks lock")
             .iter()
-            .filter(|ack| matches!(ack, ironclaw_product::ProductInboundAck::Accepted { .. }))
+            .filter(|ack| {
+                matches!(
+                    ack,
+                    ironclaw_product_contracts::inbound::ProductInboundAck::Accepted { .. }
+                )
+            })
             .count()
     }
 
@@ -210,7 +216,12 @@ impl AcmeIngress {
             .lock()
             .expect("acks lock")
             .iter()
-            .filter(|ack| matches!(ack, ironclaw_product::ProductInboundAck::Duplicate { .. }))
+            .filter(|ack| {
+                matches!(
+                    ack,
+                    ironclaw_product_contracts::inbound::ProductInboundAck::Duplicate { .. }
+                )
+            })
             .count()
     }
 }
@@ -230,8 +241,17 @@ async fn activate_acme(group: &RebornIntegrationGroup) -> ExtensionIngressParts 
         .build()
         .await
         .expect("lifecycle thread builds");
+    // Every `[[tools]]` credential referencing `vendor = "acme"` merges into
+    // one whole-package OAuth requirement (same provider + setup), so the
+    // seeded account must cover the union of every declared scope — both
+    // the write ops' `notes:write` and the 16 standard ops' `notes:read`
+    // reads/people scope (standardized messaging framework, task 7).
     lifecycle
-        .seed_capability_credential_account("acme", "acme ingress account", &["notes:write"])
+        .seed_capability_credential_account(
+            "acme",
+            "acme ingress account",
+            &["notes:write", "notes:read"],
+        )
         .await
         .expect("seed acme account");
     lifecycle

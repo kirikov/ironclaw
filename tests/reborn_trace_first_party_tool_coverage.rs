@@ -8,30 +8,43 @@ mod support;
 
 use std::{collections::BTreeSet, time::Duration};
 
-use ironclaw_host_api::CapabilityId;
+use ironclaw_host_api::ids::CapabilityId;
 use ironclaw_host_runtime::{
-    APPLY_PATCH_CAPABILITY_ID, ECHO_CAPABILITY_ID, GLOB_CAPABILITY_ID, GREP_CAPABILITY_ID,
-    HTTP_CAPABILITY_ID, HTTP_SAVE_CAPABILITY_ID, JSON_CAPABILITY_ID, LIST_DIR_CAPABILITY_ID,
-    MEMORY_READ_CAPABILITY_ID, MEMORY_SEARCH_CAPABILITY_ID, MEMORY_TREE_CAPABILITY_ID,
-    MEMORY_WRITE_CAPABILITY_ID, PROFILE_SET_CAPABILITY_ID, READ_FILE_CAPABILITY_ID,
-    SHELL_CAPABILITY_ID, SKILL_AUTO_ACTIVATE_SET_CAPABILITY_ID, SKILL_INSTALL_CAPABILITY_ID,
-    SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID, SKILL_UPDATE_CAPABILITY_ID,
-    SPAWN_SUBAGENT_CAPABILITY_ID, TIME_CAPABILITY_ID,
-    TRACE_COMMONS_ACCOUNT_LOGIN_LINK_CAPABILITY_ID, TRACE_COMMONS_CREDITS_CAPABILITY_ID,
-    TRACE_COMMONS_ONBOARD_CAPABILITY_ID, TRACE_COMMONS_PROFILE_SET_CAPABILITY_ID,
-    TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID, TRACE_COMMONS_STATUS_CAPABILITY_ID,
-    TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID, TRIGGER_PAUSE_CAPABILITY_ID,
-    TRIGGER_REMOVE_CAPABILITY_ID, TRIGGER_RESUME_CAPABILITY_ID, WRITE_FILE_CAPABILITY_ID,
+    APPLY_PATCH_CAPABILITY_ID, ATTACH_WORKSPACE_FILE_TO_REPLY_CAPABILITY_ID, ECHO_CAPABILITY_ID,
+    GLOB_CAPABILITY_ID, GREP_CAPABILITY_ID, HTTP_CAPABILITY_ID, HTTP_SAVE_CAPABILITY_ID,
+    JSON_CAPABILITY_ID, LIST_DIR_CAPABILITY_ID, MEMORY_READ_CAPABILITY_ID,
+    MEMORY_SEARCH_CAPABILITY_ID, MEMORY_TREE_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID,
+    PROFILE_SET_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, SHELL_CAPABILITY_ID,
+    SKILL_AUTO_ACTIVATE_SET_CAPABILITY_ID, SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID,
+    SKILL_REMOVE_CAPABILITY_ID, SKILL_UPDATE_CAPABILITY_ID, SPAWN_SUBAGENT_CAPABILITY_ID,
+    TIME_CAPABILITY_ID, TRACE_COMMONS_ACCOUNT_LOGIN_LINK_CAPABILITY_ID,
+    TRACE_COMMONS_CREDITS_CAPABILITY_ID, TRACE_COMMONS_ONBOARD_CAPABILITY_ID,
+    TRACE_COMMONS_PROFILE_SET_CAPABILITY_ID, TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID,
+    TRACE_COMMONS_STATUS_CAPABILITY_ID, TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID,
+    TRIGGER_PAUSE_CAPABILITY_ID, TRIGGER_REMOVE_CAPABILITY_ID, TRIGGER_RESUME_CAPABILITY_ID,
+    TRIGGER_RUN_CAPABILITY_ID, TRIGGER_STATUS_CAPABILITY_ID, WRITE_FILE_CAPABILITY_ID,
     builtin_first_party_package, native_memory_first_party_package,
 };
+use ironclaw_loop_contracts::LoopHostMilestoneKind;
 use ironclaw_loop_host::{HostManagedModelMessageRole, HostManagedModelResponse};
-use ironclaw_turns::{TurnStatus, run_profile::LoopHostMilestoneKind};
+use ironclaw_turns::TurnStatus;
 use parity_qa_support::{
     binary_e2e::{HarnessWaitConfig, RebornBinaryE2EHarness, assert_milestone_order},
     model_replay::{
         RebornModelReplayStep, RebornScriptedProviderToolCall, RebornTraceReplayModelGateway,
     },
 };
+
+fn trigger_execution_contract(goal: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "goal": goal.into(),
+        "success_criteria": ["Complete the requested task"],
+        "output_instructions": "Return a concise result",
+        "no_result_text": "No result",
+        "policy": { "result_delivery": "deliver" }
+    })
+}
 
 const REBORN_FIRST_PARTY_E2E_COVERED_CAPABILITIES: &[&str] = &[
     ECHO_CAPABILITY_ID,
@@ -62,18 +75,41 @@ const REBORN_FIRST_PARTY_E2E_COVERED_CAPABILITIES: &[&str] = &[
     TRIGGER_PAUSE_CAPABILITY_ID,
     TRIGGER_RESUME_CAPABILITY_ID,
     TRIGGER_REMOVE_CAPABILITY_ID,
+    TRIGGER_STATUS_CAPABILITY_ID,
+    // Manual trigger runs are user-direct product gestures, not tools exposed
+    // to the ordinary model surface exercised below. Their positive host path
+    // is covered by `builtin_trigger_run_dispatches_submitted_and_replayed_through_host_runtime`;
+    // `scheduled_trigger_fire_cannot_invoke_trigger_mutators` covers the
+    // production-composed scheduled-run denial path.
+    TRIGGER_RUN_CAPABILITY_ID,
     TRACE_COMMONS_ONBOARD_CAPABILITY_ID,
     TRACE_COMMONS_STATUS_CAPABILITY_ID,
     TRACE_COMMONS_CREDITS_CAPABILITY_ID,
     TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID,
     TRACE_COMMONS_PROFILE_SET_CAPABILITY_ID,
     TRACE_COMMONS_ACCOUNT_LOGIN_LINK_CAPABILITY_ID,
-    // #6520 registers the product-owned run-scoped delivery router as a real
-    // built-in; its e2e coverage lives in
-    // `reborn_integration_delivery_user_journeys` (ROUTE_CURRENT journeys:
-    // exact-listed-target routing, web_app-only routing, stale-target
-    // model-correctable failure).
-    ironclaw_host_runtime::OUTBOUND_DELIVERY_TARGET_ROUTE_CURRENT_CAPABILITY_ID,
+    // The explicit model-initiated delivery tool. Its e2e coverage is the
+    // delivery user journeys in `reborn_integration_delivery_user_journeys`
+    // (`webui_send_me_on_slack_delivers_via_bot_with_evidence` and siblings),
+    // which drive it through the real composition-wired
+    // `ExtensionHostModelChannelDelivery` → `DeliveryCoordinator` → channel
+    // adapter → vendor wire, asserting at the wire recorder and the outbound
+    // attempt ledger.
+    ironclaw_host_runtime::OUTBOUND_DELIVER_CAPABILITY_ID,
+    // This capability's production runtime proof writes a CSV through
+    // `builtin.write_file`, invokes the attachment tool through the real
+    // host/runtime/loop chain, and verifies the finalized assistant message:
+    // `runtime::tests::outbound_delivery::
+    // production_reply_attachment_capability_registers_durable_run_intent`.
+    ATTACH_WORKSPACE_FILE_TO_REPLY_CAPABILITY_ID,
+    // #6898 item 3. Both are driven end-to-end by
+    // `reborn_integration_document_edit`: the redline journey reads a .docx
+    // structurally and resolves its tracked changes into a new document, the
+    // spreadsheet journey sets a formula under a named column, the deck journey
+    // clones a slide with its layout, and the PDF journey authors HTML and
+    // renders it.
+    ironclaw_host_runtime::DOCUMENT_EDIT_CAPABILITY_ID,
+    ironclaw_host_runtime::HTML_TO_PDF_CAPABILITY_ID,
 ];
 
 const SKILL_NAME: &str = "reborn-skill-e2e";
@@ -427,6 +463,8 @@ async fn reborn_trace_trigger_management_first_party_tools_parity() {
         CapabilityId::new(TRIGGER_RESUME_CAPABILITY_ID).expect("valid capability id");
     let trigger_remove =
         CapabilityId::new(TRIGGER_REMOVE_CAPABILITY_ID).expect("valid capability id");
+    let trigger_status =
+        CapabilityId::new(TRIGGER_STATUS_CAPABILITY_ID).expect("valid capability id");
     let missing_trigger_id = "01HZZZZZZZZZZZZZZZZZZZZZZZ";
     let model_gateway = RebornTraceReplayModelGateway::with_scripted_steps([
         RebornModelReplayStep::AssertProviderToolsThenProviderToolCalls {
@@ -436,13 +474,14 @@ async fn reborn_trace_trigger_management_first_party_tools_parity() {
                 trigger_remove.clone(),
                 trigger_pause.clone(),
                 trigger_resume.clone(),
+                trigger_status.clone(),
             ],
             calls: vec![RebornScriptedProviderToolCall::new(
                 trigger_create.clone(),
                 "call_trigger_create_first_party",
                 serde_json::json!({
                     "name": "Daily trace summary",
-                    "prompt": "Summarize trace state",
+                    "execution_contract": trigger_execution_contract("Summarize trace state"),
                     "schedule": {
                         "kind": "cron",
                         "expression": "0 8 * * *",
@@ -464,6 +503,14 @@ async fn reborn_trace_trigger_management_first_party_tools_parity() {
             calls: vec![RebornScriptedProviderToolCall::new(
                 trigger_remove.clone(),
                 "call_trigger_remove_missing",
+                serde_json::json!({ "trigger_id": missing_trigger_id }),
+            )],
+            expected_tool_results: Vec::new(),
+        },
+        RebornModelReplayStep::ProviderToolCalls {
+            calls: vec![RebornScriptedProviderToolCall::new(
+                trigger_status.clone(),
+                "call_trigger_status_missing",
                 serde_json::json!({ "trigger_id": missing_trigger_id }),
             )],
             expected_tool_results: Vec::new(),
@@ -500,10 +547,11 @@ async fn reborn_trace_trigger_management_first_party_tools_parity() {
         .expect("final reply");
 
     let invocations = harness.capability_invocations();
-    assert_eq!(invocations.len(), 3);
+    assert_eq!(invocations.len(), 4);
     assert_eq!(invocations[0].capability_id, trigger_create);
     assert_eq!(invocations[1].capability_id, trigger_list);
     assert_eq!(invocations[2].capability_id, trigger_remove);
+    assert_eq!(invocations[3].capability_id, trigger_status);
 
     let results = harness.capability_results();
     assert_eq!(results.len(), 3);
@@ -527,10 +575,11 @@ async fn reborn_trace_trigger_management_first_party_tools_parity() {
     );
 
     let requests = harness.model_requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert_eq!(tool_result_count(&requests[1]), 1);
     assert_eq!(tool_result_count(&requests[2]), 2);
     assert_eq!(tool_result_count(&requests[3]), 3);
+    assert_eq!(tool_result_count(&requests[4]), 4);
     assert_milestone_order(
         &harness.milestones(),
         |kind| matches!(kind, LoopHostMilestoneKind::CapabilityBatchCompleted { .. }),

@@ -1,11 +1,52 @@
 """Executable classification of the shipped provider capability surface."""
 
-from pathlib import Path
 import tomllib
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY_PATH = ROOT / "tests/e2e/fixtures/provider_capability_coverage.toml"
-ASSET_ROOT = ROOT / "crates/ironclaw_first_party_extensions/assets"
+ASSET_ROOT = ROOT / "crates/extensions/packages"
+
+# WS2's package colocation put the two `[memory]` provider packages under the
+# same `packages/` root as the extension packages. They are not *provider*
+# capabilities in this file's sense: `ironclaw.memory.*` is the
+# provider-neutral memory contract, identical whichever backend is bound, and
+# none of its tools declares `external_write` or `network` — there is no vendor
+# boundary for a journey to seed or assert against. Excluding them keeps this
+# inventory measuring exactly what it measured before the move.
+# `crates/app/ironclaw_architecture_tests/tests/reborn_extension_specificity.rs` carves
+# the same two packages out of the vendor vocabulary, for the same reason.
+NON_PROVIDER_PACKAGE_DIRS = frozenset({"memory-native", "mem0"})
+
+
+def shipped_provider_manifests() -> list[Path]:
+    """Every shipped provider package manifest, memory providers excluded.
+
+    Fails closed: an empty result, or a carve-out entry naming a package that
+    is not there, means the tree moved under this inventory rather than that
+    there is nothing to classify.
+    """
+    for name in sorted(NON_PROVIDER_PACKAGE_DIRS):
+        carved = ASSET_ROOT / name / "manifest.toml"
+        if not carved.is_file():
+            raise AssertionError(
+                f"NON_PROVIDER_PACKAGE_DIRS names {name!r}, but {carved} does not exist. "
+                "A stale carve-out excludes nothing and a renamed package silently "
+                "rejoins the provider inventory; repoint it in the same change that "
+                "moved the package."
+            )
+    manifests = [
+        path
+        for path in sorted(ASSET_ROOT.glob("*/manifest.toml"))
+        if path.parent.name not in NON_PROVIDER_PACKAGE_DIRS
+    ]
+    if not manifests:
+        raise AssertionError(
+            f"no package manifests under {ASSET_ROOT} — the provider inventory would "
+            "classify an empty surface and every coverage assertion would pass "
+            "vacuously."
+        )
+    return manifests
 
 
 def _load_inventory() -> dict:
@@ -54,7 +95,7 @@ def backlogged_capabilities(rule: str) -> frozenset[str]:
 
 def _production_extension_ids() -> set[str]:
     extension_ids = set()
-    for manifest_path in sorted(ASSET_ROOT.glob("*/manifest.toml")):
+    for manifest_path in shipped_provider_manifests():
         with manifest_path.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)
         if manifest.get("tools"):
@@ -63,19 +104,27 @@ def _production_extension_ids() -> set[str]:
 
 
 def _capability_operation_kinds() -> dict[str, str]:
-    """Read/write kind per capability, derived from shipped manifests.
+    """Provider operation kind per capability, derived from shipped manifests.
 
-    The manifests already declare `external_write` in each tool's `effects`,
-    so the kind is production-derived like the capability denominator itself
-    rather than a hand-maintained list that can drift from what ships.
+    `external_write` identifies mutations and `network` identifies provider
+    reads. Capabilities with neither effect are local operations, not provider
+    reads; requiring seeded provider outcomes for those would fabricate a
+    boundary that production never crosses.
     """
     kinds: dict[str, str] = {}
-    for manifest_path in sorted(ASSET_ROOT.glob("*/manifest.toml")):
+    for manifest_path in shipped_provider_manifests():
         with manifest_path.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)
+        inherited_effects = manifest.get("mcp", {}).get("effects", [])
         for tool in manifest.get("tools", []):
-            effects = tool.get("effects", [])
-            kinds[tool["id"]] = "write" if "external_write" in effects else "read"
+            effects = [*inherited_effects, *tool.get("effects", [])]
+            if "external_write" in effects:
+                kind = "write"
+            elif "network" in effects:
+                kind = "read"
+            else:
+                kind = "local"
+            kinds[tool["id"]] = kind
     return kinds
 
 

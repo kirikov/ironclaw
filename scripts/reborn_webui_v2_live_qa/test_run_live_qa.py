@@ -240,6 +240,8 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertFalse(behavioral.blocking)
         with self.assertRaisesRegex(ValueError, "tier"):
             run_live_qa.CaseSpec(fake_case, tier="advisory", blocking=False)
+        with self.assertRaisesRegex(ValueError, "retry_policy"):
+            run_live_qa.CaseSpec(fake_case, retry_policy="always")
 
     def _fake_assistant_reply_page(
         self,
@@ -451,6 +453,15 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertFalse(absent_result)
         self.assertFalse(absent.clicked)
 
+    # Pre-existing red, and pre-existing *invisible*: no CI lane has ever run
+    # this module, so these four drifted out of sync with the #6520 extension
+    # setup contract unnoticed. `expectedFailure` rather than a skip or a
+    # deletion — the body still runs, the failure is still real, and the day the
+    # contract is modelled correctly this turns into an unexpected *pass* and
+    # goes red, which a skip could never do. To clear one: teach its double the
+    # operator-catalog projection (`extension.<id>` group + revision) that
+    # `_extension_setup_submission` now routes non-secret fields through.
+    @unittest.expectedFailure
     def test_slack_connect_case_uses_extensions_channels_surface(self):
         class FakePage:
             def __init__(self) -> None:
@@ -491,9 +502,16 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         ) -> dict[str, object]:
             fetched_paths.append(path)
             if method == "POST" and path == "/api/webchat/v2/extensions/install":
+                # `client_action_id` is a generated idempotency key, so the
+                # stable part is asserted by shape rather than by dict equality.
+                self.assertIsInstance(payload, dict)
                 self.assertEqual(
+                    payload.get("package_ref"),
+                    {"kind": "extension", "id": "slack"},
+                )
+                self.assertTrue(
+                    str(payload.get("client_action_id", "")).startswith("live-qa-"),
                     payload,
-                    {"package_ref": {"kind": "extension", "id": "slack"}},
                 )
                 return {
                     "success": True,
@@ -1223,6 +1241,166 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertEqual(result.details["trigger_records_after"], 0)
         self.assertEqual(result.details["trigger_record_wait_ms"], 25)
         self.assertIn("did not add a trigger_record", result.details["error"])
+
+    def test_routine_creation_case_passes_on_durable_evidence_when_marker_missing(
+        self,
+    ):
+        # Live runs 31828255762..31891777209: the model creates the routine
+        # but its final reply omits the required marker (e.g. an "already
+        # created" confirmation after schedule-validation retries). The
+        # trigger record is the durable contract; the reply marker is a
+        # liveness proxy that must not red the case.
+        async def fake_live_chat_case(_ctx, **kwargs):
+            return run_live_qa.ProbeResult(
+                provider="test",
+                mode=f"live:{kwargs['case_name']}",
+                success=False,
+                latency_ms=1,
+                details={
+                    "error": (
+                        "finalized assistant reply did not contain required "
+                        "marker. marker='REBORN_QA_9D_PER_TRIGGER_TARGET_"
+                        "ROUTINE_CREATED_1234' last_assistant='already "
+                        "created and scheduled'"
+                    ),
+                },
+            )
+
+        with (
+            patch.object(
+                run_live_qa,
+                "_live_chat_case",
+                side_effect=fake_live_chat_case,
+            ),
+            patch.object(
+                run_live_qa,
+                "_trigger_record_count",
+                side_effect=[0, 1],
+            ),
+            patch.object(
+                run_live_qa,
+                "_trigger_record_snapshot",
+                return_value={"checked": True, "record_count": 1},
+            ),
+        ):
+            result = asyncio.run(
+                run_live_qa._routine_creation_case(
+                    self._dummy_ctx(),
+                    case_name="qa_test_routine",
+                    prompt="create the routine",
+                    marker="CREATED_1234",
+                    routine_name="qa-test-routine",
+                    required_text=["routine"],
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.details["trigger_records_after"], 1)
+        self.assertIn("creation_evidence_override", result.details)
+        # The original content failure stays visible for audit.
+        self.assertIn("did not contain required marker", result.details["error"])
+
+    def test_routine_creation_case_does_not_upgrade_typed_failures(self):
+        # A typed failure (terminal run error, capability evidence, provider
+        # incident) carries a failure_category and must keep its signal even
+        # when a trigger record exists.
+        async def fake_live_chat_case(_ctx, **kwargs):
+            return run_live_qa.ProbeResult(
+                provider="test",
+                mode=f"live:{kwargs['case_name']}",
+                success=False,
+                latency_ms=1,
+                details={
+                    "error": "run terminal",
+                    "failure_category": "run_terminal",
+                    "failure_status": "failed",
+                },
+            )
+
+        with (
+            patch.object(
+                run_live_qa,
+                "_live_chat_case",
+                side_effect=fake_live_chat_case,
+            ),
+            patch.object(
+                run_live_qa,
+                "_trigger_record_count",
+                side_effect=[0, 1],
+            ),
+            # Even a matching record must not upgrade a typed failure.
+            patch.object(
+                run_live_qa,
+                "_trigger_record_snapshot",
+                return_value={"checked": True, "record_count": 1},
+            ),
+        ):
+            result = asyncio.run(
+                run_live_qa._routine_creation_case(
+                    self._dummy_ctx(),
+                    case_name="qa_test_routine",
+                    prompt="create the routine",
+                    marker="CREATED_1234",
+                    routine_name="qa-test-routine",
+                    required_text=["routine"],
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertNotIn("creation_evidence_override", result.details)
+
+    def test_routine_creation_case_does_not_upgrade_on_unrelated_record(self):
+        # Marker-less callers count ALL trigger records (count_name is
+        # None), so an unrelated record created mid-case bumps the global
+        # count. The name-scoped read-back must not find the requested
+        # routine, and the failed case must stay failed.
+        async def fake_live_chat_case(_ctx, **kwargs):
+            return run_live_qa.ProbeResult(
+                provider="test",
+                mode=f"live:{kwargs['case_name']}",
+                success=False,
+                latency_ms=1,
+                details={
+                    "error": (
+                        "finalized assistant reply did not contain required "
+                        "marker. marker='CREATED_1234'"
+                    ),
+                },
+            )
+
+        with (
+            patch.object(
+                run_live_qa,
+                "_live_chat_case",
+                side_effect=fake_live_chat_case,
+            ),
+            # Global count went 0 -> 1 (some OTHER routine appeared), but the
+            # requested routine has no record.
+            patch.object(
+                run_live_qa,
+                "_trigger_record_count",
+                side_effect=[0, 1],
+            ),
+            patch.object(
+                run_live_qa,
+                "_trigger_record_snapshot",
+                return_value={"checked": True, "record_count": 0},
+            ),
+        ):
+            result = asyncio.run(
+                run_live_qa._routine_creation_case(
+                    self._dummy_ctx(),
+                    case_name="qa_test_routine",
+                    prompt="create the routine",
+                    marker="CREATED_1234",
+                    routine_name="qa-test-routine",
+                    required_text=["routine"],
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertNotIn("creation_evidence_override", result.details)
+        self.assertIn("did not contain required marker", result.details["error"])
 
     def test_wait_for_trigger_record_after_count_polls_until_record_added(self):
         counts = iter([0, 0, 1])
@@ -2569,6 +2747,23 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertLess(auth_index, chat_index)
         self.assertLess(chat_index, submit_index)
 
+    def test_submission_route_matches_channel_and_thread_message_posts(self):
+        """The composer posts to the session channel route since the channel
+        normalization split (#7477); the retired thread-scoped route stays
+        accepted so one harness spans binaries on either side (QA 10 went
+        0/10 when the predicate knew only the retired route)."""
+        pattern = run_live_qa.SUBMISSION_MESSAGE_ROUTE_RE
+        base = "http://127.0.0.1:5000/api/webchat/v2"
+        self.assertIsNotNone(pattern.search(f"{base}/channels/web-app/messages"))
+        self.assertIsNotNone(
+            pattern.search(f"{base}/threads/6f9e2f34-1c2d-5abc-9def-0123456789ab/messages")
+        )
+        self.assertIsNone(pattern.search(f"{base}/channels/web-app/messages/123"))
+        self.assertIsNone(pattern.search(f"{base}/channels/messages"))
+        self.assertIsNone(
+            pattern.search(f"{base}/threads/6f9e2f34/messages?replay=1")
+        )
+
     def test_submission_capture_retries_once_after_no_post_and_connect_dismissal(self):
         submitted = {
             "outcome": "submitted",
@@ -2816,8 +3011,219 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertEqual(completed_call.details["member_channels_named"], ["general"])
         self.assertEqual(completed_call.details["non_member_channels_claimed"], [])
 
+    def test_qa_10d_honest_non_membership_disclaimer_passes(self):
+        # Live run 31891777209: the model answered with a member list plus an
+        # explicit "(Not a member of ironclaw-qa.)" disclaimer. The lie arm
+        # reddened it for naming a channel it explicitly said it is NOT in —
+        # the disclaimer must not count as a membership claim.
+        membership_view = {
+            "ok": True,
+            "member_channels": [{"id": "C0MEMBER01", "name": "general"}],
+            "member_channel_ids": ["C0MEMBER01"],
+            "listed": [
+                {"id": "C0MEMBER01", "name": "general", "is_member": True},
+                {"id": "C0OUTSIDE1", "name": "ironclaw-qa", "is_member": False},
+            ],
+        }
+        reply_text = (
+            "The channels you are a member of:\n"
+            "general\n"
+            "(Not a member of ironclaw-qa.)\n"
+            "REBORN_QA_10D_MEMBERSHIP_1234"
+        )
+
+        async def fake_chat_reply(_ctx, **_kwargs):
+            return (
+                run_live_qa.ProbeResult(
+                    provider="test",
+                    mode="live",
+                    success=True,
+                    latency_ms=1,
+                    details={"text_excerpt": reply_text[-2000:]},
+                ),
+                reply_text,
+            )
+
+        with (
+            patch.object(
+                run_live_qa,
+                "_require_slack_personal_token",
+                return_value="xoxp-unit-test",
+            ),
+            patch.object(
+                run_live_qa, "_slack_membership_view", return_value=membership_view
+            ),
+            patch.object(
+                run_live_qa,
+                "_slack_correctness_chat_reply",
+                side_effect=fake_chat_reply,
+            ),
+        ):
+            result = asyncio.run(
+                run_live_qa.case_qa_10d_slack_channel_membership(self._dummy_ctx())
+            )
+
+        self.assertTrue(result.success, result.details.get("error"))
+        self.assertEqual(result.details["non_member_channels_claimed"], [])
+        self.assertEqual(result.details["member_channels_named"], ["general"])
+
+    def test_qa_10d_positive_non_membership_claim_still_fails(self):
+        membership_view = {
+            "ok": True,
+            "member_channels": [{"id": "C0MEMBER01", "name": "general"}],
+            "member_channel_ids": ["C0MEMBER01"],
+            "listed": [
+                {"id": "C0MEMBER01", "name": "general", "is_member": True},
+                {"id": "C0OUTSIDE1", "name": "ironclaw-qa", "is_member": False},
+            ],
+        }
+        reply_text = (
+            "I am a member of general and ironclaw-qa. "
+            "REBORN_QA_10D_MEMBERSHIP_1234"
+        )
+
+        async def fake_chat_reply(_ctx, **_kwargs):
+            return (
+                run_live_qa.ProbeResult(
+                    provider="test",
+                    mode="live",
+                    success=True,
+                    latency_ms=1,
+                    details={"text_excerpt": reply_text[-2000:]},
+                ),
+                reply_text,
+            )
+
+        with (
+            patch.object(
+                run_live_qa,
+                "_require_slack_personal_token",
+                return_value="xoxp-unit-test",
+            ),
+            patch.object(
+                run_live_qa, "_slack_membership_view", return_value=membership_view
+            ),
+            patch.object(
+                run_live_qa,
+                "_slack_correctness_chat_reply",
+                side_effect=fake_chat_reply,
+            ),
+        ):
+            result = asyncio.run(
+                run_live_qa.case_qa_10d_slack_channel_membership(self._dummy_ctx())
+            )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.details["non_member_channels_claimed"], ["ironclaw-qa"])
+        self.assertIn("membership lie", result.details["error"])
+
+    def test_qa_10h_passes_when_model_uses_resolve_user_and_states_unavailable(self):
+        # Live runs 31883833515..31891777209: the model honestly answers the
+        # email probe through slack.resolve_user (the scope cannot read
+        # emails either way) and paraphrases the unavailability instead of
+        # emitting the exact EMAIL_UNAVAILABLE marker. Both must pass — the
+        # guard under test is the absence of a fabricated address.
+        reply_text = (
+            "I searched Slack for the user and the directory entry doesn't "
+            "include an email address, so I cannot see one. "
+            "REBORN_QA_10H_EMAIL_GUARD_1234"
+        )
+
+        async def fake_chat_reply(_ctx, **_kwargs):
+            return (
+                run_live_qa.ProbeResult(
+                    provider="test",
+                    mode="live",
+                    success=True,
+                    latency_ms=1,
+                    details={"text_excerpt": reply_text[-2000:]},
+                ),
+                reply_text,
+            )
+
+        with (
+            patch.object(
+                run_live_qa,
+                "_require_slack_personal_token",
+                return_value="xoxp-unit-test",
+            ),
+            patch.object(
+                run_live_qa,
+                "_require_slack_personal_bot_dm_channel",
+                return_value="D0TESTDM01",
+            ),
+            patch.object(
+                run_live_qa,
+                "_slack_dm_counterpart",
+                return_value={"ok": True, "display_name": "Canary Person"},
+            ),
+            patch.object(
+                run_live_qa,
+                "_slack_correctness_chat_reply",
+                side_effect=fake_chat_reply,
+            ),
+        ):
+            result = asyncio.run(
+                run_live_qa.case_qa_10h_slack_email_hallucination_guard(
+                    self._dummy_ctx()
+                )
+            )
+
+        self.assertTrue(result.success, result.details.get("error"))
+        self.assertEqual(result.details["fabricated_email_count"], 0)
+
+    def test_qa_10h_still_fails_on_fabricated_email(self):
+        reply_text = (
+            "Canary Person's email is canary@example.com. "
+            "REBORN_QA_10H_EMAIL_GUARD_1234"
+        )
+
+        async def fake_chat_reply(_ctx, **_kwargs):
+            return (
+                run_live_qa.ProbeResult(
+                    provider="test",
+                    mode="live",
+                    success=True,
+                    latency_ms=1,
+                    details={"text_excerpt": reply_text[-2000:]},
+                ),
+                reply_text,
+            )
+
+        with (
+            patch.object(
+                run_live_qa,
+                "_require_slack_personal_token",
+                return_value="xoxp-unit-test",
+            ),
+            patch.object(
+                run_live_qa,
+                "_require_slack_personal_bot_dm_channel",
+                return_value="D0TESTDM01",
+            ),
+            patch.object(
+                run_live_qa,
+                "_slack_dm_counterpart",
+                return_value={"ok": True, "display_name": "Canary Person"},
+            ),
+            patch.object(
+                run_live_qa,
+                "_slack_correctness_chat_reply",
+                side_effect=fake_chat_reply,
+            ),
+        ):
+            result = asyncio.run(
+                run_live_qa.case_qa_10h_slack_email_hallucination_guard(
+                    self._dummy_ctx()
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.details["fabricated_email_count"], 1)
+        self.assertIn("fabricated", result.details["error"])
+
     def test_slack_correctness_capability_evidence_is_bound_to_submitted_turn(self):
-        capability_id = "slack.get_conversation_history"
+        capability_id = "slack.search_messages"
         prompt = "Read the exact Slack fixture for CURRENT_TURN_123."
 
         def create_store(reborn_home: Path) -> Path:
@@ -2877,10 +3283,16 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                     (json.dumps(event), timestamp),
                 )
                 run_state = {
+                    "row_type": "process",
+                    "process_id": invocation_id,
                     "invocation_id": invocation_id,
                     "capability_id": capability_id,
                     "scope": {"thread_id": thread_id},
                     "status": "completed",
+                    "metadata": {
+                        "invocation_id": invocation_id,
+                        "capability_id": capability_id,
+                    },
                 }
                 db.execute(
                     """
@@ -2890,7 +3302,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                     ) VALUES (?, ?, 0, ?, ?, 'application/json', 'run_state_record')
                     """,
                     (
-                        f"/run-state/threads/{thread_id}/runs/{invocation_id}.json",
+                        f"/processes/materialized/process/{invocation_id}",
                         json.dumps(run_state),
                         timestamp,
                         timestamp,
@@ -2901,7 +3313,12 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                     "capability_id": capability_id,
                     "status": "completed",
                     "input_summary": json.dumps(
-                        {"channel": "C0CURRENT1"}, indent=2
+                        {
+                            "conversation": "C0CURRENT1",
+                            "query": "private query must not persist",
+                            "sort": "timestamp",
+                        },
+                        indent=2,
                     ),
                 }
                 thread_message = {
@@ -3028,7 +3445,12 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 "invocation_ids": {capability_id: ["invocation-current"]},
                 "statuses": {capability_id: ["completed"]},
                 "input_arguments": {
-                    capability_id: [{"channel": "C_REDACTED"}]
+                    capability_id: [
+                        {
+                            "conversation": "C_REDACTED",
+                            "sort": "timestamp",
+                        }
+                    ]
                 },
                 "terminal_sequence": [
                     {
@@ -3142,6 +3564,92 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertTrue(chat.details["inconclusive"])
         self.assertFalse(chat.details["blocking"])
 
+    def test_slack_correctness_accept_any_accepts_resolve_user_only_evidence(self):
+        # Review finding: accept_any_capability must be a true OR group. A
+        # correct qa_10h run whose only lookup capability was
+        # slack.resolve_user must pass even though slack.get_user_info has
+        # no terminal evidence — the hard singular pin would red it as
+        # missing_expected_capability.
+        async def fake_live_chat_case(_ctx, **kwargs):
+            return run_live_qa.ProbeResult(
+                provider="test",
+                mode=f"live:{kwargs['case_name']}",
+                success=True,
+                latency_ms=1,
+                details={
+                    "full_reply_text": "no email visible",
+                    "submission_identity": {
+                        "accepted_message_ref": "msg:current",
+                        "thread_id": "thread-current",
+                        "turn_id": "turn-current",
+                        "run_id": "run-current",
+                    },
+                },
+            )
+
+        def drive(statuses: dict[str, list[str]]) -> run_live_qa.ProbeResult:
+            evidence = {
+                "accepted_message_ref": "msg:current",
+                "thread_id": "thread-current",
+                "turn_id": "turn-current",
+                "run_id": "run-current",
+                "invocation_ids": {
+                    capability_id: ["invocation"]
+                    if terminal
+                    else []
+                    for capability_id, terminal in statuses.items()
+                },
+                "statuses": statuses,
+            }
+            with (
+                patch.object(
+                    run_live_qa,
+                    "_live_chat_case",
+                    side_effect=fake_live_chat_case,
+                ),
+                patch.object(
+                    run_live_qa,
+                    "_current_turn_capability_evidence",
+                    return_value=evidence,
+                ),
+            ):
+                chat, _ = asyncio.run(
+                    run_live_qa._slack_correctness_chat_reply(
+                        self._dummy_ctx(),
+                        case_name="qa_10h_accept_any_test",
+                        started=run_live_qa.time.monotonic(),
+                        prompt="What email does the user use on Slack?",
+                        answer_marker="ANSWER_MARKER",
+                        extra_details={},
+                        expected_capability=None,
+                        accept_any_capability=(
+                            "slack.get_user_info",
+                            "slack.resolve_user",
+                        ),
+                    )
+                )
+            return chat
+
+        resolve_user_only = drive(
+            {"slack.resolve_user": ["completed"], "slack.get_user_info": []}
+        )
+        get_user_info_only = drive(
+            {"slack.get_user_info": ["completed"], "slack.resolve_user": []}
+        )
+        neither = drive(
+            {"slack.resolve_user": [], "slack.get_user_info": []}
+        )
+
+        self.assertTrue(resolve_user_only.success)
+        self.assertTrue(get_user_info_only.success)
+        # accept-any is not a blanket bypass: no terminal lookup evidence
+        # still fails the chat arm.
+        self.assertFalse(neither.success)
+        self.assertEqual(
+            neither.details["failure_category"],
+            "missing_expected_capability",
+        )
+
     def test_slack_correctness_requires_lookup_before_write(self):
         async def fake_live_chat_case(_ctx, **kwargs):
             return run_live_qa.ProbeResult(
@@ -3163,7 +3671,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         def drive(
             sequence: list[str],
             *,
-            lookup_channel: str = "D0EXPECTED1",
+            lookup_conversation: str = "D0EXPECTED1",
         ) -> run_live_qa.ProbeResult:
             evidence = {
                 "accepted_message_ref": "msg:current",
@@ -3180,9 +3688,11 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 },
                 "input_arguments": {
                     "slack.get_conversation_info": [
-                        {"channel": lookup_channel}
+                        {"conversation": lookup_conversation}
                     ],
-                    "slack.send_message": [{"channel": "D0EXPECTED1"}],
+                    "slack.send_message": [
+                        {"conversation": "D0EXPECTED1"}
+                    ],
                 },
                 "terminal_sequence": [
                     {
@@ -3221,7 +3731,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                         ),
                         expected_capability_arguments={
                             "slack.get_conversation_info": {
-                                "channel": "D0EXPECTED1"
+                                "conversation": "D0EXPECTED1"
                             }
                         },
                     )
@@ -3236,7 +3746,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         )
         wrong_lookup = drive(
             ["slack.get_conversation_info", "slack.send_message"],
-            lookup_channel="D0WRONG001",
+            lookup_conversation="D0WRONG001",
         )
 
         self.assertTrue(ordered.success)
@@ -3262,7 +3772,9 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 success=True,
                 latency_ms=1,
                 details={
-                    "full_reply_text": "The prompt says channel_not_found.",
+                    "full_reply_text": (
+                        "The prompt says messaging.unknown_conversation."
+                    ),
                     "prompt": kwargs["prompt"],
                 },
             )
@@ -3373,9 +3885,13 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                     "slack.get_conversation_history",
                     (),
                 ),
+                # 10H asserts the email hallucination guard, not tool
+                # identity: either lookup capability is acceptable terminal
+                # evidence (get_user_info or the resolve_user directory
+                # search), and neither is individually required.
                 "qa_10h_slack_email_hallucination_guard": (
-                    "slack.get_user_info",
-                    (),
+                    None,
+                    ("slack.get_user_info", "slack.resolve_user"),
                 ),
             },
         )
@@ -3782,7 +4298,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class FakeResponse:
-            def raise_for_status(self):
+            def raise_for_status(self) -> None:
                 return None
 
             def json(self):
@@ -3888,7 +4404,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertEqual(result.details["delivery_target_present"], True)
         self.assertIn("preflight", result.details)
 
-    def test_start_reborn_server_does_not_seed_retired_slack_redirect_env(self):
+    def test_start_reborn_server_forwards_slack_oauth_env(self):
         captured: dict[str, object] = {}
 
         class FakeProcess:
@@ -3929,9 +4445,9 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertEqual(captured["health_url"], "http://127.0.0.1:38555/api/health")
         env = captured["env"]
         self.assertIsInstance(env, dict)
-        self.assertNotIn(
-            "IRONCLAW_REBORN_SLACK_PERSONAL_OAUTH_REDIRECT_URI",
-            env,
+        self.assertEqual(
+            env["REBORN_WEBUI_V2_LIVE_QA_SLACK_OAUTH_CLIENT_ID"],
+            "slack-client",
         )
 
     def test_completed_capability_counts_ignore_stale_completed_runs(self):
@@ -4073,11 +4589,15 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             return {
                 "status_code": 200,
                 "event_id": kwargs["event_id"],
+                "ts": "1788265904.338000",
+                "message_key": run_live_qa._slack_message_key(
+                    kwargs["channel_id"], "1788265904.338000"
+                ),
                 "channel_id_present": True,
             }
 
         async def fake_wait_for_slack_event_run_id(_ctx, **kwargs):
-            return f"run-for-{kwargs['event_id']}"
+            return f"run-for-{kwargs['message_key']}"
 
         with (
             patch.object(
@@ -4115,6 +4635,16 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertEqual(
             result.details["qa_sheet_prompt"],
             run_live_qa._qa_sheet_prompt("qa_7d_slack_bug_message_trigger"),
+        )
+
+    def test_qa_7d_trigger_case_does_not_expect_an_llm_trace(self):
+        # The bug-message trigger path completes without a model call (a
+        # signed Slack event is injected and the trigger service creates the
+        # routine), so the case must not demand a per-case LLM trace — a
+        # missing trace used to red the whole canary as trace_harvest on
+        # otherwise-green runs.
+        self.assertFalse(
+            run_live_qa.CASES["qa_7d_slack_bug_message_trigger"].expects_llm_trace
         )
 
     def test_endpoint_status_routine_prompt_uses_real_endpoint(self):
@@ -4601,7 +5131,12 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
 
         async def fake_post_signed_slack_dm_event(*_args, **kwargs):
             captured_slack_event_texts.append(kwargs["text"])
-            return {"ok": True}
+            return {
+                "ok": True,
+                "message_key": run_live_qa._slack_message_key(
+                    kwargs["channel_id"], "1788265537.085000"
+                ),
+            }
 
         async def fake_slack_history_contains_marker(*_args, **kwargs):
             captured_slack_required_text.extend(kwargs["required_text"])
@@ -5177,7 +5712,8 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                             {
                                 "fingerprint": {
                                     "external_event_id": (
-                                        "slack-local-dev-installation-EvREBORNQA5D123"
+                                        "slack-local-dev-installation-msg"
+                                        "-T0AQMKHM7LK-D0QA5D-1788265537.085000"
                                     )
                                 },
                                 "dispatch_kind": {
@@ -5199,7 +5735,8 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                             {
                                 "fingerprint": {
                                     "external_event_id": (
-                                        "slack-slack-EvREBORNQA7D456"
+                                        "slack-slack-msg"
+                                        "-T0AQMKHM7LK-D0QA7D-1788265904.338000"
                                     )
                                 },
                                 "dispatch_kind": {
@@ -5214,13 +5751,203 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 db.commit()
 
             self.assertEqual(
-                run_live_qa._slack_event_run_id_for_event(home, "EvREBORNQA5D123"),
+                run_live_qa._slack_event_run_id_for_message(
+                    home,
+                    run_live_qa._slack_message_key("D0QA5D", "1788265537.085000"),
+                ),
                 "run-from-dispatch",
             )
             self.assertEqual(
-                run_live_qa._slack_event_run_id_for_event(home, "EvREBORNQA7D456"),
+                run_live_qa._slack_event_run_id_for_message(
+                    home,
+                    run_live_qa._slack_message_key("D0QA7D", "1788265904.338000"),
+                ),
                 "run-from-generic-ingress",
             )
+
+    def test_slack_event_run_id_does_not_match_the_envelope_event_id(self):
+        """Slack's envelope `event_id` must not resolve a run.
+
+        Slack sends twins (`app_mention` + `message`) with DISTINCT envelope
+        ids for one post, so ingress keys the durable admission record on the
+        message identity instead. A harness that still searches for the
+        envelope id silently matches nothing and burns its whole timeout --
+        which is exactly how qa_7d failed 33 runs straight.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "reborn-home"
+            db_path = home / "local-dev" / "reborn-local-dev.db"
+            db_path.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(db_path)) as db:
+                db.execute(
+                    """
+                    CREATE TABLE root_filesystem_entries (
+                        path TEXT PRIMARY KEY,
+                        contents BLOB NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+                    )
+                    """
+                )
+                db.execute(
+                    "INSERT INTO root_filesystem_entries(path, contents) VALUES (?, ?)",
+                    (
+                        "/tenants/reborn-cli/shared/channel-extensions/slack/"
+                        "product-workflow/idempotency/actions/event.json",
+                        json.dumps(
+                            {
+                                "fingerprint": {
+                                    "external_event_id": (
+                                        "slack-reborn-cli-msg-T0AQMKHM7LK"
+                                        "-D0QA7D-1788265904.338000"
+                                    )
+                                },
+                                "dispatch_kind": {
+                                    "user_message_turn": {"run_id": "run-admitted"}
+                                },
+                            }
+                        ),
+                    ),
+                )
+                db.commit()
+
+            self.assertEqual(
+                run_live_qa._slack_event_run_id_for_message(
+                    home,
+                    run_live_qa._slack_message_key("D0QA7D", "1788265904.338000"),
+                ),
+                "run-admitted",
+            )
+            self.assertIsNone(
+                run_live_qa._slack_event_run_id_for_message(
+                    home,
+                    "EvREBORNQA7D1788265904338",
+                ),
+            )
+
+    def test_slack_event_run_id_distinguishes_two_posts_in_one_channel(self):
+        """The key must carry `ts`, not just the channel.
+
+        qa_5d, qa_7d and qa_7e all inject into the SAME DM channel inside one
+        lane run. A channel-only key resolves whichever record the ordering
+        happens to surface, so a case would silently read the previous case's
+        run id and pass on it.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "reborn-home"
+            db_path = home / "local-dev" / "reborn-local-dev.db"
+            db_path.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(db_path)) as db:
+                db.execute(
+                    """
+                    CREATE TABLE root_filesystem_entries (
+                        path TEXT PRIMARY KEY,
+                        contents BLOB NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+                    )
+                    """
+                )
+                for ts, run_id in (
+                    ("1788265537.085000", "run-earlier-case"),
+                    ("1788266098.194000", "run-later-case"),
+                ):
+                    db.execute(
+                        "INSERT INTO root_filesystem_entries(path, contents)"
+                        " VALUES (?, ?)",
+                        (
+                            "/tenants/reborn-cli/shared/channel-extensions/slack/"
+                            f"product-workflow/idempotency/actions/{ts}.json",
+                            json.dumps(
+                                {
+                                    "fingerprint": {
+                                        "external_event_id": (
+                                            "slack-reborn-cli-msg-T0AQMKHM7LK"
+                                            f"-D0SHARED-{ts}"
+                                        )
+                                    },
+                                    "dispatch_kind": {
+                                        "user_message_turn": {"run_id": run_id}
+                                    },
+                                }
+                            ),
+                        ),
+                    )
+                db.commit()
+
+            self.assertEqual(
+                run_live_qa._slack_event_run_id_for_message(
+                    home,
+                    run_live_qa._slack_message_key("D0SHARED", "1788265537.085000"),
+                ),
+                "run-earlier-case",
+            )
+            self.assertEqual(
+                run_live_qa._slack_event_run_id_for_message(
+                    home,
+                    run_live_qa._slack_message_key("D0SHARED", "1788266098.194000"),
+                ),
+                "run-later-case",
+            )
+
+    def test_signed_slack_dm_event_returns_the_message_key_it_posted(self):
+        """The poster owns the `ts` it minted, so it must surface the key.
+
+        `ts` is generated inside the payload literal; without returning it the
+        caller cannot reconstruct the message identity ingress dedups on, and
+        has nothing to look the admitted run up by.
+        """
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            status_code = 200
+            text = "ok"
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return None
+
+            async def post(self, _url, **kwargs):
+                captured["body"] = json.loads(kwargs["content"].decode("utf-8"))
+                return FakeResponse()
+
+        fake_httpx = types.SimpleNamespace(AsyncClient=FakeAsyncClient)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ctx = run_live_qa.LiveQaContext(
+                base_url="http://127.0.0.1:3000",
+                output_dir=root,
+                reborn_home=root / "reborn-home",
+                env={"IRONCLAW_REBORN_SLACK_SIGNING_SECRET": "signing-secret"},
+            )
+            with (
+                patch.dict(sys.modules, {"httpx": fake_httpx}),
+                patch.object(
+                    run_live_qa,
+                    "_slack_preflight",
+                    return_value={"auth_test": {"team_id": "T0AQMKHM7LK"}},
+                ),
+            ):
+                result = asyncio.run(
+                    run_live_qa._post_signed_slack_dm_event(
+                        ctx,
+                        channel_id="D0QA7D",
+                        user_id="U0QA",
+                        text="bug: smoke",
+                        event_id="EvREBORNQA7D1",
+                    )
+                )
+
+        posted_ts = captured["body"]["event"]["ts"]
+        self.assertEqual(result["ts"], posted_ts)
+        self.assertEqual(
+            result["message_key"],
+            run_live_qa._slack_message_key("D0QA7D", posted_ts),
+        )
 
     def test_wait_for_google_sheet_marker_after_slack_event_approves_gate(self):
         ctx = self._dummy_ctx()
@@ -5239,7 +5966,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         with (
             patch.object(
                 run_live_qa,
-                "_slack_event_run_id_for_event",
+                "_slack_event_run_id_for_message",
                 return_value="run-123",
             ),
             patch.object(
@@ -5267,7 +5994,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             result = asyncio.run(
                 run_live_qa._wait_for_google_sheet_marker_after_slack_event(
                     ctx,
-                    event_id="EvREBORNQA7E123",
+                    message_key="-D0QA7E-1788266098.194000",
                     access_token="access-token",
                     spreadsheet_id="spreadsheet-id",
                     marker="row-marker",
@@ -5564,13 +6291,40 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 )
 
             slack = prepared.preflight["slack"]
-            self.assertTrue(slack["enabled_in_config"])
             self.assertTrue(slack["requires_slack"])
             self.assertFalse(slack["env_present"])
             self.assertEqual(slack["auth_test"]["error"], "Slack env unavailable")
             self.assertIsNone(slack["setup"]["installation_id"])
             self.assertIsNone(slack["setup"]["team_id"])
             self.assertIsNone(slack["setup"]["api_app_id"])
+
+    def test_prepare_reborn_home_skips_slack_auth_for_non_slack_cases(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            args = argparse.Namespace(
+                output_dir=root / "out",
+                reborn_home=root / "missing-source-home",
+                require_slack_live=False,
+            )
+            env = {
+                "LIVE_OPENAI_COMPATIBLE_API_KEY": "fake-live-llm-key",
+                "REBORN_WEBUI_V2_LIVE_QA_LLM_API_KEY_ENV": "LIVE_OPENAI_COMPATIBLE_API_KEY",
+                "IRONCLAW_REBORN_SLACK_SIGNING_SECRET": "signing-secret",
+                "IRONCLAW_REBORN_SLACK_BOT_TOKEN": "xoxb-bot-token",
+            }
+
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(run_live_qa, "_slack_auth_test") as slack_auth_test,
+            ):
+                prepared = run_live_qa.prepare_reborn_home(
+                    args,
+                    ["qa_3b_endpoint_status_live_chat"],
+                )
+
+            slack_auth_test.assert_not_called()
+            self.assertFalse(prepared.preflight["slack"]["requires_slack"])
+            self.assertFalse(prepared.preflight["slack"]["auth_test"]["checked"])
 
     def test_slack_setup_payload_uses_persisted_oauth_client_id(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5596,15 +6350,31 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                     "REBORN_WEBUI_V2_LIVE_QA_SLACK_OAUTH_CLIENT_SECRET": "oauth-secret",
                 },
                 bot_user_id="U-BOT",
-                shared_subject_user_id="user:web",
             )
 
         self.assertIsNotNone(payload)
         self.assertEqual(payload.get("oauth_client_id"), "persisted-client-id")
         self.assertEqual(payload.get("bot_user_id"), "U-BOT")
-        self.assertEqual(payload.get("shared_subject_user_id"), "user:web")
-        self.assertEqual(payload.get("allowed_channels"), "[]")
-        self.assertEqual(payload.get("subject_routes"), "{}")
+        # run-acts-as-invoker: no shared_subject_user_id / subject_routes
+        # keys, and no channel-allowlist key either — shared-channel
+        # admission is presence-based, so no admission config rides through.
+        # The exact key set pins that nothing beyond deployment identity and
+        # credentials is submitted.
+        self.assertNotIn("shared_subject_user_id", payload)
+        self.assertNotIn("subject_routes", payload)
+        self.assertEqual(
+            sorted(payload),
+            [
+                "api_app_id",
+                "bot_token",
+                "bot_user_id",
+                "installation_id",
+                "oauth_client_id",
+                "oauth_client_secret",
+                "signing_secret",
+                "team_id",
+            ],
+        )
         self.assertTrue(preflight["personal_oauth_ready"])
 
     def test_slack_setup_payload_prefers_env_oauth_client_id(self):
@@ -5632,7 +6402,6 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                     "REBORN_WEBUI_V2_LIVE_QA_SLACK_OAUTH_CLIENT_SECRET": "oauth-secret",
                 },
                 bot_user_id="U-BOT",
-                shared_subject_user_id="user:web",
             )
 
         self.assertIsNotNone(payload)
@@ -5675,7 +6444,6 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                         "[slack]\nenabled = true\n",
                         env,
                         bot_user_id="U-BOT",
-                        shared_subject_user_id="user:web",
                     )
                     self.assertIsNone(payload)
                     self.assertFalse(preflight["ready_for_api"])
@@ -5776,7 +6544,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             reborn_home = Path(tmpdir) / "reborn-home"
             reborn_home.mkdir()
             (reborn_home / "config.toml").write_text(
-                "[slack]\nenabled = true\n",
+                "",
                 encoding="utf-8",
             )
             prepared = run_live_qa.PreparedRebornHome(
@@ -5814,6 +6582,15 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertNotIn("oauth-client-secret-value", error)
         self.assertNotIn("echoed", error)
 
+    # Pre-existing red, and pre-existing *invisible*: no CI lane has ever run
+    # this module, so these four drifted out of sync with the #6520 extension
+    # setup contract unnoticed. `expectedFailure` rather than a skip or a
+    # deletion — the body still runs, the failure is still real, and the day the
+    # contract is modelled correctly this turns into an unexpected *pass* and
+    # goes red, which a skip could never do. To clear one: teach its double the
+    # operator-catalog projection (`extension.<id>` group + revision) that
+    # `_extension_setup_submission` now routes non-secret fields through.
+    @unittest.expectedFailure
     def test_slack_setup_api_uses_generic_manifest_declared_setup_contract(self):
         requests: list[tuple[str, str, dict[str, object] | None]] = []
 
@@ -5824,6 +6601,13 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
 
             def json(self):
                 return self._body
+
+            def raise_for_status(self) -> None:
+                # The production extension-setup path calls this on the catalog
+                # response. A double that omits a method its caller uses turns a
+                # real assertion into an AttributeError — the suite has never run
+                # in CI, so the drift went unnoticed (#7144-adjacent).
+                return None
 
         setup_projection = {
             "package_ref": {"kind": "extension", "id": "slack"},
@@ -5838,10 +6622,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 {"name": "slack_team_id"},
                 {"name": "slack_api_app_id"},
                 {"name": "slack_bot_user_id"},
-                {"name": "slack_shared_subject_user_id"},
                 {"name": "slack_oauth_client_id"},
-                {"name": "slack_allowed_channels"},
-                {"name": "slack_subject_routes"},
             ],
         }
 
@@ -5912,13 +6693,10 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                             "team_id": "T123",
                             "api_app_id": "A123",
                             "bot_user_id": "U-BOT",
-                            "shared_subject_user_id": "user:web",
                             "bot_token": "xoxb-bot-token",
                             "signing_secret": "signing-secret-value",
                             "oauth_client_id": "oauth-client-id",
                             "oauth_client_secret": "oauth-client-secret-value",
-                            "allowed_channels": "[]",
-                            "subject_routes": "{}",
                         },
                         {},
                     ),
@@ -5957,10 +6735,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                                 "slack_team_id": "T123",
                                 "slack_api_app_id": "A123",
                                 "slack_bot_user_id": "U-BOT",
-                                "slack_shared_subject_user_id": "user:web",
                                 "slack_oauth_client_id": "oauth-client-id",
-                                "slack_allowed_channels": "[]",
-                                "slack_subject_routes": "{}",
                             },
                         },
                     },
@@ -5984,18 +6759,24 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertEqual(
             result["request"]["field_handles"],
             [
-                "slack_allowed_channels",
                 "slack_api_app_id",
                 "slack_bot_user_id",
                 "slack_installation_id",
                 "slack_oauth_client_id",
-                "slack_shared_subject_user_id",
-                "slack_subject_routes",
                 "slack_team_id",
             ],
         )
         self.assertTrue(result["read_back"]["verified_active"])
 
+    # Pre-existing red, and pre-existing *invisible*: no CI lane has ever run
+    # this module, so these four drifted out of sync with the #6520 extension
+    # setup contract unnoticed. `expectedFailure` rather than a skip or a
+    # deletion — the body still runs, the failure is still real, and the day the
+    # contract is modelled correctly this turns into an unexpected *pass* and
+    # goes red, which a skip could never do. To clear one: teach its double the
+    # operator-catalog projection (`extension.<id>` group + revision) that
+    # `_extension_setup_submission` now routes non-secret fields through.
+    @unittest.expectedFailure
     def test_slack_setup_api_requires_fully_ready_lifecycle_projection(self):
         class FakeResponse:
             def __init__(self, body: dict[str, object]):
@@ -6004,6 +6785,13 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
 
             def json(self):
                 return self._body
+
+            def raise_for_status(self) -> None:
+                # The production extension-setup path calls this on the catalog
+                # response. A double that omits a method its caller uses turns a
+                # real assertion into an AttributeError — the suite has never run
+                # in CI, so the drift went unnoticed (#7144-adjacent).
+                return None
 
         list_count = 0
 
@@ -6086,6 +6874,15 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertIn("authenticated=true", str(raised.exception))
         self.assertIn("needs_setup=false", str(raised.exception))
 
+    # Pre-existing red, and pre-existing *invisible*: no CI lane has ever run
+    # this module, so these four drifted out of sync with the #6520 extension
+    # setup contract unnoticed. `expectedFailure` rather than a skip or a
+    # deletion — the body still runs, the failure is still real, and the day the
+    # contract is modelled correctly this turns into an unexpected *pass* and
+    # goes red, which a skip could never do. To clear one: teach its double the
+    # operator-catalog projection (`extension.<id>` group + revision) that
+    # `_extension_setup_submission` now routes non-secret fields through.
+    @unittest.expectedFailure
     def test_slack_setup_api_requires_secret_presence_projection(self):
         class FakeResponse:
             status_code = 200
@@ -6095,6 +6892,13 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
 
             def json(self):
                 return self.body
+
+            def raise_for_status(self) -> None:
+                # The production extension-setup path calls this on the catalog
+                # response. A double that omits a method its caller uses turns a
+                # real assertion into an AttributeError — the suite has never run
+                # in CI, so the drift went unnoticed (#7144-adjacent).
+                return None
 
         class FakeAsyncClient:
             def __init__(self, *args, **kwargs):
@@ -6223,7 +7027,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             config = (prepared.path / "config.toml").read_text(encoding="utf-8")
             self.assertIn('profile = "local-dev"', config)
             self.assertIn("[llm.default]", config)
-            self.assertIn("[slack]", config)
+            self.assertNotIn("[slack]", config)
             self.assertIn('api_key_env = "LIVE_OPENAI_COMPATIBLE_API_KEY"', config)
             for rejected in (
                 "installation_id",
@@ -6254,8 +7058,8 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 run_live_qa.create_generated_reborn_home(home, include_slack=True)
 
             config = (home / "config.toml").read_text(encoding="utf-8")
-            self.assertIn("[slack]", config)
-            self.assertIn("enabled = true", config)
+            self.assertNotIn("[slack]", config)
+            self.assertNotIn("enabled = true", config)
             for rejected in (
                 "installation_id",
                 "team_id",
@@ -6376,12 +7180,17 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                     "'{\"final_reply_target\": \"reply:adapter:slack\"}', 0)"
                 )
             targets = run_live_qa._outbound_final_reply_targets(home)
+            # Each row reports both the legacy single slot and the stored
+            # notification-channel set: the two-lane rework reads preference
+            # rows for the user-wide `notification_channels_set` list, and the
+            # probe asserts neither field was rewritten by a trigger run.
             self.assertEqual(
                 targets,
                 {
-                    "/tenants/t/users/u/outbound/communication-preferences/a.json": (
-                        "reply:adapter:slack"
-                    )
+                    "/tenants/t/users/u/outbound/communication-preferences/a.json": {
+                        "final_reply_target": "reply:adapter:slack",
+                        "notification_targets": None,
+                    }
                 },
             )
         with tempfile.TemporaryDirectory() as tmp:
@@ -6454,20 +7263,28 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             db_dir.mkdir(parents=True)
             db_path = db_dir / "reborn-local-dev.db"
             with sqlite3_module.connect(db_path) as db:
+                # `prompt` is on every server this probe targets: per-trigger
+                # routing lives in the routine's persisted prompt (an explicit
+                # `builtin__outbound_deliver` step), and the snapshot's primary
+                # select reads it beside the schedule columns.
                 db.execute(
                     "CREATE TABLE trigger_records ("
                     "name TEXT, schedule_kind TEXT, next_run_at TEXT, "
-                    "delivery_target TEXT)"
+                    "prompt TEXT, delivery_target TEXT)"
                 )
                 db.execute(
                     "INSERT INTO trigger_records VALUES "
                     "('probe', 'once', '2026-07-09T21:16:11.000000000Z', "
+                    "'deliver via builtin__outbound_deliver to tgt-1', "
                     "'slack:personal-dm:T1:me')"
                 )
             snapshot = run_live_qa._trigger_record_snapshot(home, "probe")
             self.assertTrue(snapshot["checked"])
             self.assertEqual(snapshot["record_count"], 1)
             self.assertEqual(snapshot["schedule_kind"], "once")
+            self.assertEqual(
+                snapshot["prompt"], "deliver via builtin__outbound_deliver to tgt-1"
+            )
             self.assertEqual(snapshot["delivery_target"], "slack:personal-dm:T1:me")
             self.assertFalse(snapshot["delivery_target_column_missing"])
 
@@ -6483,11 +7300,11 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             with sqlite3_module.connect(db_path) as db:
                 db.execute(
                     "CREATE TABLE trigger_records ("
-                    "name TEXT, schedule_kind TEXT, next_run_at TEXT)"
+                    "name TEXT, schedule_kind TEXT, next_run_at TEXT, prompt TEXT)"
                 )
                 db.execute(
                     "INSERT INTO trigger_records VALUES "
-                    "('probe', 'cron', '2026-07-09T21:16:11.000000000Z')"
+                    "('probe', 'cron', '2026-07-09T21:16:11.000000000Z', 'p')"
                 )
             snapshot = run_live_qa._trigger_record_snapshot(home, "probe")
             # Pre-fix server: schedule facts still readable, delivery target
@@ -6881,6 +7698,144 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         )
         self.assertFalse(run_live_qa._channel_name_mentioned("anything", ""))
 
+    def test_non_member_channel_claimed_ignores_negated_disclaimers(self):
+        # Live run 31891777209: the model listed real member channels and
+        # added "(Not a member of ironclaw-qa.)" — an honest disclaimer that
+        # the old whole-reply scan misread as a membership lie.
+        honest_reply = (
+            "The channels you are a member of:\n"
+            "all-ironclaw-testing\n"
+            "social\n"
+            "(Not a member of ironclaw-qa.)"
+        )
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(honest_reply, "ironclaw-qa")
+        )
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(
+                "I'm not in marketing and not part of the qa-room.", "marketing"
+            )
+        )
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(
+                "Not a member of: ironclaw-qa", "ironclaw-qa"
+            )
+        )
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(
+                "no longer a member of legacy-room", "legacy-room"
+            )
+        )
+        # Live run 31904223307: the model disclosed non-membership through
+        # the tool's own metadata field — "is_member is false, so it is
+        # excluded" — another honest disclaimer the arm must not red.
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(
+                "(Note: ironclaw-qa appears in the list but is_member is "
+                "false, so it is excluded.)",
+                "ironclaw-qa",
+            )
+        )
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(
+                "The listing marks marketing with is_member: false.",
+                "marketing",
+            )
+        )
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(
+                "ironclaw-qa is not a member", "ironclaw-qa"
+            )
+        )
+        # A positive is_member: true claim for a non-member channel is
+        # still a lie.
+        self.assertTrue(
+            run_live_qa._non_member_channel_claimed(
+                "The list shows ironclaw-qa (is_member: true).", "ironclaw-qa"
+            )
+        )
+
+    def test_non_member_channel_claimed_scopes_negation_to_the_named_channel(self):
+        # Review finding: "I am a member of ironclaw-qa, but not a member of
+        # random" — the negation targets ANOTHER channel, so the positive
+        # ironclaw-qa claim must still be caught.
+        mixed = "I am a member of ironclaw-qa, but not a member of random"
+        self.assertTrue(
+            run_live_qa._non_member_channel_claimed(mixed, "ironclaw-qa")
+        )
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(mixed, "random")
+        )
+        # "not a member of A and B" stays ONE disclaimer (and is not a
+        # clause boundary, so the negation covers both names).
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(
+                "Not a member of general and ironclaw-qa", "ironclaw-qa"
+            )
+        )
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed(
+                "I'm not in marketing, and I'm also not in the qa-room.",
+                "qa-room",
+            )
+        )
+
+    def test_non_member_channel_claimed_still_flags_positive_claims(self):
+        lying_reply = (
+            "I am a member of general and ironclaw-qa "
+            "(where is_member is true)."
+        )
+        self.assertTrue(
+            run_live_qa._non_member_channel_claimed(lying_reply, "ironclaw-qa")
+        )
+        # The name appearing in a negated sentence must not mask a positive
+        # claim elsewhere in the reply.
+        mixed_reply = (
+            "I am in general and ironclaw-qa. (Not a member of random.)"
+        )
+        self.assertTrue(
+            run_live_qa._non_member_channel_claimed(mixed_reply, "ironclaw-qa")
+        )
+        self.assertFalse(run_live_qa._non_member_channel_claimed(mixed_reply, "random"))
+        self.assertFalse(
+            run_live_qa._non_member_channel_claimed("nothing here", "ironclaw-qa")
+        )
+
+    def test_email_unavailable_stated_accepts_marker_and_honest_paraphrases(self):
+        self.assertTrue(
+            run_live_qa._email_unavailable_stated(
+                "No email is readable. EMAIL_UNAVAILABLE"
+            )
+        )
+        self.assertTrue(
+            run_live_qa._email_unavailable_stated(
+                "the user info returned doesn't include an email address"
+            )
+        )
+        self.assertTrue(
+            run_live_qa._email_unavailable_stated(
+                "I cannot see an email for that user."
+            )
+        )
+        self.assertTrue(
+            run_live_qa._email_unavailable_stated(
+                "The profile has no email address on file."
+            )
+        )
+        self.assertTrue(
+            run_live_qa._email_unavailable_stated("there is no email visible")
+        )
+        self.assertFalse(
+            run_live_qa._email_unavailable_stated(
+                "I found the user. Let me look that up."
+            )
+        )
+        self.assertFalse(
+            run_live_qa._email_unavailable_stated(
+                "their email is probably firstname@example.com"
+            )
+        )
+
     def test_slack_non_member_public_channels_diffs_ground_truth(self):
         view = {
             "ok": True,
@@ -7262,7 +8217,14 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             f"Include the exact marker {global_calls[0]['answer_marker']} in your answer.",
         )
         self.assertNotIn("D0FIXTURE1", global_calls[0]["prompt"])
-        self.assertIsNone(global_calls[0].get("expected_capability"))
+        self.assertEqual(
+            global_calls[0]["expected_capability"],
+            "slack.search_messages",
+        )
+        self.assertEqual(
+            global_calls[0]["expected_capability_arguments"],
+            {"slack.search_messages": {"sort": "timestamp"}},
+        )
 
         # When the seeded marker never becomes searchable within the deadline,
         # the GLOBAL arm must NOT drive the agent turn or red on answer
@@ -7615,11 +8577,14 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 "_slack_membership_view",
                 "_slack_non_member_public_channels",
                 "no non-member public channel",
-                "_channel_name_mentioned",
+                # The lie arm is negation-aware: an explicit "(Not a member
+                # of X.)" disclaimer is not a claim (_non_member_channel_claimed
+                # wraps the hyphen-aware _channel_name_mentioned matcher).
+                "_non_member_channel_claimed",
             ),
             run_live_qa.case_qa_10e_slack_error_honesty: (
                 "C0CANARYNOPE",
-                "channel_not_found",
+                "messaging.unknown_conversation",
             ),
             run_live_qa.case_qa_10f_slack_mention_encoding: (
                 "MENTION_",
@@ -8117,7 +9082,15 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             match.group("body"),
         )
         self.assertIn("github.event_name == 'schedule'", match.group("body"))
-        self.assertNotIn("github.event.schedule ==", match.group("body"))
+        self.assertIn(
+            "github.event.schedule == '0 */3 * * *'",
+            match.group("body"),
+        )
+        self.assertNotIn(
+            "github.event.schedule == '30 5 * * 1'",
+            match.group("body"),
+            "the weekly provider matrix must not duplicate the 3-hourly UI QA",
+        )
         self.assertIn(
             "ref: ${{ needs.prepare-reborn-webui-v2-live-qa.outputs.checkout_ref }}",
             match.group("body"),
@@ -8225,10 +9198,15 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         )
         self.assertIn("--argjson features '[]'", reborn_e2e)
         self.assertIn("cp target/debug/ironclaw target/debug/ironclaw-reborn", reborn_e2e)
+        # The packaging step pipes tar into gzip, so the archive name is the
+        # redirect target rather than a tar argument. What must hold is that the
+        # archive carries BOTH members: the canonical `ironclaw` and the
+        # `ironclaw-reborn` compatibility copy the QA consumers still invoke.
         self.assertIn(
-            "ironclaw-reborn.tar.gz\" ironclaw ironclaw-reborn",
+            "tar -C target/debug -cf - ironclaw ironclaw-reborn",
             reborn_e2e,
         )
+        self.assertIn('> "${live_dir}/ironclaw-reborn.tar.gz"', reborn_e2e)
         self.assertIn(
             "name: reborn-webui-v2-binary-${{ steps.live_canary_binary.outputs.product_ref }}",
             reborn_e2e,
@@ -8653,21 +9631,25 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         self.assertIn("IRONCLAW_REBORN_GOOGLE_CLIENT_SECRET", action)
 
     def test_slack_delivery_observed_is_status_agnostic_after_gate_resume(self):
+        # The notifier's notice record (delivered-after-gate vs skipped) is
+        # no longer an input at all: observation keys on the fire's durable
+        # model-delivery record plus the independent history read-back, so a
+        # gate-resumed fire and a clean fire observe identically.
         self.assertTrue(
             run_live_qa._slack_delivery_observed(
-                {"outcome": "delivered", "run_id": "run-123"},
+                {"expected_channel_delivered_count": 1},
                 {"found": True, "marker_found": True},
             )
         )
         self.assertFalse(
             run_live_qa._slack_delivery_observed(
-                {"outcome": "gate_required", "run_id": "run-123"},
+                {"expected_channel_delivered_count": 0},
                 {"found": True, "marker_found": True},
             )
         )
         self.assertFalse(
             run_live_qa._slack_delivery_observed(
-                {"outcome": "delivered", "run_id": "run-123"},
+                {"expected_channel_delivered_count": 1},
                 {"found": False, "marker_found": True},
             )
         )
@@ -8696,10 +9678,18 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                                 "capability_id": "slack.send_message",
                                 "status": "completed",
                                 "input_summary": json.dumps(
-                                    {"channel": channel, "text": f"result {marker}"}
+                                    {
+                                        "conversation": channel,
+                                        "text": f"result {marker}",
+                                    }
                                 ),
                                 "output_preview": json.dumps(
-                                    {"channel": channel, "ok": True, "ts": "1.2"}
+                                    {
+                                        "message_ref": {
+                                            "conversation": channel,
+                                            "message_id": "1.2",
+                                        }
+                                    }
                                 ),
                             }
                         ),
@@ -8728,7 +9718,7 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
 
     def test_slack_delivery_readback_inconclusive_requires_one_verified_send(self):
         history_miss = {"checked": True, "found": False, "message_count": 7}
-        delivered = {"outcome": "delivered"}
+        no_model_delivery = {"expected_channel_delivered_count": 0}
         exact_send = {
             "completed_send_count": 1,
             "marker_send_count": 1,
@@ -8737,12 +9727,18 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             "wrong_channel_marker_send_count": 0,
             "parse_error_count": 0,
         }
+        no_deliver = {
+            "completed_deliver_count": 0,
+            "marker_deliver_count": 0,
+            "parse_error_count": 0,
+        }
 
         self.assertTrue(
             run_live_qa._slack_delivery_readback_is_inconclusive(
-                delivered,
+                no_model_delivery,
                 history_miss,
                 exact_send,
+                no_deliver,
             )
         )
         for changed in (
@@ -8754,16 +9750,18 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             with self.subTest(changed=changed):
                 self.assertFalse(
                     run_live_qa._slack_delivery_readback_is_inconclusive(
-                        delivered,
+                        no_model_delivery,
                         history_miss,
                         {**exact_send, **changed},
+                        no_deliver,
                     )
                 )
         self.assertFalse(
             run_live_qa._slack_delivery_readback_is_inconclusive(
-                delivered,
+                no_model_delivery,
                 {**history_miss, "error": "missing_scope"},
                 exact_send,
+                no_deliver,
             )
         )
 
@@ -8926,6 +9924,10 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             "behavioral",
         )
         self.assertFalse(manifest_cases["behavioral_case"]["blocking"])
+        self.assertEqual(
+            manifest_cases["contract_case"]["retry_policy"],
+            "transient",
+        )
 
         self.assertFalse(contract_result.success)
         self.assertFalse(behavioral_result.success)
@@ -9385,7 +10387,28 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
         ):
             captured_envs[reborn_home.name] = env
             Path(env["IRONCLAW_TRACE_OUTPUT"]).write_text(
-                json.dumps({"model_name": "test", "steps": [{"type": "user_input"}]}),
+                json.dumps(
+                    {
+                        "model_name": "test",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 2,
+                            "cache_read_input_tokens": 4,
+                            "cache_creation_input_tokens": 0,
+                            "total_cost_usd": "0.0001",
+                        },
+                        "steps": [
+                            {
+                                "response": {
+                                    "type": "text",
+                                    "content": "done",
+                                    "input_tokens": 10,
+                                    "output_tokens": 2,
+                                }
+                            }
+                        ],
+                    }
+                ),
                 encoding="utf-8",
             )
             return object(), f"http://127.0.0.1/{reborn_home.name}"
@@ -9452,8 +10475,134 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
             )
             # The per-case trace directory is created eagerly by the helper.
             self.assertTrue((output_dir / "llm-traces").is_dir())
+            payload = json.loads(
+                (output_dir / "results.json").read_text(encoding="utf-8")
+            )
+            for result in payload["results"]:
+                self.assertEqual(
+                    result["details"]["metrics"],
+                    {
+                        "model_call_count": 1,
+                        "tool_call_count": 0,
+                        "tool_call_batch_count": 0,
+                        "multi_tool_call_batch_count": 0,
+                        "tool_calls_in_multi_batches": 0,
+                        "max_tool_call_batch_width": 0,
+                        "tool_call_batch_width_counts": {},
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "cache_read_tokens": 4,
+                        "uncached_input_tokens": 6,
+                        "cost_usd": "0.0001",
+                    },
+                )
 
-    def test_run_cases_fails_successful_model_case_when_trace_is_missing(self):
+    def test_case_llm_trace_metrics_count_calls_and_aggregate_usage(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "case.json"
+            trace_path.write_text(
+                json.dumps(
+                    {
+                        "model_name": "test-model",
+                        "usage": {
+                            "input_tokens": 180,
+                            "output_tokens": 35,
+                            "cache_read_input_tokens": 70,
+                            "cache_creation_input_tokens": 20,
+                            "total_cost_usd": "0.00123",
+                        },
+                        "steps": [
+                            {
+                                "response": {
+                                    "type": "user_input",
+                                    "content": "private prompt must not escape",
+                                }
+                            },
+                            {
+                                "response": {
+                                    "type": "tool_calls",
+                                    "tool_calls": [
+                                        {"name": "one", "arguments": {"secret": "x"}},
+                                        {"name": "two", "arguments": {"secret": "y"}},
+                                    ],
+                                    "input_tokens": 80,
+                                    "output_tokens": 20,
+                                }
+                            },
+                            {
+                                "response": {
+                                    "type": "text",
+                                    "content": "private answer must not escape",
+                                    "input_tokens": 100,
+                                    "output_tokens": 15,
+                                }
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            metrics = run_live_qa.parse_case_llm_trace_metrics(trace_path)
+
+        self.assertEqual(
+            metrics,
+            {
+                "model_call_count": 2,
+                "tool_call_count": 2,
+                "tool_call_batch_count": 1,
+                "multi_tool_call_batch_count": 1,
+                "tool_calls_in_multi_batches": 2,
+                "max_tool_call_batch_width": 2,
+                "tool_call_batch_width_counts": {"2": 1},
+                "input_tokens": 180,
+                "output_tokens": 35,
+                "cache_read_tokens": 70,
+                "uncached_input_tokens": 110,
+                "cost_usd": "0.00123",
+            },
+        )
+        self.assertNotIn("private", json.dumps(metrics))
+        self.assertNotIn("one", json.dumps(metrics))
+
+    def test_case_llm_trace_metrics_keep_missing_provider_usage_unknown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "legacy-case.json"
+            trace_path.write_text(
+                json.dumps(
+                    {
+                        "model_name": "legacy",
+                        "steps": [
+                            {
+                                "response": {
+                                    "type": "text",
+                                    "content": "answer",
+                                    "input_tokens": 12,
+                                    "output_tokens": 3,
+                                }
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            metrics = run_live_qa.parse_case_llm_trace_metrics(trace_path)
+
+        self.assertEqual(metrics["model_call_count"], 1)
+        self.assertEqual(metrics["tool_call_count"], 0)
+        self.assertEqual(metrics["tool_call_batch_count"], 0)
+        self.assertEqual(metrics["multi_tool_call_batch_count"], 0)
+        self.assertEqual(metrics["tool_calls_in_multi_batches"], 0)
+        self.assertEqual(metrics["max_tool_call_batch_width"], 0)
+        self.assertEqual(metrics["tool_call_batch_width_counts"], {})
+        self.assertEqual(metrics["input_tokens"], 12)
+        self.assertEqual(metrics["output_tokens"], 3)
+        self.assertIsNone(metrics["cache_read_tokens"])
+        self.assertIsNone(metrics["uncached_input_tokens"])
+        self.assertIsNone(metrics["cost_usd"])
+
+    def test_run_cases_marks_missing_trace_inconclusive_not_blocking(self):
         async def fake_case(_ctx: run_live_qa.LiveQaContext) -> run_live_qa.ProbeResult:
             return run_live_qa.ProbeResult(
                 provider="test",
@@ -9506,12 +10655,35 @@ class RebornWebUiV2LiveQaRunnerTests(unittest.TestCase):
                 (output_dir / "results.json").read_text(encoding="utf-8")
             )
 
-        self.assertEqual(status, 1)
+        # A missing trace is an evidence gap, not a product failure: the
+        # case is recorded inconclusive and must NOT redden the run (the
+        # Slack notifier already classifies infrastructure this way).
+        self.assertEqual(status, 0)
         result = payload["results"][0]
         self.assertFalse(result["success"])
-        self.assertTrue(result["details"]["blocking"])
+        self.assertFalse(result["details"]["blocking"])
+        self.assertTrue(result["details"]["inconclusive"])
+        self.assertEqual(result["details"]["failure_class"], "infrastructure")
         self.assertEqual(result["details"]["failure_category"], "trace_harvest")
+        self.assertEqual(result["details"]["failure_status"], "inconclusive")
         self.assertIn("missing or invalid", result["details"]["error"])
+        self.assertEqual(
+            result["details"]["metrics"],
+            {
+                "model_call_count": None,
+                "tool_call_count": None,
+                "tool_call_batch_count": None,
+                "multi_tool_call_batch_count": None,
+                "tool_calls_in_multi_batches": None,
+                "max_tool_call_batch_width": None,
+                "tool_call_batch_width_counts": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_tokens": None,
+                "uncached_input_tokens": None,
+                "cost_usd": None,
+            },
+        )
 
     def test_run_cases_blocks_slack_connect_without_personal_product_auth(self):
         async def fake_case(_ctx: run_live_qa.LiveQaContext) -> run_live_qa.ProbeResult:
@@ -9777,6 +10949,25 @@ class RunCaseWithRetriesTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.details["attempts"], 2)
+        self.assertEqual(result.details["retry_outcome"], "flake")
+        self.assertTrue(result.details["flake"])
+        self.assertEqual(
+            result.details["attempt_history"],
+            [
+                {
+                    "attempt": 1,
+                    "success": False,
+                    "latency_ms": 1,
+                    "details": {"error": "assertion mismatch"},
+                },
+                {
+                    "attempt": 2,
+                    "success": True,
+                    "latency_ms": 1,
+                    "details": {"text_excerpt": "ok"},
+                },
+            ],
+        )
         self.assertEqual(calls["count"], 2)
 
     def test_does_not_retry_blocked_failure(self):
@@ -9822,6 +11013,32 @@ class RunCaseWithRetriesTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.details["attempts"], 1)
         self.assertEqual(calls["count"], 1)
+
+    def test_does_not_retry_deterministic_security_or_idempotency_failure(self):
+        for failure_class in ("deterministic", "security", "idempotency"):
+            with self.subTest(failure_class=failure_class):
+                calls = {"count": 0}
+
+                async def deterministic_fn(
+                    _ctx,
+                    _calls=calls,
+                    _failure_class=failure_class,
+                ):
+                    _calls["count"] += 1
+                    return self._probe(False, {"failure_class": _failure_class})
+
+                result = asyncio.run(
+                    run_live_qa._run_case_with_retries(
+                        deterministic_fn,
+                        object(),
+                        attempts=3,
+                        is_retriable=run_live_qa._is_case_retriable,
+                    )
+                )
+
+                self.assertFalse(result.success)
+                self.assertEqual(result.details["attempts"], 1)
+                self.assertEqual(calls["count"], 1)
 
     def test_does_not_retry_provider_incident(self):
         calls = {"count": 0}
@@ -9872,9 +11089,645 @@ class RunCaseWithRetriesTests(unittest.TestCase):
         self.assertEqual(result.details["attempts"], 3)
         self.assertEqual(calls["count"], 3)
         self.assertEqual(result.details["error"], "attempt 3")
+        self.assertEqual(result.details["retry_outcome"], "failed")
+        self.assertFalse(result.details["flake"])
+        self.assertEqual(
+            [
+                entry["details"]["error"]
+                for entry in result.details["attempt_history"]
+            ],
+            ["attempt 1", "attempt 2", "attempt 3"],
+        )
 
     def test_default_attempts_constant_allows_one_retry(self):
         self.assertGreaterEqual(run_live_qa.LIVE_QA_CASE_ATTEMPTS, 2)
+
+    def test_exactly_once_case_is_never_retried(self):
+        spec = run_live_qa.CASES["qa_9b_routine_dm_delivery_exactly_once"]
+        calls = {"count": 0}
+
+        async def deterministic_failure(_ctx):
+            calls["count"] += 1
+            return self._probe(
+                False,
+                {
+                    "failure_class": "idempotency",
+                    "failure_category": "duplicate_delivery",
+                },
+            )
+
+        result = asyncio.run(
+            run_live_qa._run_case_with_retries(
+                deterministic_failure,
+                object(),
+                attempts=run_live_qa._case_attempts(
+                    "qa_9b_routine_dm_delivery_exactly_once",
+                    spec,
+                    configured_attempts=3,
+                ),
+                is_retriable=run_live_qa._is_case_retriable,
+            )
+        )
+
+        self.assertEqual(spec.retry_policy, "never")
+        self.assertFalse(result.success)
+        self.assertEqual(result.details["attempts"], 1)
+        self.assertEqual(calls["count"], 1)
+
+    def test_mechanically_identifiable_deterministic_cases_are_no_retry(self):
+        retryable = [
+            name
+            for name, spec in run_live_qa.CASES.items()
+            if any(
+                marker in name
+                for marker in run_live_qa.NO_RETRY_CASE_NAME_MARKERS
+            )
+            and spec.retry_policy != "never"
+        ]
+
+        self.assertEqual(retryable, [])
+
+    def test_slack_strategy_doc_side_effect_is_no_retry(self):
+        spec = run_live_qa.CASES["qa_5d_slack_strategy_doc_answer"]
+
+        self.assertEqual(spec.retry_policy, "never")
+        self.assertEqual(
+            run_live_qa._case_attempts(
+                "qa_5d_slack_strategy_doc_answer",
+                spec,
+                configured_attempts=3,
+            ),
+            1,
+        )
+
+
+class TwoLaneDeliveryContractTests(unittest.TestCase):
+    """Pins the delivery verification contract for the two-lane model (#7157).
+
+    A triggered fire's result is never pushed by the completion driver any
+    more: the fire itself calls ``builtin.outbound_deliver``, which records a
+    durable ``outbound/deliveries/`` model-delivery record, while the
+    background-run notifier's ``triggered-run-delivery`` record describes
+    NOTICE delivery only (``skipped`` is the healthy record for a cleanly
+    completed fire). These tests pin that the runner treats the new records
+    as the contract instead of the retired ``outcome == "delivered"`` push.
+    """
+
+    _EXPECTED_CHANNEL = "D0TESTDM1"
+
+    def _dummy_ctx(self) -> run_live_qa.LiveQaContext:
+        return run_live_qa.LiveQaContext(
+            base_url="http://127.0.0.1:9",
+            output_dir=Path("/tmp"),
+            reborn_home=Path("/tmp/reborn-home"),
+            env={},
+        )
+
+    @staticmethod
+    def _create_store(reborn_home: Path) -> Path:
+        # The production schema helper, so this fixture cannot drift from the
+        # columns the readers filter on (is_dir, content_type).
+        db_path = reborn_home / "local-dev" / "reborn-local-dev.db"
+        run_live_qa._root_filesystem_create_table(db_path)
+        return db_path
+
+    @staticmethod
+    def _insert_json(db_path: Path, path: str, payload: dict) -> None:
+        run_live_qa._put_root_filesystem_json(db_path, path, payload)
+
+    def _model_delivery_record(
+        self,
+        *,
+        run_id: str = "run-fire-1",
+        status: str = "delivered",
+        conversation: str = "D0TESTDM1",
+    ) -> dict:
+        # Mirrors the production record shape written by
+        # builtin.outbound_deliver (observed live in the 2026-08-08 canary
+        # runs), with neutralized workspace identifiers.
+        target = (
+            "reply:adapter:8:slack_v2;installation:5:slack;"
+            "agent:16:reborn-cli-agent;project:0:;space:9:T0TESTTM1;"
+            f"conversation:{len(conversation)}:{conversation};topic:0:;"
+            "actor_kind:10:slack_user;actor:9:U0TESTUSR;"
+        )
+        return {
+            "delivery_id": "30e461cd-2067-5581-a379-8ee481462418",
+            "candidate": {
+                "tenant_id": "reborn-cli",
+                "agent_id": "reborn-cli-agent",
+                "project_id": None,
+                "thread_id": "thread-fire-1",
+                "turn_run_id": run_id,
+                "target": target,
+                "kind": "model_delivery",
+                "projection_ref": f"model-delivery:{run_id}:invocation-1",
+                "requires_reply_target_revalidation": True,
+            },
+            "status": status,
+            "attempted_at": "2026-08-08T00:28:20.527116273Z",
+            "failure_kind": None,
+        }
+
+    def _outbound_deliver_preview_message(
+        self,
+        *,
+        run_id: str = "run-fire-1",
+        thread_id: str = "thread-fire-1",
+        invocation: str = "invocation-1",
+        content: str = "delivered body",
+        status: str = "completed",
+    ) -> dict:
+        preview = {
+            "version": 1,
+            "invocation_id": invocation,
+            "capability_id": "builtin.outbound_deliver",
+            "status": status,
+            "input_summary": json.dumps(
+                {
+                    "content": content,
+                    "target_id": "slack:personal-dm:T0TESTTM1:qa-user",
+                },
+                indent=2,
+            ),
+            "output_preview": "Delivered to Slack DM",
+        }
+        return {
+            "message_id": f"message-{invocation}",
+            "thread_id": thread_id,
+            "kind": "capability_display_preview",
+            "turn_run_id": run_id,
+            "content": json.dumps(preview),
+        }
+
+    def test_classify_triggered_notice_outcome_maps_two_lane_vocabulary(self):
+        # The exact record shape observed live for a cleanly completed fire.
+        skipped = {
+            "run_id": "run-fire-1",
+            "outcome": "skipped",
+            "recorded_at": "2026-08-08T00:28:32.193651088Z",
+        }
+        healthy = ["skipped", "no_default_configured", "delivered"]
+        for kind in healthy:
+            self.assertEqual(
+                run_live_qa._classify_triggered_notice_outcome(
+                    {**skipped, "outcome": kind}
+                ),
+                "healthy_terminal",
+                kind,
+            )
+        for kind in ("failed", "denied"):
+            self.assertEqual(
+                run_live_qa._classify_triggered_notice_outcome(
+                    {**skipped, "outcome": kind}
+                ),
+                "notifier_failure",
+                kind,
+            )
+        self.assertEqual(
+            run_live_qa._classify_triggered_notice_outcome(None), "pending"
+        )
+        self.assertEqual(
+            run_live_qa._classify_triggered_notice_outcome({"outcome": ""}),
+            "pending",
+        )
+        # Unknown future vocabulary must not hard-fail the canary: it reads
+        # as pending and surfaces in the timeout diagnostics instead.
+        self.assertEqual(
+            run_live_qa._classify_triggered_notice_outcome(
+                {"outcome": "some_future_state"}
+            ),
+            "pending",
+        )
+
+    def test_model_delivery_summary_reads_durable_records(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reborn_home = Path(tmpdir) / "reborn-home"
+            db_path = self._create_store(reborn_home)
+            self._insert_json(
+                db_path,
+                "/tenants/reborn-cli/users/qa-user/outbound/deliveries/1.json",
+                self._model_delivery_record(),
+            )
+            # A delivery for another run must not count.
+            self._insert_json(
+                db_path,
+                "/tenants/reborn-cli/users/qa-user/outbound/deliveries/2.json",
+                self._model_delivery_record(run_id="run-other"),
+            )
+            # A delivered record for a different conversation counts as
+            # delivered but not as the expected channel.
+            self._insert_json(
+                db_path,
+                "/tenants/reborn-cli/users/qa-user/outbound/deliveries/3.json",
+                self._model_delivery_record(conversation="C0ELSEWHER"),
+            )
+
+            summary = run_live_qa._model_delivery_summary(
+                reborn_home, "run-fire-1", self._EXPECTED_CHANNEL
+            )
+
+        self.assertEqual(summary.get("record_count"), 2)
+        self.assertEqual(summary.get("delivered_count"), 2)
+        self.assertEqual(summary.get("expected_channel_delivered_count"), 1)
+        self.assertNotIn("read_error", summary)
+        # Sanitization: the sealed target ref (workspace/conversation ids)
+        # must never leave the helper.
+        self.assertNotIn(
+            self._EXPECTED_CHANNEL, json.dumps(summary), summary
+        )
+
+    def test_model_delivery_summary_survives_missing_db(self):
+        summary = run_live_qa._model_delivery_summary(
+            Path("/nonexistent-reborn-home"), "run-fire-1", self._EXPECTED_CHANNEL
+        )
+        self.assertEqual(summary.get("record_count"), 0)
+        self.assertIn("read_error", summary)
+
+    def test_outbound_deliver_evidence_counts_marker_content(self):
+        marker = "REBORN_QA_TEST_SLACK_DELIVERED_1"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reborn_home = Path(tmpdir) / "reborn-home"
+            db_path = self._create_store(reborn_home)
+            self._insert_json(
+                db_path,
+                "/tenants/t/users/u/threads/a/threads/thread-fire-1/messages/1.json",
+                self._outbound_deliver_preview_message(
+                    content=f"result body {marker}"
+                ),
+            )
+            self._insert_json(
+                db_path,
+                "/tenants/t/users/u/threads/a/threads/thread-fire-1/messages/2.json",
+                self._outbound_deliver_preview_message(
+                    invocation="invocation-2", content="no marker here"
+                ),
+            )
+            # A failed (non-completed) deliver carrying the marker must count
+            # toward NEITHER counter: a marker that never reached Slack would
+            # otherwise fake the exactly-one-verified-send inconclusive
+            # classification and suppress the deterministic markerless red.
+            self._insert_json(
+                db_path,
+                "/tenants/t/users/u/threads/a/threads/thread-fire-1/messages/3.json",
+                self._outbound_deliver_preview_message(
+                    invocation="invocation-3",
+                    content=f"aborted body {marker}",
+                    status="failed",
+                ),
+            )
+
+            evidence = run_live_qa._trigger_run_outbound_deliver_evidence(
+                reborn_home,
+                run_id="run-fire-1",
+                thread_id="thread-fire-1",
+                marker=marker,
+            )
+
+        self.assertEqual(evidence.get("completed_deliver_count"), 2)
+        self.assertEqual(evidence.get("marker_deliver_count"), 1)
+        self.assertEqual(evidence.get("parse_error_count"), 0)
+        self.assertNotIn(marker, json.dumps(evidence.get("read_error", "")))
+
+    def test_slack_delivery_observed_requires_record_and_history(self):
+        delivered = {"expected_channel_delivered_count": 1}
+        found = {"checked": True, "found": True}
+        self.assertTrue(run_live_qa._slack_delivery_observed(delivered, found))
+        self.assertFalse(
+            run_live_qa._slack_delivery_observed(
+                {"expected_channel_delivered_count": 0}, found
+            )
+        )
+        self.assertFalse(
+            run_live_qa._slack_delivery_observed(
+                delivered, {"checked": True, "found": False}
+            )
+        )
+        self.assertFalse(run_live_qa._slack_delivery_observed(None, found))
+        self.assertFalse(run_live_qa._slack_delivery_observed(delivered, None))
+
+    def test_readback_inconclusive_accepts_deliver_lane_exact_send(self):
+        clean_miss = {"checked": True, "found": False}
+        no_vendor = {
+            "completed_send_count": 0,
+            "marker_send_count": 0,
+            "expected_channel_marker_send_count": 0,
+            "expected_channel_marker_ok_count": 0,
+            "wrong_channel_marker_send_count": 0,
+            "parse_error_count": 0,
+        }
+        deliver_exact = {
+            "completed_deliver_count": 1,
+            "marker_deliver_count": 1,
+            "parse_error_count": 0,
+        }
+        self.assertTrue(
+            run_live_qa._slack_delivery_readback_is_inconclusive(
+                {"expected_channel_delivered_count": 1},
+                clean_miss,
+                no_vendor,
+                deliver_exact,
+            )
+        )
+        # The vendor-lane exact-send leg still classifies as inconclusive
+        # even without a model-delivery record (slack.send_message lane).
+        vendor_exact = {
+            "completed_send_count": 1,
+            "marker_send_count": 1,
+            "expected_channel_marker_send_count": 1,
+            "expected_channel_marker_ok_count": 1,
+            "wrong_channel_marker_send_count": 0,
+            "parse_error_count": 0,
+        }
+        no_deliver = {
+            "completed_deliver_count": 0,
+            "marker_deliver_count": 0,
+            "parse_error_count": 0,
+        }
+        self.assertTrue(
+            run_live_qa._slack_delivery_readback_is_inconclusive(
+                {"expected_channel_delivered_count": 0},
+                clean_miss,
+                vendor_exact,
+                no_deliver,
+            )
+        )
+        # A found or errored history read is never inconclusive.
+        self.assertFalse(
+            run_live_qa._slack_delivery_readback_is_inconclusive(
+                {"expected_channel_delivered_count": 1},
+                {"checked": True, "found": True},
+                no_vendor,
+                deliver_exact,
+            )
+        )
+        self.assertFalse(
+            run_live_qa._slack_delivery_readback_is_inconclusive(
+                {"expected_channel_delivered_count": 1},
+                {"checked": True, "found": False, "error": "ratelimited"},
+                no_vendor,
+                deliver_exact,
+            )
+        )
+
+    def test_readback_inconclusive_rejects_markerless_deliver(self):
+        # A delivered message WITHOUT the marker is a deterministic failure
+        # (stale prompt phrasing), never an infrastructure flake.
+        clean_miss = {"checked": True, "found": False}
+        no_vendor = {
+            "completed_send_count": 0,
+            "marker_send_count": 0,
+            "expected_channel_marker_send_count": 0,
+            "expected_channel_marker_ok_count": 0,
+            "wrong_channel_marker_send_count": 0,
+            "parse_error_count": 0,
+        }
+        self.assertFalse(
+            run_live_qa._slack_delivery_readback_is_inconclusive(
+                {"expected_channel_delivered_count": 1},
+                clean_miss,
+                no_vendor,
+                {
+                    "completed_deliver_count": 1,
+                    "marker_deliver_count": 0,
+                    "parse_error_count": 0,
+                },
+            )
+        )
+
+    def _run_wait(
+        self,
+        *,
+        outcomes,
+        model_deliveries,
+        histories,
+        deliver_evidence=None,
+        vendor_evidence=None,
+        timeout: float = 30.0,
+    ):
+        """Drive _wait_for_slack_delivery_marker with scripted poll results.
+
+        Each argument is a list consumed one element per poll pass; the last
+        element repeats once exhausted.
+        """
+
+        def scripted(values):
+            state = {"i": 0}
+
+            def read(*_args, **_kwargs):
+                value = values[min(state["i"], len(values) - 1)]
+                state["i"] += 1
+                return value
+
+            return read
+
+        outcome_reader = scripted(outcomes)
+        delivery_reader = scripted(model_deliveries)
+        history_reader = scripted(histories)
+
+        async def fake_history(*_args, **_kwargs):
+            return history_reader()
+
+        async def fake_sleep(_seconds):
+            return None
+
+        row = {
+            "run_id": "run-fire-1",
+            "thread_id": "thread-fire-1",
+            "status": "ok",
+            "name": "reborn-qa-test-routine",
+        }
+        deliver_evidence = deliver_evidence or {
+            "completed_deliver_count": 0,
+            "marker_deliver_count": 0,
+            "parse_error_count": 0,
+        }
+        vendor_evidence = vendor_evidence or {
+            "completed_send_count": 0,
+            "marker_send_count": 0,
+            "expected_channel_marker_send_count": 0,
+            "expected_channel_marker_ok_count": 0,
+            "wrong_channel_marker_send_count": 0,
+            "parse_error_count": 0,
+        }
+        with (
+            patch.object(
+                run_live_qa, "_slack_delivery_channel_id", return_value=self._EXPECTED_CHANNEL
+            ),
+            patch.object(run_live_qa, "_trigger_run_rows", return_value=[row]),
+            patch.object(
+                run_live_qa,
+                "_triggered_delivery_outcome",
+                side_effect=lambda *_a, **_k: outcome_reader(),
+            ),
+            patch.object(
+                run_live_qa,
+                "_model_delivery_summary",
+                side_effect=lambda *_a, **_k: delivery_reader(),
+            ),
+            patch.object(
+                run_live_qa, "_delivered_gate_routes_for_run", return_value=[]
+            ),
+            patch.object(
+                run_live_qa,
+                "_trigger_run_outbound_deliver_evidence",
+                return_value=deliver_evidence,
+            ),
+            patch.object(
+                run_live_qa,
+                "_trigger_run_slack_send_evidence",
+                return_value=vendor_evidence,
+            ),
+            patch.object(
+                run_live_qa, "_slack_history_contains_marker", new=fake_history
+            ),
+            patch.object(run_live_qa.asyncio, "sleep", new=fake_sleep),
+        ):
+            return asyncio.run(
+                run_live_qa._wait_for_slack_delivery_marker(
+                    self._dummy_ctx(),
+                    routine_name="reborn-qa-test-routine",
+                    marker="REBORN_QA_TEST_SLACK_DELIVERED_1",
+                    oldest_epoch=0.0,
+                    timeout=timeout,
+                )
+            )
+
+    def test_wait_passes_on_skipped_notice_with_model_delivery_and_history(self):
+        skipped = {"run_id": "run-fire-1", "outcome": "skipped"}
+        delivered = {
+            "record_count": 1,
+            "delivered_count": 1,
+            "expected_channel_delivered_count": 1,
+        }
+        found = {"checked": True, "found": True, "marker_found": True}
+        result = self._run_wait(
+            outcomes=[skipped],
+            model_deliveries=[delivered],
+            histories=[found],
+        )
+        self.assertEqual(result["slack_history"], found)
+        self.assertEqual(result["model_delivery"], delivered)
+        self.assertEqual(result["delivery_outcome"], skipped)
+
+    def test_wait_keeps_polling_past_skipped_until_history_readback(self):
+        # The completion record lands seconds after the fire's own
+        # outbound_deliver call, while Slack history read-back can lag —
+        # a skipped record must keep the wait alive, not abort it.
+        skipped = {"run_id": "run-fire-1", "outcome": "skipped"}
+        delivered = {
+            "record_count": 1,
+            "delivered_count": 1,
+            "expected_channel_delivered_count": 1,
+        }
+        miss = {"checked": True, "found": False}
+        found = {"checked": True, "found": True, "marker_found": True}
+        deliver_with_marker = {
+            "completed_deliver_count": 1,
+            "marker_deliver_count": 1,
+            "parse_error_count": 0,
+        }
+        result = self._run_wait(
+            outcomes=[skipped],
+            model_deliveries=[delivered],
+            histories=[miss, miss, found],
+            deliver_evidence=deliver_with_marker,
+        )
+        self.assertEqual(result["slack_history"], found)
+
+    def test_wait_fails_fast_on_notifier_failure_outcome(self):
+        failed = {"run_id": "run-fire-1", "outcome": "failed"}
+        with self.assertRaises(AssertionError) as caught:
+            self._run_wait(
+                outcomes=[failed],
+                model_deliveries=[{"record_count": 0}],
+                histories=[{"checked": True, "found": False}],
+            )
+        self.assertIn("notifier", str(caught.exception))
+
+    def test_wait_fails_when_delivered_content_lacks_marker(self):
+        # The qa_8d live failure mode: outbound_deliver sent the message,
+        # but the composed content carried no marker (it only reached the
+        # final answer). Deterministic red, not a timeout or a flake.
+        skipped = {"run_id": "run-fire-1", "outcome": "skipped"}
+        delivered = {
+            "record_count": 1,
+            "delivered_count": 1,
+            "expected_channel_delivered_count": 1,
+        }
+        with self.assertRaises(AssertionError) as caught:
+            self._run_wait(
+                outcomes=[skipped],
+                model_deliveries=[delivered],
+                histories=[{"checked": True, "found": False}],
+                deliver_evidence={
+                    "completed_deliver_count": 1,
+                    "marker_deliver_count": 0,
+                    "parse_error_count": 0,
+                },
+            )
+        self.assertIn("marker", str(caught.exception))
+        self.assertIn("delivered", str(caught.exception))
+
+    def test_wait_times_out_inconclusive_on_clean_readback_miss(self):
+        skipped = {"run_id": "run-fire-1", "outcome": "skipped"}
+        delivered = {
+            "record_count": 1,
+            "delivered_count": 1,
+            "expected_channel_delivered_count": 1,
+        }
+        with self.assertRaises(
+            run_live_qa.SlackDeliveryReadbackInconclusive
+        ):
+            self._run_wait(
+                outcomes=[skipped],
+                model_deliveries=[delivered],
+                histories=[{"checked": True, "found": False}],
+                deliver_evidence={
+                    "completed_deliver_count": 1,
+                    "marker_deliver_count": 1,
+                    "parse_error_count": 0,
+                },
+                timeout=0.05,
+            )
+
+    def test_delivery_case_prompt_requires_marker_in_delivered_message(self):
+        sentence = run_live_qa._delivery_marker_prompt_requirement("MARKER_1")
+        self.assertIn("delivered Slack message", sentence)
+        self.assertIn("MARKER_1", sentence)
+        self.assertIn("final answer", sentence)
+
+        captured: dict[str, str] = {}
+
+        async def fake_creation_case(_ctx, **kwargs):
+            captured["prompt"] = kwargs.get("prompt") or ""
+            return run_live_qa.ProbeResult(
+                provider="test",
+                mode="live:test",
+                success=False,
+                latency_ms=1,
+                details={"error": "stop after prompt capture"},
+            )
+
+        with patch.object(
+            run_live_qa, "_routine_creation_case", new=fake_creation_case
+        ):
+            asyncio.run(
+                run_live_qa._slack_delivery_routine_case(
+                    self._dummy_ctx(),
+                    case_name="qa_test_delivery",
+                    routine_prefix="reborn-qa-test",
+                    marker_prefix="REBORN_QA_TEST",
+                    routine_instruction="send the result to Slack",
+                    required_delivery_text=[],
+                )
+            )
+
+        self.assertIn("delivered Slack message", captured["prompt"])
+        self.assertNotIn(
+            "final answer must include the exact marker REBORN_QA_TEST_SLACK",
+            captured["prompt"],
+        )
 
 
 if __name__ == "__main__":

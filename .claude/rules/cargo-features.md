@@ -52,7 +52,7 @@ when introduced:
 - **`pr3180-ready`, `pr7-ready`** — speculative gates for landings that
   never came, with zero `#[cfg]` sites, sitting in the manifest for two
   months.
-- **`libsql`/`postgres` on `ironclaw_resources`, `ironclaw_run_state`,
+- **`libsql`/`postgres` on `ironclaw_resources`, the retired run-state crate,
   `ironclaw_outbound`** — declared, forwarded to by three crates, never
   read; they pulled `libsql`, `deadpool-postgres`, and `tokio-postgres`
   into builds that used none of them.
@@ -93,12 +93,12 @@ when introduced:
   every dependent manifest, `required-features` on `[[test]]` /
   `[[bin]]` targets, `.github/workflows/`, `Dockerfile*`,
   `scripts/ci/package-feature-flags.sh` and its self-test, and
-  `docs/plans/composition-pubuse.snapshot` when the public facade
+  `docs/internal/plans/composition-pubuse.snapshot` when the public facade
   changes.
-- **Persisted strings are not feature references.**
-  `SLACK_OUTBOUND_PROVIDER_KEY_PREFIX = "slack-v2-host-beta"` is a
-  secret-store key prefix. Renaming it corrupts existing rows. Check
-  before a global find-and-replace.
+- **Persisted strings are not feature references.** A feature name
+  embedded in a persisted secret-store key prefix corrupts existing rows
+  if renamed. Check before a global find-and-replace whenever a feature
+  that gates persisted keys is renamed.
 
 ## Review flags
 

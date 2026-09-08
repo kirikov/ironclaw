@@ -9,15 +9,13 @@ mod support;
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use ironclaw_loop_contracts::{LoopRunContext, PromptMode};
 use ironclaw_loop_host::{
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
     HostIdentityMessageContent, HostManagedModelMessageRole, HostManagedModelResponse,
     IdentityApplicability, IdentityFileName,
 };
-use ironclaw_turns::{
-    LoopMessageRef, TurnStatus,
-    run_profile::{LoopRunContext, PromptMode},
-};
+use ironclaw_turns::{LoopMessageRef, TurnStatus};
 use parity_qa_support::binary_e2e::{RebornBinaryE2EHarness, RebornHarnessSharedStorage};
 use parity_qa_support::model_replay::RebornTraceReplayModelGateway;
 use reborn_support::harness::{RecordingTestCapabilityPort, test_product_scope};
@@ -53,7 +51,7 @@ async fn reborn_identity_project_scope_isolation_parity() {
         RecordingTestCapabilityPort::echo(),
         project_alpha,
         identity_source.clone(),
-        ironclaw_product::ProductTriggerReason::DirectChat,
+        ironclaw_extension_contracts::channel_adapter::ProductTriggerReason::DirectChat,
         "reborn-test",
         "install-1",
         "alice",
@@ -69,7 +67,7 @@ async fn reborn_identity_project_scope_isolation_parity() {
         RecordingTestCapabilityPort::echo(),
         project_beta,
         identity_source.clone(),
-        ironclaw_product::ProductTriggerReason::DirectChat,
+        ironclaw_extension_contracts::channel_adapter::ProductTriggerReason::DirectChat,
         "reborn-test",
         "install-1",
         "alice",

@@ -18,10 +18,11 @@ mod reborn_support;
 #[path = "../support/mod.rs"]
 mod support;
 
-use ironclaw_turns::run_profile::{
+use ironclaw_loop_contracts::RunProfileResolver;
+use ironclaw_loop_contracts::{
     InMemoryRunProfileResolver, LoopRunContext, RunProfileResolutionRequest,
 };
-use ironclaw_turns::{RunProfileResolver, TurnActor, TurnId, TurnRunId, TurnScope};
+use ironclaw_turns::{TurnActor, TurnId, TurnRunId, TurnScope};
 use reborn_support::group::RebornIntegrationGroup;
 use reborn_support::reply::RebornScriptedReply;
 
@@ -36,12 +37,13 @@ async fn read_back_run_context(tenant_id: &str, user_id: &str) -> LoopRunContext
         .await
         .expect("resolve interactive run profile");
     let scope = TurnScope::new(
-        ironclaw_host_api::TenantId::new(tenant_id).expect("valid tenant id"),
+        ironclaw_host_api::ids::TenantId::new(tenant_id).expect("valid tenant id"),
         None,
         None,
-        ironclaw_host_api::ThreadId::new("thread-profile-itest").expect("valid thread id"),
+        ironclaw_host_api::ids::ThreadId::new("thread-profile-itest").expect("valid thread id"),
     );
-    let actor = TurnActor::new(ironclaw_host_api::UserId::new(user_id).expect("valid user id"));
+    let actor =
+        TurnActor::new(ironclaw_host_api::ids::UserId::new(user_id).expect("valid user id"));
     LoopRunContext::new(scope, TurnId::new(), TurnRunId::new(), resolved_run_profile)
         .with_actor(actor)
 }
@@ -122,12 +124,23 @@ async fn profile_set_write_is_readable_through_the_wired_profile_source() {
         .submit_turn("what's my setup")
         .await
         .expect("turn completes");
+    // Profile facts render inside the runtime-context section, which rides
+    // the conversation tail as a <system-reminder> user message so the cached
+    // system prefix stays byte-stable (#6985).
     prompt_thread
-        .assert_system_prompt_contains("locale=en-US")
+        .assert_system_prompt_excludes("locale=en-US")
         .await
-        .expect("profile_set locale must reach the model-visible system prompt");
+        .expect("profile_set locale must stay out of the cached system prefix");
     prompt_thread
-        .assert_system_prompt_contains("America/Los_Angeles")
+        .assert_system_prompt_excludes("America/Los_Angeles")
         .await
-        .expect("profile_set timezone must reach the model-visible system prompt");
+        .expect("profile_set timezone must stay out of the cached system prefix");
+    prompt_thread
+        .assert_rides_conversation_tail("locale=en-US")
+        .await
+        .expect("profile_set locale must ride the conversation tail");
+    prompt_thread
+        .assert_rides_conversation_tail("America/Los_Angeles")
+        .await
+        .expect("profile_set timezone must ride the conversation tail");
 }

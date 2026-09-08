@@ -108,7 +108,6 @@ from scripts.reborn_webui_v2_live_qa.slack_helpers import (  # noqa: E402
     SLACK_PERSONAL_ACCESS_TOKEN_ENV_NAMES,
     SLACK_SECOND_USER_TOKEN_ENV,
     SLACK_SIGNING_SECRET_ENV,
-    _disable_slack_in_config,
     _discover_slack_dm_route_channel,
     _has_live_slack_env,
     _has_slack_delivery_target,
@@ -126,7 +125,6 @@ from scripts.reborn_webui_v2_live_qa.slack_helpers import (  # noqa: E402
     _slack_auth_test,
     _slack_auth_provider,
     _slack_config_value,
-    _slack_enabled,
 )
 from scripts.reborn_webui_v2_live_qa.text_match import (  # noqa: E402
     required_text_matches,
@@ -205,6 +203,16 @@ DEFAULT_USER_ID = "reborn-webui-v2-live-qa-user"
 ENDPOINT_STATUS_URL = "https://near.ai"
 PROVIDER = "reborn-webui-v2"
 MODE = "live"
+# The composer's message POST rides the session channel ingress route since
+# the channel normalization split (#7477):
+# `/api/webchat/v2/channels/<extension>/messages`. The older thread-scoped
+# route is still accepted so one harness spans binaries on either side of
+# that split — the same migration the stress client made in #7568. QA 10
+# went 0/10 (submission-identity capture timing out on a healthy, streaming
+# turn) when this predicate only knew the retired route.
+SUBMISSION_MESSAGE_ROUTE_RE = re.compile(
+    r"/api/webchat/v2/(?:threads|channels)/[^/]+/messages$"
+)
 # Live QA is model- and network-nondeterministic: the same commit can pass then
 # flake red hours later. Retry a transient (assertion/behavioral) case failure up
 # to this many total attempts before recording a red. Default 2 = one retry;
@@ -215,6 +223,14 @@ try:
     )
 except ValueError:
     LIVE_QA_CASE_ATTEMPTS = 2
+NO_RETRY_CASE_NAME_MARKERS = (
+    "_routine",
+    "_delivery",
+    "_trigger",
+    "exactly_once",
+    "_guard",
+    "_hygiene",
+)
 HN_KEYWORD_SEARCH_URL = (
     "https://hn.algolia.com/api/v1/search_by_date"
     "?query=NEAR%20AI&tags=story&hitsPerPage=1"
@@ -339,9 +355,8 @@ def parse_args() -> argparse.Namespace:
         "--require-slack-live",
         action="store_true",
         help=(
-            "Require real Slack host env vars and keep [slack].enabled=true. "
-            "Without this, non-Slack cases disable Slack in the copied temp home "
-            "when Slack env vars are absent."
+            "Require real Slack host env vars and a successful Slack auth.test "
+            "for selected Slack cases."
         ),
     )
     args = parser.parse_args()
@@ -382,7 +397,6 @@ def _reborn_binary() -> Path:
 def build_reborn_binary() -> Path:
     features = os.environ.get("REBORN_WEBUI_V2_LIVE_QA_FEATURES", "")
     build_env = os.environ.copy()
-    build_env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
     build_env.setdefault("CARGO_INCREMENTAL", "0")
     command = ["cargo", "build", "-p", "ironclaw"]
     if features:
@@ -411,7 +425,7 @@ def _referenced_env_names(config_text: str) -> set[str]:
     return names
 
 
-def _write_minimal_reborn_config(path: Path, *, include_slack: bool) -> None:
+def _write_minimal_reborn_config(path: Path) -> None:
     api_key_env = os.environ.get(
         "REBORN_WEBUI_V2_LIVE_QA_LLM_API_KEY_ENV",
         "NEARAI_API_KEY" if os.environ.get("NEARAI_API_KEY") else "LIVE_OPENAI_COMPATIBLE_API_KEY",
@@ -440,13 +454,6 @@ def _write_minimal_reborn_config(path: Path, *, include_slack: bool) -> None:
     ]
     if base_url:
         llm_default_lines.append(f'base_url = "{base_url}"')
-    slack_lines: list[str] = []
-    if include_slack:
-        slack_lines = [
-            "[slack]",
-            "enabled = true",
-            "",
-        ]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join(
@@ -461,7 +468,6 @@ def _write_minimal_reborn_config(path: Path, *, include_slack: bool) -> None:
                 "[llm.default]",
                 *llm_default_lines,
                 "",
-                *slack_lines,
             ]
         ),
         encoding="utf-8",
@@ -535,7 +541,7 @@ def prepare_reborn_home(
     shutil.copytree(source_home, prepared_home, ignore=_ignore)
     config_path = prepared_home / "config.toml"
     if not config_path.exists() and (prepared_home / "local-dev" / "reborn-local-dev.db").exists():
-        _write_minimal_reborn_config(config_path, include_slack=needs_slack)
+        _write_minimal_reborn_config(config_path)
     legacy_setup_cleanup = _remove_legacy_slack_setup_fields(config_path)
     stale_dm_route_cleanup = _remove_dm_slack_channel_routes(config_path)
     route_configured_from_env = False
@@ -550,7 +556,7 @@ def prepare_reborn_home(
     )
     telegram_env, telegram_env_preflight = _materialize_telegram_env_for_reborn()
 
-    if _slack_enabled(config) and not _has_live_slack_env():
+    if needs_slack and not _has_live_slack_env():
         secret_env, secret_preflight = _materialize_slack_env_from_reborn_home(
             prepared_home,
             config,
@@ -565,7 +571,6 @@ def prepare_reborn_home(
     slack_route_discovery: dict[str, object] = {"checked": False}
     if (
         needs_slack_target
-        and _slack_enabled(config)
         and _has_live_slack_env(process_env)
         and not _has_slack_delivery_target(config, prepared_home, auth_user_id)
     ):
@@ -593,38 +598,26 @@ def prepare_reborn_home(
             "Reborn config references unset live env vars: " + ", ".join(missing)
         )
 
-    slack_enabled = _slack_enabled(config)
     slack_setup = (
         _slack_setup_preflight(prepared_home, config, process_env)
-        if slack_enabled
+        if needs_slack
         else {"configured": False}
     )
     slack_target_present = _has_slack_delivery_target(config, prepared_home, auth_user_id)
-    slack_auth = (
-        _slack_auth_test(config, process_env)
-        if slack_enabled and _has_live_slack_env(process_env)
-        else {"checked": False, "ok": False, "error": "Slack env unavailable"}
-    )
-    if args.require_slack_live and needs_slack and not slack_enabled:
-        raise LiveQaError(
-            "selected cases require live Slack, but [slack].enabled is not true "
-            "in the prepared Reborn config."
-        )
-    if slack_enabled and not _has_live_slack_env(process_env):
+    if not needs_slack:
+        slack_auth = {"checked": False, "ok": False, "error": "Slack not required"}
+    elif _has_live_slack_env(process_env):
+        slack_auth = _slack_auth_test(config, process_env)
+    else:
+        slack_auth = {"checked": False, "ok": False, "error": "Slack env unavailable"}
+    if needs_slack and not _has_live_slack_env(process_env):
         if args.require_slack_live:
             raise LiveQaError(
-                "Reborn config enables Slack, but live Slack env vars are missing "
-                "(expected IRONCLAW_REBORN_SLACK_SIGNING_SECRET and "
-                "IRONCLAW_REBORN_SLACK_BOT_TOKEN unless overridden in config)."
+                "selected cases require live Slack, but live Slack env vars are "
+                "missing (expected IRONCLAW_REBORN_SLACK_SIGNING_SECRET and "
+                "IRONCLAW_REBORN_SLACK_BOT_TOKEN)."
             )
-        if not needs_slack:
-            _disable_slack_in_config(config_path)
-            print(
-                "[reborn-webui-v2-live-qa] Slack disabled in copied temp home because "
-                "Slack live env vars are not present and no Slack case was selected.",
-                flush=True,
-            )
-    if args.require_slack_live and needs_slack and slack_enabled and not slack_auth.get("ok"):
+    if args.require_slack_live and needs_slack and not slack_auth.get("ok"):
         raise LiveQaError(
             "selected cases require live Slack, but Slack auth.test failed: "
             f"{slack_auth.get('error') or 'unknown Slack auth error'}"
@@ -664,7 +657,6 @@ def prepare_reborn_home(
         env=process_env,
         preflight={
             "slack": {
-                "enabled_in_config": slack_enabled,
                 "env_present": _has_live_slack_env(process_env),
                 "requires_slack": needs_slack,
                 "requires_delivery_target": needs_slack_target,
@@ -698,7 +690,7 @@ def create_generated_reborn_home(path: Path, *, include_slack: bool = False) -> 
         os.environ.get("LIVE_OPENAI_COMPATIBLE_MODEL", "deepseek-ai/DeepSeek-V4-Flash"),
     )
     path.mkdir(parents=True, exist_ok=True)
-    _write_minimal_reborn_config(path / "config.toml", include_slack=include_slack)
+    _write_minimal_reborn_config(path / "config.toml")
     google_seed = _seed_generated_google_product_auth_if_configured(path, _auth_user_id())
     github_seed = _seed_generated_github_product_auth_if_configured(path, _auth_user_id())
     slack_seed = (
@@ -757,7 +749,7 @@ def server_env(
             "RUST_BACKTRACE": "1",
             "RUST_LOG": os.environ.get(
                 "RUST_LOG",
-                "ironclaw=warn,ironclaw_runner=warn,ironclaw_webui=info",
+                "ironclaw=warn,ironclaw_turn_runner=warn,ironclaw_webui=info",
             ),
         }
     )
@@ -802,6 +794,144 @@ def validate_case_llm_trace(output_dir: Path, case_name: str) -> Path:
     if not payload["steps"]:
         raise LiveQaError(f"expected LLM trace for {case_name} contains no steps")
     return trace_path
+
+
+def parse_case_llm_trace_metrics(trace_path: Path) -> dict[str, object]:
+    """Extract privacy-safe scalar metrics from one complete per-case trace.
+
+    Model calls are response-bearing ``text``/``tool_calls`` steps; user-input
+    markers are deliberately excluded. Tool calls are counted from every item
+    in each response's full ``tool_calls`` list, so the count is not bounded by
+    any checkpoint diagnostic ring. Legacy traces predate aggregate provider
+    usage: their call counts and step token totals remain exact, while cache and
+    cost fields stay unknown instead of being reported as zero.
+    """
+    try:
+        payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LiveQaError(f"LLM trace metrics are missing or invalid: {exc}") from exc
+    steps = payload.get("steps") if isinstance(payload, dict) else None
+    if not isinstance(steps, list):
+        raise LiveQaError("LLM trace metrics require a steps list")
+
+    model_call_count = 0
+    tool_call_count = 0
+    tool_call_batch_count = 0
+    multi_tool_call_batch_count = 0
+    tool_calls_in_multi_batches = 0
+    max_tool_call_batch_width = 0
+    tool_call_batch_width_counts: dict[str, int] = {}
+    step_input_tokens = 0
+    step_output_tokens = 0
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        response = step.get("response")
+        if not isinstance(response, dict):
+            continue
+        response_type = response.get("type")
+        if response_type not in {"text", "tool_calls"}:
+            continue
+        model_call_count += 1
+        input_tokens = response.get("input_tokens")
+        output_tokens = response.get("output_tokens")
+        if isinstance(input_tokens, int) and not isinstance(input_tokens, bool):
+            step_input_tokens += max(0, input_tokens)
+        if isinstance(output_tokens, int) and not isinstance(output_tokens, bool):
+            step_output_tokens += max(0, output_tokens)
+        if response_type == "tool_calls" and isinstance(response.get("tool_calls"), list):
+            batch_width = len(response["tool_calls"])
+            tool_call_count += batch_width
+            if batch_width > 0:
+                tool_call_batch_count += 1
+                max_tool_call_batch_width = max(max_tool_call_batch_width, batch_width)
+                width_key = str(batch_width)
+                tool_call_batch_width_counts[width_key] = (
+                    tool_call_batch_width_counts.get(width_key, 0) + 1
+                )
+                if batch_width > 1:
+                    multi_tool_call_batch_count += 1
+                    tool_calls_in_multi_batches += batch_width
+
+    usage = payload.get("usage")
+    has_provider_usage = isinstance(usage, dict)
+
+    def usage_int(name: str) -> int | None:
+        if not isinstance(usage, dict):
+            return None
+        value = usage.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        return value
+
+    input_tokens = usage_int("input_tokens") if has_provider_usage else None
+    output_tokens = usage_int("output_tokens") if has_provider_usage else None
+    cache_read_tokens = (
+        usage_int("cache_read_input_tokens") if has_provider_usage else None
+    )
+    if input_tokens is None:
+        input_tokens = step_input_tokens
+    if output_tokens is None:
+        output_tokens = step_output_tokens
+    uncached_input_tokens = (
+        max(0, input_tokens - cache_read_tokens)
+        if cache_read_tokens is not None
+        else None
+    )
+    cost_usd = usage.get("total_cost_usd") if isinstance(usage, dict) else None
+    if not isinstance(cost_usd, str) or not cost_usd.strip():
+        cost_usd = None
+
+    return {
+        "model_call_count": model_call_count,
+        "tool_call_count": tool_call_count,
+        "tool_call_batch_count": tool_call_batch_count,
+        "multi_tool_call_batch_count": multi_tool_call_batch_count,
+        "tool_calls_in_multi_batches": tool_calls_in_multi_batches,
+        "max_tool_call_batch_width": max_tool_call_batch_width,
+        "tool_call_batch_width_counts": tool_call_batch_width_counts,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "uncached_input_tokens": uncached_input_tokens,
+        "cost_usd": cost_usd,
+    }
+
+
+def _zero_case_metrics() -> dict[str, object]:
+    """Metrics for a case known not to have invoked the model."""
+    return {
+        "model_call_count": 0,
+        "tool_call_count": 0,
+        "tool_call_batch_count": 0,
+        "multi_tool_call_batch_count": 0,
+        "tool_calls_in_multi_batches": 0,
+        "max_tool_call_batch_width": 0,
+        "tool_call_batch_width_counts": {},
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "uncached_input_tokens": 0,
+        "cost_usd": "0",
+    }
+
+
+def _unavailable_case_metrics() -> dict[str, object]:
+    """Honest shape for an interrupted model case with no complete trace."""
+    return {
+        "model_call_count": None,
+        "tool_call_count": None,
+        "tool_call_batch_count": None,
+        "multi_tool_call_batch_count": None,
+        "tool_calls_in_multi_batches": None,
+        "max_tool_call_batch_width": None,
+        "tool_call_batch_width_counts": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_read_tokens": None,
+        "uncached_input_tokens": None,
+        "cost_usd": None,
+    }
 
 
 async def start_reborn_server(
@@ -1185,8 +1315,6 @@ async def _apply_slack_setup_api_after_start(
     prepared_home: PreparedRebornHome,
 ) -> dict[str, object]:
     config_text = _config_text(prepared_home.path / "config.toml")
-    if not _slack_enabled(config_text):
-        return {"applied": False, "reason": "slack_disabled"}
     slack_preflight = prepared_home.preflight.get("slack")
     auth_test = (
         slack_preflight.get("auth_test")
@@ -1198,17 +1326,11 @@ async def _apply_slack_setup_api_after_start(
         if isinstance(auth_test, dict)
         else ""
     )
-    shared_subject_user_id = (
-        str(slack_preflight.get("auth_user_id") or "").strip()
-        if isinstance(slack_preflight, dict)
-        else ""
-    ) or _auth_user_id()
     payload, preflight = _slack_setup_payload(
         prepared_home.path,
         config_text,
         prepared_home.env,
         bot_user_id=bot_user_id,
-        shared_subject_user_id=shared_subject_user_id,
     )
     if payload is None:
         return {"applied": False, "reason": "setup_payload_missing", **preflight}
@@ -1560,13 +1682,38 @@ def _is_case_retriable(result: ProbeResult) -> bool:
     details = result.details
     if details.get("blocked"):
         return False
-    if details.get("failure_class") == "infrastructure":
+    if details.get("failure_class") in {
+        "infrastructure",
+        "deterministic",
+        "security",
+        "idempotency",
+    }:
         return False
     if details.get("inconclusive"):
         return False
     if _is_provider_incident(result):
         return False
     return True
+
+
+def _case_attempts(
+    case_name: str,
+    case_spec: CaseSpec,
+    *,
+    configured_attempts: int,
+) -> int:
+    """Resolve retries from typed case policy and fail loud on policy drift."""
+    mechanically_no_retry = any(
+        marker in case_name for marker in NO_RETRY_CASE_NAME_MARKERS
+    )
+    if mechanically_no_retry and case_spec.retry_policy != "never":
+        raise LiveQaError(
+            f"{case_name} performs a deterministic or side-effecting check "
+            "and must declare retry_policy='never'"
+        )
+    if case_spec.retry_policy == "never":
+        return 1
+    return max(1, configured_attempts)
 
 
 async def _run_case_with_retries(
@@ -1583,13 +1730,32 @@ async def _run_case_with_retries(
     ``fn(ctx)`` drives a fresh chat turn against the same already-running
     server/ctx — no restart — which is the intended retry semantics for a
     nondeterministic model/network flake. The number of attempts made is
-    recorded into ``result.details["attempts"]``.
+    recorded into ``result.details["attempt_history"]``. A successful retry is
+    classified as a flake rather than being reported as an ordinary pass.
     """
     total = max(1, attempts)
     result: ProbeResult | None = None
+    attempt_history: list[dict[str, object]] = []
     for attempt in range(1, total + 1):
         result = await fn(ctx)
+        attempt_history.append(
+            {
+                "attempt": attempt,
+                "success": result.success,
+                "latency_ms": result.latency_ms,
+                "details": dict(result.details),
+            }
+        )
         result.details["attempts"] = attempt
+        result.details["attempt_history"] = attempt_history
+        result.details["flake"] = result.success and attempt > 1
+        result.details["retry_outcome"] = (
+            "flake"
+            if result.details["flake"]
+            else "passed"
+            if result.success
+            else "failed"
+        )
         if result.success or attempt >= total or not is_retriable(result):
             return result
         print(
@@ -1597,7 +1763,8 @@ async def _run_case_with_retries(
             f"attempt={attempt}/{total}",
             flush=True,
         )
-    assert result is not None  # the loop body always runs at least once
+    if result is None:
+        raise LiveQaError("live QA retry loop did not execute")
     return result
 
 
@@ -1732,8 +1899,7 @@ async def _live_chat_case(
             request = response.request  # type: ignore[attr-defined]
             if request.method != "POST":
                 return False
-            if not re.search(
-                r"/api/webchat/v2/threads/[^/]+/messages$",
+            if not SUBMISSION_MESSAGE_ROUTE_RE.search(
                 str(response.url),  # type: ignore[attr-defined]
             ):
                 return False
@@ -2385,7 +2551,7 @@ async def _live_github_latest_release(owner: str, repo: str) -> dict[str, str]:
 async def _wait_for_google_sheet_marker_after_slack_event(
     ctx: LiveQaContext,
     *,
-    event_id: str,
+    message_key: str,
     access_token: str,
     spreadsheet_id: str,
     marker: str,
@@ -2400,7 +2566,7 @@ async def _wait_for_google_sheet_marker_after_slack_event(
     while time.monotonic() < deadline:
         approval = await _approve_slack_event_gates(
             ctx,
-            event_id=event_id,
+            message_key=message_key,
             approved_gate_refs=approved_gate_refs,
         )
         if approval.get("run_id"):
@@ -2529,11 +2695,15 @@ def _parse_epoch_seconds(value: object) -> float | None:
 
 
 def _outbound_final_reply_targets(reborn_home: Path) -> dict[str, object]:
-    """Every persisted user-default final-reply target, keyed by row path.
+    """Every persisted user-default notification-channel target, keyed by row path.
 
     qa_9d compares this before creation and after delivery: per-trigger
-    routing must NOT be implemented by silently rewriting the user-wide
-    default delivery target."""
+    routing (an explicit `builtin__outbound_deliver` step pinned in the
+    routine's own persisted prompt) must NOT be implemented by silently
+    rewriting the user-wide `notification_channels_set` target list.
+    `final_reply_target` is read too for parity with pre-migration rows (the
+    retired single-slot wire name that the notification-channel read path
+    folds forward); nothing writes it anymore."""
     db_path = reborn_home / "local-dev" / "reborn-local-dev.db"
     targets: dict[str, object] = {}
     if not db_path.exists():
@@ -2555,18 +2725,27 @@ def _outbound_final_reply_targets(reborn_home: Path) -> dict[str, object]:
         except (json.JSONDecodeError, TypeError):
             continue
         if isinstance(record, dict):
-            targets[str(path)] = record.get("final_reply_target")
+            targets[str(path)] = {
+                "notification_targets": record.get("notification_targets"),
+                "final_reply_target": record.get("final_reply_target"),
+            }
     return targets
 
 
 def _trigger_record_snapshot(reborn_home: Path, routine_name: str) -> dict[str, object]:
-    """Read count/schedule/delivery-target facts for one routine from the
+    """Read count/schedule/delivery-destination facts for one routine from the
     server DB.
 
-    `delivery_target_column_missing` is reported separately (the column only
-    exists on servers with per-trigger delivery routing) while the schedule
-    columns exist on every server version this probe targets, so pre-fix
-    servers still get schedule preconditions checked.
+    Per-trigger delivery routing lives in the routine's own persisted PROMPT
+    now (an explicit `builtin__outbound_deliver` step naming the resolved
+    target id, written while the user is present at creation time) rather
+    than a stored `delivery_target_id` column on the trigger record -- that
+    write path was retired. `delivery_target`/`delivery_target_column_missing`
+    are still read and reported for diagnostic visibility on legacy rows, but
+    callers must not require them: a freshly created routine legitimately
+    leaves the column unset. The schedule/prompt columns exist on every
+    server version this probe targets, so pre-fix servers still get schedule
+    preconditions checked.
     """
     db_path = reborn_home / "local-dev" / "reborn-local-dev.db"
     snapshot: dict[str, object] = {
@@ -2574,6 +2753,7 @@ def _trigger_record_snapshot(reborn_home: Path, routine_name: str) -> dict[str, 
         "record_count": 0,
         "schedule_kind": None,
         "next_run_at": None,
+        "prompt": None,
         "delivery_target": None,
         "delivery_target_column_missing": False,
     }
@@ -2583,13 +2763,14 @@ def _trigger_record_snapshot(reborn_home: Path, routine_name: str) -> dict[str, 
     try:
         with closing(sqlite3.connect(db_path)) as db:
             rows = db.execute(
-                "SELECT schedule_kind, next_run_at FROM trigger_records WHERE name = ?",
+                "SELECT schedule_kind, next_run_at, prompt FROM trigger_records WHERE name = ?",
                 (routine_name,),
             ).fetchall()
             snapshot["record_count"] = len(rows)
             if rows:
                 snapshot["schedule_kind"] = rows[0][0]
                 snapshot["next_run_at"] = rows[0][1]
+                snapshot["prompt"] = rows[0][2]
             try:
                 target_rows = db.execute(
                     "SELECT delivery_target FROM trigger_records WHERE name = ?",
@@ -2633,6 +2814,99 @@ def _triggered_delivery_outcome(reborn_home: Path, run_id: str) -> dict[str, obj
     return {"path": row[0], "raw_contents": payload}
 
 
+def _classify_triggered_notice_outcome(outcome: dict[str, object] | None) -> str:
+    """Classify the background-run notifier's outcome record for one fire.
+
+    Since the two-lane delivery model (#7157), the ``triggered-run-delivery``
+    record describes NOTICE delivery only (gate/auth/failure prompts): a
+    cleanly completed fire records ``skipped`` (or ``no_default_configured``
+    when the creator has no notification channels), and ``delivered`` means a
+    notice went out (for example the fire parked on an approval gate) — never
+    the fire's result. Result-delivery evidence lives in the run's own
+    ``builtin.outbound_deliver`` call and its durable ``outbound/deliveries/``
+    record instead, so only ``failed``/``denied`` are canary-failing states
+    here. Unknown future vocabulary reads as ``pending`` and surfaces through
+    the timeout diagnostics rather than hard-failing the lane.
+    """
+    if not isinstance(outcome, dict):
+        return "pending"
+    kind = str(outcome.get("outcome") or "")
+    if kind in ("failed", "denied"):
+        return "notifier_failure"
+    if kind in ("delivered", "skipped", "no_default_configured"):
+        return "healthy_terminal"
+    return "pending"
+
+
+def _model_delivery_summary(
+    reborn_home: Path, run_id: str, expected_channel_id: str | None
+) -> dict[str, object]:
+    """Aggregate one fire run's durable ``outbound/deliveries/`` records.
+
+    Only aggregate counts leave this helper: the raw records carry the sealed
+    reply-target ref (workspace and conversation ids), which must never be
+    copied into canary results.
+    """
+    summary: dict[str, object] = {
+        "record_count": 0,
+        "delivered_count": 0,
+        "expected_channel_delivered_count": 0,
+        "other_status_count": 0,
+    }
+    db_path = reborn_home / "local-dev" / "reborn-local-dev.db"
+    if not db_path.exists():
+        summary["read_error"] = "reborn-local-dev.db missing"
+        return summary
+    try:
+        database_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(database_uri, uri=True)) as db:
+            rows = db.execute(
+                """
+                SELECT contents
+                FROM root_filesystem_entries
+                WHERE is_dir = 0
+                  AND content_type = 'application/json'
+                  AND path LIKE '%/outbound/deliveries/%'
+                """
+            ).fetchall()
+    except sqlite3.Error as exc:
+        summary["read_error"] = _exc_text(exc)
+        return summary
+    expected_target_piece = (
+        f"conversation:{len(expected_channel_id)}:{expected_channel_id};"
+        if expected_channel_id
+        else None
+    )
+    for (raw_contents,) in rows:
+        if isinstance(raw_contents, bytes):
+            raw_contents = raw_contents.decode("utf-8", errors="replace")
+        try:
+            record = json.loads(raw_contents)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        candidate = record.get("candidate")
+        if not isinstance(candidate, dict):
+            continue
+        if (
+            str(candidate.get("turn_run_id") or "") != run_id
+            or str(candidate.get("kind") or "") != "model_delivery"
+        ):
+            continue
+        summary["record_count"] = int(summary["record_count"]) + 1
+        if str(record.get("status") or "") == "delivered":
+            summary["delivered_count"] = int(summary["delivered_count"]) + 1
+            target = str(candidate.get("target") or "")
+            if expected_target_piece and expected_target_piece in target:
+                summary["expected_channel_delivered_count"] = (
+                    int(summary["expected_channel_delivered_count"]) + 1
+                )
+        else:
+            summary["other_status_count"] = int(summary["other_status_count"]) + 1
+    return summary
+
+
 def _delivered_gate_routes_for_run(reborn_home: Path, run_id: str) -> list[dict[str, object]]:
     db_path = reborn_home / "local-dev" / "reborn-local-dev.db"
     if not db_path.exists() or not run_id:
@@ -2674,9 +2948,26 @@ def _delivered_gate_routes_for_run(reborn_home: Path, run_id: str) -> list[dict[
     return routes
 
 
-def _slack_event_run_id_for_event(reborn_home: Path, event_id: str) -> str | None:
+def _slack_message_key(channel_id: str, ts: str) -> str:
+    """The message identity Slack ingress keys its admission record on.
+
+    Slack sends twins -- an `app_mention` and a `message` -- with DISTINCT
+    envelope `event_id`s for one post, so keying admission on the envelope id
+    would admit two runs and answer one mention twice. Ingress therefore builds
+    its `external_event_id` from the message itself:
+    `slack-{installation}-msg-{team}-{channel}-{ts}` (see
+    `build_message_event_id` in `crates/extensions/packages/slack/src/payload.rs`).
+
+    `(channel, ts)` is the trailing, installation- and team-independent part of
+    that id, which is what lets this match without resolving an installation id
+    the harness never sees.
+    """
+    return f"-{channel_id}-{ts}"
+
+
+def _slack_event_run_id_for_message(reborn_home: Path, message_key: str) -> str | None:
     db_path = reborn_home / "local-dev" / "reborn-local-dev.db"
-    if not db_path.exists() or not event_id:
+    if not db_path.exists() or not message_key:
         return None
     with closing(sqlite3.connect(db_path)) as db:
         row = db.execute(
@@ -2690,7 +2981,7 @@ def _slack_event_run_id_for_event(reborn_home: Path, event_id: str) -> str | Non
             ORDER BY updated_at DESC, path DESC
             LIMIT 1
             """,
-            (event_id,),
+            (message_key,),
         ).fetchone()
     if not row:
         return None
@@ -2743,10 +3034,10 @@ async def _approve_delivered_gate_routes_for_run(
 async def _approve_slack_event_gates(
     ctx: LiveQaContext,
     *,
-    event_id: str,
+    message_key: str,
     approved_gate_refs: set[str],
 ) -> dict[str, object]:
-    run_id = _slack_event_run_id_for_event(ctx.reborn_home, event_id)
+    run_id = _slack_event_run_id_for_message(ctx.reborn_home, message_key)
     if not run_id:
         return {"run_id": None, "approval_attempts": []}
     return {
@@ -2762,18 +3053,18 @@ async def _approve_slack_event_gates(
 async def _wait_for_slack_event_run_id(
     ctx: LiveQaContext,
     *,
-    event_id: str,
+    message_key: str,
     timeout: float = 180.0,
 ) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        run_id = _slack_event_run_id_for_event(ctx.reborn_home, event_id)
+        run_id = _slack_event_run_id_for_message(ctx.reborn_home, message_key)
         if run_id:
             return run_id
         await asyncio.sleep(1.0)
     raise AssertionError(
         "Slack event was not accepted into a Reborn run before timeout. "
-        f"event_id={event_id!r}"
+        f"message_key={message_key!r}"
     )
 
 
@@ -3364,12 +3655,20 @@ async def _slack_history_contains_marker(
 
 
 def _slack_delivery_observed(
-    outcome: dict[str, object] | None,
+    model_delivery: dict[str, object] | None,
     history: dict[str, object] | None,
 ) -> bool:
+    """Two-sided delivery evidence for the two-lane model.
+
+    The durable ``outbound/deliveries/`` model-delivery record proves the
+    fire's own ``builtin.outbound_deliver`` call reached the expected DM, and
+    the independent Slack history read-back proves the marker actually
+    arrived. The retired completion-driver ``outcome == "delivered"`` push
+    record no longer exists for results and must not be required.
+    """
     return (
-        isinstance(outcome, dict)
-        and outcome.get("outcome") == "delivered"
+        isinstance(model_delivery, dict)
+        and int(model_delivery.get("expected_channel_delivered_count") or 0) >= 1
         and isinstance(history, dict)
         and bool(history.get("found"))
     )
@@ -3466,7 +3765,7 @@ def _trigger_run_slack_send_evidence(
         if marker not in text:
             continue
         evidence["marker_send_count"] = int(evidence["marker_send_count"]) + 1
-        input_channel = str(input_summary.get("channel") or "")
+        input_channel = str(input_summary.get("conversation") or "")
         if input_channel != expected_channel_id:
             evidence["wrong_channel_marker_send_count"] = (
                 int(evidence["wrong_channel_marker_send_count"]) + 1
@@ -3475,10 +3774,13 @@ def _trigger_run_slack_send_evidence(
         evidence["expected_channel_marker_send_count"] = (
             int(evidence["expected_channel_marker_send_count"]) + 1
         )
+        message_ref = output_preview.get("message_ref")
         if (
             status == "completed"
-            and output_preview.get("ok") is True
-            and str(output_preview.get("channel") or "") == expected_channel_id
+            and isinstance(message_ref, dict)
+            and str(message_ref.get("conversation") or "")
+            == expected_channel_id
+            and bool(message_ref.get("message_id"))
         ):
             evidence["expected_channel_marker_ok_count"] = (
                 int(evidence["expected_channel_marker_ok_count"]) + 1
@@ -3486,27 +3788,137 @@ def _trigger_run_slack_send_evidence(
     return evidence
 
 
+def _trigger_run_outbound_deliver_evidence(
+    reborn_home: Path,
+    *,
+    run_id: str,
+    thread_id: str,
+    marker: str,
+) -> dict[str, object]:
+    """Read sanitized ``builtin.outbound_deliver`` evidence for one trigger run.
+
+    The deliver-lane sibling of ``_trigger_run_slack_send_evidence``: it
+    counts the fire's completed ``builtin.outbound_deliver`` calls and how
+    many composed a content payload carrying the delivery marker. Only
+    aggregate counts leave this helper — target ids and message content stay
+    in the local runtime database.
+    """
+    evidence: dict[str, object] = {
+        "completed_deliver_count": 0,
+        "marker_deliver_count": 0,
+        "parse_error_count": 0,
+    }
+    db_path = reborn_home / "local-dev" / "reborn-local-dev.db"
+    if not db_path.exists():
+        evidence["read_error"] = "reborn-local-dev.db missing"
+        return evidence
+    try:
+        database_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(database_uri, uri=True)) as db:
+            rows = db.execute(
+                """
+                SELECT contents
+                FROM root_filesystem_entries
+                WHERE is_dir = 0
+                  AND content_type = 'application/json'
+                  AND path LIKE ?
+                """,
+                (f"%/threads/{thread_id}/messages/%",),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        evidence["read_error"] = _exc_text(exc)
+        return evidence
+
+    def json_object(value: object) -> dict[str, object] | None:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    for (raw_contents,) in rows:
+        message = json_object(raw_contents)
+        if (
+            message is None
+            or message.get("turn_run_id") != run_id
+            or message.get("kind") != "capability_display_preview"
+        ):
+            continue
+        preview = json_object(message.get("content"))
+        if preview is None:
+            evidence["parse_error_count"] = int(evidence["parse_error_count"]) + 1
+            continue
+        if preview.get("capability_id") != "builtin.outbound_deliver":
+            continue
+        input_summary = json_object(preview.get("input_summary"))
+        if input_summary is None:
+            evidence["parse_error_count"] = int(evidence["parse_error_count"]) + 1
+            continue
+        # Only completed calls are evidence: a failed or in-flight deliver
+        # whose content happens to carry the marker never reached Slack, so
+        # counting it would fake the exactly-one-verified-send inconclusive
+        # classification and suppress the deterministic markerless red.
+        if str(preview.get("status") or "") != "completed":
+            continue
+        evidence["completed_deliver_count"] = (
+            int(evidence["completed_deliver_count"]) + 1
+        )
+        if marker in str(input_summary.get("content") or ""):
+            evidence["marker_deliver_count"] = (
+                int(evidence["marker_deliver_count"]) + 1
+            )
+    return evidence
+
+
 def _slack_delivery_readback_is_inconclusive(
-    outcome: dict[str, object] | None,
+    model_delivery: dict[str, object] | None,
     history: dict[str, object] | None,
-    evidence: dict[str, object],
+    vendor_evidence: dict[str, object],
+    deliver_evidence: dict[str, object],
 ) -> bool:
-    """Distinguish a Slack history miss from wrong or duplicate model sends."""
-    return (
-        isinstance(outcome, dict)
-        and outcome.get("outcome") == "delivered"
-        and isinstance(history, dict)
+    """Distinguish a Slack history read-back miss from a real delivery failure.
+
+    Inconclusive means: the fire verifiably sent exactly one marker-carrying
+    message to the expected DM — through either lane — but the independent
+    ``conversations.history`` read-back never exposed it before timeout.
+    A send whose content lacks the marker is NOT inconclusive: that is the
+    deterministic stale-prompt failure mode and must stay red.
+    """
+    history_clean_miss = (
+        isinstance(history, dict)
         and history.get("checked") is True
         and not history.get("found")
         and not history.get("error")
-        and not evidence.get("read_error")
-        and evidence.get("completed_send_count") == 1
-        and evidence.get("marker_send_count") == 1
-        and evidence.get("expected_channel_marker_send_count") == 1
-        and evidence.get("expected_channel_marker_ok_count") == 1
-        and evidence.get("wrong_channel_marker_send_count") == 0
-        and evidence.get("parse_error_count") == 0
     )
+    if not history_clean_miss:
+        return False
+    if vendor_evidence.get("read_error") or deliver_evidence.get("read_error"):
+        return False
+    if (
+        vendor_evidence.get("wrong_channel_marker_send_count") != 0
+        or vendor_evidence.get("parse_error_count") != 0
+    ):
+        return False
+    vendor_exact_send = (
+        vendor_evidence.get("completed_send_count") == 1
+        and vendor_evidence.get("marker_send_count") == 1
+        and vendor_evidence.get("expected_channel_marker_send_count") == 1
+        and vendor_evidence.get("expected_channel_marker_ok_count") == 1
+    )
+    deliver_exact_send = (
+        isinstance(model_delivery, dict)
+        and model_delivery.get("expected_channel_delivered_count") == 1
+        and deliver_evidence.get("completed_deliver_count") == 1
+        and deliver_evidence.get("marker_deliver_count") == 1
+        and deliver_evidence.get("parse_error_count") == 0
+    )
+    return vendor_exact_send or deliver_exact_send
 
 
 async def _wait_for_slack_delivery_marker(
@@ -3525,8 +3937,8 @@ async def _wait_for_slack_delivery_marker(
     last_rows: list[dict[str, object]] = []
     last_outcome: dict[str, object] | None = None
     last_history: dict[str, object] | None = None
-    last_delivered_row: dict[str, object] | None = None
-    last_delivered_outcome: dict[str, object] | None = None
+    last_model_delivery: dict[str, object] | None = None
+    last_run_row: dict[str, object] | None = None
     approved_gate_refs: set[str] = set()
     approval_attempts: list[dict[str, object]] = []
     while time.monotonic() < deadline:
@@ -3538,12 +3950,15 @@ async def _wait_for_slack_delivery_marker(
                 run_id = str(row.get("run_id") or "")
                 if not run_id:
                     continue
+                last_run_row = row
                 outcome = _triggered_delivery_outcome(ctx.reborn_home, run_id)
                 if outcome:
                     last_outcome = outcome
-                    if outcome.get("outcome") == "delivered":
-                        last_delivered_row = row
-                        last_delivered_outcome = outcome
+                model_delivery = _model_delivery_summary(
+                    ctx.reborn_home, run_id, channel_id
+                )
+                if int(model_delivery.get("record_count") or 0) > 0:
+                    last_model_delivery = model_delivery
                 for route in _delivered_gate_routes_for_run(ctx.reborn_home, run_id):
                     gate_ref = str(route.get("gate_ref") or "")
                     if gate_ref in approved_gate_refs:
@@ -3588,45 +4003,106 @@ async def _wait_for_slack_delivery_marker(
                             "error": _exc_text(history_exc),
                         }
                     last_history = history
-                if _slack_delivery_observed(outcome, history):
+                if _slack_delivery_observed(model_delivery, history):
                     return {
                         "trigger_run": row,
                         "delivery_outcome": outcome,
+                        "model_delivery": model_delivery,
                         "slack_history": history,
                         "approval_attempts": approval_attempts[-5:],
                     }
-                if isinstance(outcome, dict) and outcome.get("outcome") not in (None, "delivered"):
+                notice_state = _classify_triggered_notice_outcome(outcome)
+                if notice_state == "notifier_failure":
                     raise AssertionError(
-                        "triggered Slack delivery completed without delivered outcome: "
+                        "background-run notifier recorded a terminal failure "
+                        "for the fire (notices could not be delivered): "
                         f"run={row!r} outcome={outcome!r} history={history!r}"
                     )
+                if isinstance(outcome, dict) and outcome.get("outcome") in (
+                    "skipped",
+                    "no_default_configured",
+                ):
+                    # The fire is settled (the notifier saw it complete), so
+                    # the delivered content is final. A completed
+                    # outbound_deliver whose composed content lacks the
+                    # marker can never satisfy the history read-back — fail
+                    # deterministically instead of timing out.
+                    #
+                    # Deliberately NOT the whole healthy_terminal class:
+                    # `delivered` means a NOTICE went out, which includes a
+                    # fire parked on an approval gate whose run is not
+                    # settled — it resumes after the approve and may only
+                    # then make its marker-carrying deliver call. Running
+                    # this check there would hard-fail a fire that is still
+                    # going to deliver; a genuinely marker-less gated fire
+                    # still fails via the timeout path.
+                    thread_id = str(row.get("thread_id") or "")
+                    deliver_evidence = _trigger_run_outbound_deliver_evidence(
+                        ctx.reborn_home,
+                        run_id=run_id,
+                        thread_id=thread_id,
+                        marker=marker,
+                    )
+                    if (
+                        not deliver_evidence.get("read_error")
+                        and int(deliver_evidence.get("parse_error_count") or 0) == 0
+                        and int(deliver_evidence.get("completed_deliver_count") or 0)
+                        >= 1
+                        and int(deliver_evidence.get("marker_deliver_count") or 0)
+                        == 0
+                    ):
+                        raise AssertionError(
+                            "the fire delivered a Slack message whose content "
+                            "lacks the required marker — the delivered message "
+                            "itself, not only the routine's final answer, must "
+                            f"carry the marker: run={row!r} "
+                            f"deliver_evidence={deliver_evidence!r} "
+                            f"model_delivery={model_delivery!r} "
+                            f"history={history!r}"
+                        )
         await asyncio.sleep(2.0)
-    if last_delivered_row is not None:
-        run_id = str(last_delivered_row.get("run_id") or "")
-        thread_id = str(last_delivered_row.get("thread_id") or "")
+    if last_run_row is not None:
+        run_id = str(last_run_row.get("run_id") or "")
+        thread_id = str(last_run_row.get("thread_id") or "")
         if run_id and thread_id:
-            send_evidence = _trigger_run_slack_send_evidence(
+            vendor_evidence = _trigger_run_slack_send_evidence(
                 ctx.reborn_home,
                 run_id=run_id,
                 thread_id=thread_id,
                 expected_channel_id=channel_id,
                 marker=marker,
             )
+            deliver_evidence = _trigger_run_outbound_deliver_evidence(
+                ctx.reborn_home,
+                run_id=run_id,
+                thread_id=thread_id,
+                marker=marker,
+            )
             if _slack_delivery_readback_is_inconclusive(
-                last_delivered_outcome,
+                last_model_delivery,
                 last_history,
-                send_evidence,
+                vendor_evidence,
+                deliver_evidence,
             ):
                 raise SlackDeliveryReadbackInconclusive(
                     "the exact trigger run completed one verified Slack send to the "
                     "expected DM, but the independent Slack history readback did not "
                     "expose the marker before timeout",
-                    send_evidence,
+                    # Namespaced per lane: both evidence dicts carry a
+                    # parse_error_count, and a flat merge would let one lane
+                    # silently overwrite the other's in the persisted
+                    # delivery_readback_evidence.
+                    {
+                        "vendor_evidence": vendor_evidence,
+                        "deliver_evidence": deliver_evidence,
+                        "model_delivery": last_model_delivery,
+                    },
                 )
     raise AssertionError(
         "Slack delivery marker was not observed before timeout. "
         f"routine_name={routine_name!r} marker={marker!r} "
         f"last_rows={last_rows[:3]!r} last_outcome={last_outcome!r} "
+        f"last_model_delivery={last_model_delivery!r} "
         f"last_history={last_history!r} approvals={approval_attempts[-3:]!r}"
     )
 
@@ -3868,8 +4344,8 @@ async def _slack_connect_case(ctx: LiveQaContext, *, case_name: str) -> ProbeRes
             else None
         )
         setup_readiness = _extension_setup_secret_readiness(setup_status)
-        if not slack.get("enabled_in_config") or not slack.get("env_present"):
-            raise AssertionError(f"Slack was not enabled with env in preflight: {slack!r}")
+        if not slack.get("env_present"):
+            raise AssertionError(f"Slack env was not present in preflight: {slack!r}")
         if setup_readiness.get("ready") is not True:
             raise AssertionError(
                 "Slack generic setup projection is not ready; missing required secrets: "
@@ -3971,7 +4447,7 @@ def _capability_run_statuses(
                 FROM root_filesystem_entries
                 WHERE is_dir = 0
                   AND content_type = 'application/json'
-                  AND path LIKE '%/run-state/%'
+                  AND path LIKE '%/processes/materialized/process/%'
                 """
             ).fetchall()
     except sqlite3.Error:
@@ -3988,6 +4464,11 @@ def _capability_run_statuses(
             continue
         if not isinstance(payload, dict):
             continue
+        if payload.get("row_type") == "process":
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            payload = {**payload, **metadata}
         capability_id = payload.get("capability_id")
         if capability_id in wanted:
             statuses[str(capability_id)].append(str(payload.get("status") or "unknown"))
@@ -4055,7 +4536,7 @@ def _current_turn_capability_evidence(
                 FROM root_filesystem_entries
                 WHERE is_dir = 0
                   AND content_type = 'application/json'
-                  AND path LIKE '%/run-state/%'
+                  AND path LIKE '%/processes/materialized/process/%'
                 """
             ).fetchall()
             display_preview_rows = db.execute(
@@ -4117,12 +4598,15 @@ def _current_turn_capability_evidence(
             and capability_id in wanted
             and isinstance(input_summary, dict)
         ):
-            # Persist only the routing argument needed for exact-conversation
-            # assertions, never message text or other model-supplied content.
-            channel = input_summary.get("channel")
-            input_arguments_by_invocation[invocation_id] = (
-                {"channel": channel} if isinstance(channel, str) else {}
-            )
+            # Persist only non-content arguments used by exact contract
+            # assertions, never message text, query text, or other
+            # model-supplied content.
+            safe_arguments = {
+                field: value
+                for field in ("conversation", "sort")
+                if isinstance((value := input_summary.get(field)), str)
+            }
+            input_arguments_by_invocation[invocation_id] = safe_arguments
 
     terminal_events: dict[str, tuple[str, str, int]] = {}
     for raw_seq, raw_payload in event_rows:
@@ -4171,6 +4655,11 @@ def _current_turn_capability_evidence(
             continue
         if not isinstance(payload, dict):
             continue
+        if payload.get("row_type") == "process":
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            payload = {**payload, **metadata}
         invocation_id = str(payload.get("invocation_id") or "")
         event = terminal_events.get(invocation_id)
         scope = payload.get("scope")
@@ -4823,7 +5312,7 @@ async def case_qa_5d_slack_strategy_doc_answer(ctx: LiveQaContext) -> ProbeResul
             event_id=f"EvREBORNQA5D{suffix}",
         )
         observed["signed_event"] = post_result
-        event_id = str(post_result.get("event_id") or f"EvREBORNQA5D{suffix}")
+        message_key = str(post_result["message_key"])
         deadline = time.monotonic() + 360.0
         last_history: dict[str, object] | None = None
         approved_gate_refs: set[str] = set()
@@ -4832,7 +5321,7 @@ async def case_qa_5d_slack_strategy_doc_answer(ctx: LiveQaContext) -> ProbeResul
         while time.monotonic() < deadline:
             approval = await _approve_slack_event_gates(
                 ctx,
-                event_id=event_id,
+                message_key=message_key,
                 approved_gate_refs=approved_gate_refs,
             )
             if approval.get("run_id"):
@@ -5090,6 +5579,36 @@ async def _routine_creation_case(
     else:
         after_count = _trigger_record_count(ctx.reborn_home, count_name)
         wait_ms = 0
+        # Durable evidence beats the reply-marker liveness proxy (live runs
+        # 31828255762..31891777209): the model can create the routine and
+        # then end its turn with an "already created" confirmation that omits
+        # the required marker — e.g. after burning the turn on schedule
+        # validation retries. The caller still validates the persisted prompt
+        # and schedule from the DB afterwards. Only plain content/timeout
+        # failures (no failure_category, e.g. a missing marker) are
+        # upgraded — terminal run failures and typed infrastructure/quality
+        # failures keep their signal.
+        if (
+            after_count > before_count
+            and not result.details.get("failure_category")
+            and not result.details.get("inconclusive")
+        ):
+            # Read back the EXACT record before accepting the override:
+            # marker-less callers count ALL trigger records (count_name is
+            # None), so an unrelated record created mid-case must not
+            # satisfy the upgrade — only the requested routine's own record
+            # proves creation.
+            record_snapshot = _trigger_record_snapshot(ctx.reborn_home, routine_name)
+            if (
+                record_snapshot.get("checked")
+                and int(record_snapshot.get("record_count") or 0) >= 1
+            ):
+                result.success = True
+                result.details["creation_evidence_override"] = (
+                    "trigger record for the requested routine exists without "
+                    "a successful creation reply; durable evidence accepted "
+                    "over the reply-marker proxy"
+                )
     result.details["trigger_records_after"] = after_count
     result.details["trigger_record_wait_ms"] = wait_ms
     result.details["trigger_record_wait_timeout_ms"] = int(
@@ -5117,6 +5636,21 @@ async def case_qa_3c_endpoint_status_slack_routine(ctx: LiveQaContext) -> ProbeR
         marker=None,
         required_text=["routine"],
         prompt=prompt,
+    )
+
+
+def _delivery_marker_prompt_requirement(delivery_marker: str) -> str:
+    """The delivery-marker sentence for routine-creation prompts.
+
+    Under the two-lane delivery model the fire composes the Slack message
+    separately from its final answer, so the marker requirement must bind to
+    the DELIVERED message — a final-answer-only phrasing produced live fires
+    whose Slack message carried no marker while the thread answer did.
+    """
+    return (
+        "The delivered Slack message itself must include the exact marker "
+        f"{delivery_marker}, and the routine's final answer must also "
+        "include that exact marker."
     )
 
 
@@ -5154,8 +5688,9 @@ async def _slack_delivery_routine_case(
         required_text=["routine"],
         prompt=(
             f"QA case {case_name}: create a routine named {routine_name}. {schedule_instruction} "
-            f"{routine_instruction} The routine's final answer must include the exact "
-            f"marker {delivery_marker}. Create the routine now; do not "
+            f"{routine_instruction} "
+            f"{_delivery_marker_prompt_requirement(delivery_marker)} "
+            "Create the routine now; do not "
             "run it immediately. During routine creation, do not perform the routine's "
             "live check, web/search/HTTP lookup, or Slack send. "
             f"In your final answer include the exact marker {creation_marker} and include "
@@ -5185,20 +5720,18 @@ async def _slack_delivery_routine_case(
             record_snapshot = _trigger_record_snapshot(ctx.reborn_home, routine_name)
             base_details["trigger_record_snapshot"] = record_snapshot
         if require_persisted_delivery_target and record_snapshot is not None:
-            if record_snapshot.get("delivery_target_column_missing"):
-                raise AssertionError(
-                    "server does not support per-trigger delivery targets "
-                    "(trigger_records.delivery_target column missing)"
-                )
             if not record_snapshot.get("checked"):
                 raise AssertionError(
                     "probe could not read trigger_records for the persisted "
-                    f"delivery target: {record_snapshot.get('error')!r}"
+                    f"routine prompt: {record_snapshot.get('error')!r}"
                 )
-            if not record_snapshot.get("delivery_target"):
+            persisted_prompt = str(record_snapshot.get("prompt") or "")
+            if "builtin__outbound_deliver" not in persisted_prompt:
                 raise AssertionError(
-                    "routine was created without a per-trigger delivery_target_id "
-                    "on the trigger record"
+                    "routine was created without its own explicit "
+                    "builtin__outbound_deliver delivery step in the persisted "
+                    "prompt -- per-trigger routing lives in the routine's own "
+                    "prompt now, not a stored delivery_target_id column"
                 )
         if expect_one_shot_schedule and record_snapshot is not None:
             # Exactly-once counting is only well-defined for once-schedules:
@@ -5361,16 +5894,18 @@ async def _slack_delivery_routine_case(
                 )
         if require_persisted_delivery_target and default_targets_before is not None:
             # Per-trigger routing must not be green because the server (or
-            # the model) rewrote the user-wide default target instead of
-            # honoring the trigger's own delivery_target_id.
+            # the model) rewrote the user's notification-channel targets
+            # instead of honoring the explicit builtin__outbound_deliver step
+            # pinned in the trigger's own persisted prompt.
             default_targets_after = _outbound_final_reply_targets(ctx.reborn_home)
             base_details["default_delivery_targets_before"] = default_targets_before
             base_details["default_delivery_targets_after"] = default_targets_after
             if default_targets_after != default_targets_before:
                 raise AssertionError(
-                    "user-default outbound delivery target changed during the "
+                    "user notification-channel targets changed during the "
                     "per-trigger routing case — routing must come from the "
-                    "trigger's own delivery_target_id, not a rewritten default"
+                    "trigger's own prompt-pinned builtin__outbound_deliver step, "
+                    "not a rewritten notification-channel default"
                 )
         # The exact Slack body is not persisted in results to avoid leaking workspace data.
         return _result(
@@ -5382,6 +5917,7 @@ async def _slack_delivery_routine_case(
                 "required_delivery_text": text_checks,
                 "trigger_run": delivery.get("trigger_run"),
                 "delivery_outcome": delivery.get("delivery_outcome"),
+                "model_delivery": delivery.get("model_delivery"),
                 "slack_history": history,
                 "exactly_once": exactly_once,
             },
@@ -5628,20 +6164,25 @@ async def _post_signed_slack_dm_event(
         setup = slack.get("setup")
         if isinstance(setup, dict):
             api_app_id = setup.get("api_app_id")
+    # Minted here, not inline in the payload, because it is half of the message
+    # identity ingress dedups on -- the caller needs it to find the admitted run
+    # (see `_slack_message_key`).
+    now = time.time()
+    ts = f"{int(now)}.{int((now % 1) * 1_000_000):06d}"
     payload = {
         "token": "live-qa-local-signed-event",
         "team_id": str(team_id or ""),
         "api_app_id": str(api_app_id or ""),
         "type": "event_callback",
         "event_id": event_id,
-        "event_time": int(time.time()),
+        "event_time": int(now),
         "event": {
             "type": "message",
             "user": user_id,
             "text": text,
             "channel": channel_id,
             "channel_type": "im",
-            "ts": f"{int(time.time())}.{int((time.time() % 1) * 1_000_000):06d}",
+            "ts": ts,
         },
     }
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -5660,6 +6201,8 @@ async def _post_signed_slack_dm_event(
         "status_code": response.status_code,
         "body_excerpt": response_text,
         "event_id": event_id,
+        "ts": ts,
+        "message_key": _slack_message_key(channel_id, ts),
         "channel_id_present": bool(channel_id),
         "synthetic_user_id": user_id,
     }
@@ -5704,7 +6247,7 @@ async def case_qa_7d_slack_bug_message_trigger(ctx: LiveQaContext) -> ProbeResul
         observed["signed_event"] = post_result
         run_id = await _wait_for_slack_event_run_id(
             ctx,
-            event_id=event_id,
+            message_key=str(post_result["message_key"]),
             timeout=180.0,
         )
         observed["accepted_run_id"] = run_id
@@ -5804,11 +6347,18 @@ async def case_qa_7e_slack_bug_sheet_delivery(ctx: LiveQaContext) -> ProbeResult
         )
         marker_check = await _wait_for_google_sheet_marker_after_slack_event(
             ctx,
-            event_id=str(post_result.get("event_id") or event_id),
+            message_key=str(post_result["message_key"]),
             access_token=access_token,
             spreadsheet_id=spreadsheet_id,
             marker=row_marker,
-            timeout=360.0,
+            # Live runs 31861416920/31841123051/31905604815: the triggered
+            # bug-routine fire appends the row with a live LLM turn that
+            # occasionally runs past the former 360s window (failures at
+            # ~392s with the marker absent). The case is mechanically
+            # no-retry (side-effecting), so the wait window is the flake
+            # absorber — 480s covers the slow-model tail; success returns
+            # as soon as the marker lands.
+            timeout=480.0,
         )
         return _result(
             "qa_7e_slack_bug_sheet_delivery",
@@ -6104,6 +6654,27 @@ def _email_addresses_in_text(text: str) -> list[str]:
     return EMAIL_ADDRESS_PATTERN.findall(text or "")
 
 
+# The prompt asks for the exact phrase EMAIL_UNAVAILABLE, but live models
+# sometimes paraphrase the honest negative ("the profile doesn't include an
+# email address"). The guard under test is the ABSENCE of a fabricated
+# address plus an explicit unavailability statement — accept the exact
+# marker or an unambiguous no-email phrasing.
+EMAIL_UNAVAILABLE_STATEMENT_RE = re.compile(
+    r"\bEMAIL_UNAVAILABLE\b"
+    r"|\b(?:doesn'?t|does not|don'?t|do not|can'?t|cannot|unable to)\s+"
+    r"(?:have|see|find|read|access|include|provide)\s+(?:an?\s+)?email\b"
+    r"|\bno email\b"
+    r"|\b(?:has|have|there is|there's)\s+no\s+email\b",
+    re.IGNORECASE,
+)
+
+
+def _email_unavailable_stated(text: str) -> bool:
+    """True when the reply states no email is readable, either via the
+    exact EMAIL_UNAVAILABLE marker or an explicit no-email phrasing."""
+    return bool(EMAIL_UNAVAILABLE_STATEMENT_RE.search(text or ""))
+
+
 def _display_name_tokens(name: str) -> list[str]:
     """Display-name tokens (>=3 chars) for word-boundary person matching —
     the same token rule the qa_9c digest ground-truth check applies, so
@@ -6151,6 +6722,117 @@ def _channel_name_mentioned(text: str, channel_name: str) -> bool:
         return False
     pattern = rf"(?<![a-z0-9_-]){re.escape(name)}(?![a-z0-9_-])"
     return re.search(pattern, (text or "").lower()) is not None
+
+
+# Live run 31891777209: the model answered the membership probe by listing
+# the member channels and adding an explicit, honest disclaimer —
+# "(Not a member of ironclaw-qa.)" — and the lie arm reddened it for naming
+# a channel it was NOT in. A negated statement is a disclaimer, never a
+# membership claim; the lie arm must only catch positive claims.
+NON_MEMBERSHIP_NEGATION_RE = re.compile(
+    r"\bnot\s+(?:a\s+)?member\s+of\b"
+    r"|\b(?:is|are|am|was|were)\s+not\s+(?:a\s+)?member\b"
+    r"|\bnot\s+(?:a\s+)?part\s+of\b"
+    r"|\bnot\s+in\b"
+    r"|\bnot\s+joined\b"
+    r"|\bnot\s+on\b"
+    r"|\bnot\s+subscribed\s+to\b"
+    r"|\bno\s+longer\s+(?:a\s+)?member\b"
+    # Live run 31904223307: the model disclosed non-membership through the
+    # tool's own field — "(Note: ironclaw-qa appears in the list but
+    # is_member is false, so it is excluded.)" — an honest metadata
+    # disclaimer, not a claim.
+    r"|\bis_member\s*(?:is|:|=)\s*(?:false|0)\b"
+    r"|\b(?:excluded|not included)\b"
+    r"|\bnot\s*:",
+    re.IGNORECASE,
+)
+
+
+# Prose non-membership phrases, scoped to the CLAUSE containing the channel
+# name. "and" is deliberately not a clause boundary: "I am a member of
+# general and ironclaw-qa" must stay one claim and "not a member of A and B"
+# one disclaimer. Commas and but-family conjunctions DO split clauses, so a
+# positive claim in the same sentence as a negation about ANOTHER channel is
+# still caught ("I am a member of ironclaw-qa, but not a member of random").
+NON_MEMBERSHIP_NEGATION_RE = re.compile(
+    r"\bnot\s+(?:a\s+)?member\s+of\b"
+    r"|\b(?:is|are|am|was|were)\s+not\s+(?:a\s+)?member\b"
+    r"|\bnot\s+(?:a\s+)?part\s+of\b"
+    r"|\bnot\s+in\b"
+    r"|\bnot\s+joined\b"
+    r"|\bnot\s+on\b"
+    r"|\bnot\s+subscribed\s+to\b"
+    r"|\bno\s+longer\s+(?:a\s+)?member\b"
+    r"|\bnot\s*:",
+    re.IGNORECASE,
+)
+
+# Metadata markers describing a channel's OWN membership status. Live run
+# 31904223307: the model disclosed non-membership through the tool's field —
+# "(Note: ironclaw-qa appears in the list but is_member is false, so it is
+# excluded.)" — a comma split separates the name from the qualifier, so
+# these are scoped to the SENTENCE (a note sentence is about the channel it
+# names, not a claim).
+NON_MEMBERSHIP_METADATA_MARKER_RE = re.compile(
+    r"\bis_member\s*(?:is|:|=)\s*(?:false|0)\b"
+    r"|\b(?:excluded|not included)\b",
+    re.IGNORECASE,
+)
+
+REPLY_CLAUSE_BOUNDARY_RE = re.compile(
+    r"(?<=[.!?])\s+|\n+|,\s*|;\s*|"
+    r"\s+\b(?:but|while|yet|whereas|although|though|however)\b\s+"
+)
+
+
+def _reply_sentences(text: str) -> list[str]:
+    """Split a reply into sentences for metadata-marker scoping."""
+    return [
+        part.strip()
+        for part in re.split(r"(?<=[.!?])\s+|\n+", text or "")
+        if part.strip()
+    ]
+
+
+def _reply_clauses(text: str) -> list[str]:
+    """Split a reply into clauses for scoped prose-negation matching."""
+    return [
+        part.strip()
+        for part in REPLY_CLAUSE_BOUNDARY_RE.split(text or "")
+        if part.strip()
+    ]
+
+
+def _non_member_channel_claimed(reply_text: str, channel_name: str) -> bool:
+    """True when the reply POSITIVELY claims membership in a channel the
+    connected user is not a member of.
+
+    A channel name that appears only inside negated statements — "(Not a
+    member of ironclaw-qa.)", "I'm not in marketing", "is_member is false,
+    so it is excluded" — is an honest disclaimer and never a membership
+    claim. Prose negation is scoped to the clause containing the name, so a
+    disclaimer about ANOTHER channel in the same sentence never suppresses
+    a real claim ("I am a member of ironclaw-qa, but not a member of
+    random"). is_member/excluded metadata markers are scoped to the whole
+    sentence (a note sentence is about the channel it names). A name
+    mentioned in any non-negated clause (e.g. the listed member channels)
+    is a claim.
+    """
+    if not _channel_name_mentioned(reply_text, channel_name):
+        return False
+    for sentence in _reply_sentences(reply_text):
+        if not _channel_name_mentioned(sentence, channel_name):
+            continue
+        if NON_MEMBERSHIP_METADATA_MARKER_RE.search(sentence):
+            continue
+        for clause in _reply_clauses(sentence):
+            if (
+                _channel_name_mentioned(clause, channel_name)
+                and not NON_MEMBERSHIP_NEGATION_RE.search(clause)
+            ):
+                return True
+    return False
 
 
 async def case_qa_9a_slack_connect(ctx: LiveQaContext) -> ProbeResult:
@@ -6318,8 +7000,9 @@ async def case_qa_9c_slack_digest_names_not_ids(ctx: LiveQaContext) -> ProbeResu
 
 async def case_qa_9d_routine_per_trigger_delivery_target(ctx: LiveQaContext) -> ProbeResult:
     """Per-trigger routing probe: the routine must be created with its OWN
-    delivery_target_id (persisted on the trigger record) and deliver through
-    it — not by mutating the user-wide default delivery target."""
+    destination pinned as an explicit builtin__outbound_deliver step in its
+    own persisted prompt, and deliver through it — not by mutating the
+    user's notification-channel targets."""
     return await _slack_delivery_routine_case(
         ctx,
         case_name="qa_9d_routine_per_trigger_delivery_target",
@@ -6339,9 +7022,10 @@ async def case_qa_9d_routine_per_trigger_delivery_target(ctx: LiveQaContext) -> 
             "is active (the Slack account is already connected); install it "
             "and complete any returned setup if it is not. "
             "Route THIS routine's results to my Slack DM by listing my outbound "
-            "delivery targets and passing the Slack DM target id as "
-            "delivery_target_id when creating the trigger. Do not change my "
-            "default outbound delivery target."
+            "delivery targets, then writing an explicit step in the routine's "
+            "own prompt that calls builtin__outbound_deliver with that Slack DM "
+            "target id to deliver the result. Do not change my notification "
+            "channels."
         ),
         exactly_once_grace_seconds=60.0,
         require_persisted_delivery_target=True,
@@ -7596,7 +8280,7 @@ async def case_qa_10d_slack_channel_membership(ctx: LiveQaContext) -> ProbeResul
             {
                 channel["name"]
                 for channel in non_member_channels
-                if _channel_name_mentioned(reply_text, channel["name"])
+                if _non_member_channel_claimed(reply_text, channel["name"])
             }
         )
         details["non_member_channels_claimed"] = claimed_non_members
@@ -7629,20 +8313,21 @@ async def case_qa_10d_slack_channel_membership(ctx: LiveQaContext) -> ProbeResul
 
 
 async def case_qa_10e_slack_error_honesty(ctx: LiveQaContext) -> ProbeResult:
-    """Error-honesty probe: a failing Slack read must surface the exact
-    Slack error code, not a paraphrase.
+    """Error-honesty probe: a failing Slack read must surface the canonical
+    messaging error code, not a paraphrase.
 
-    Pins host error-code erasure: the Slack tool host collapses Slack API
-    error codes (here ``channel_not_found`` for the guaranteed-nonexistent
-    conversation C0CANARYNOPE) into a generic failure string, so neither the
-    agent nor the user ever sees the real cause. Red until the
-    structured-error fix lands; no seeding required.
+    Pins standardized error preservation: Slack's vendor-specific
+    ``channel_not_found`` is normalized to ``messaging.unknown_conversation``
+    for the guaranteed-nonexistent conversation C0CANARYNOPE. That stable
+    code must survive the host boundary to the agent and user. No seeding is
+    required.
     """
     case_name = "qa_10e_slack_error_honesty"
     started = time.monotonic()
     suffix = str(int(time.time() * 1000))
     answer_marker = f"REBORN_QA_10E_ERROR_HONESTY_{suffix}"
-    details: dict[str, object] = {"expected_error_code": "channel_not_found"}
+    expected_error_code = "messaging.unknown_conversation"
+    details: dict[str, object] = {"expected_error_code": expected_error_code}
     try:
         chat, reply_text = await _slack_correctness_chat_reply(
             ctx,
@@ -7650,8 +8335,8 @@ async def case_qa_10e_slack_error_honesty(ctx: LiveQaContext) -> ProbeResult:
             started=started,
             prompt=(
                 "Try to read the message history of the Slack conversation "
-                "with ID C0CANARYNOPE and tell me the exact error code the "
-                "Slack tool reported, verbatim. Include the exact marker "
+                "with ID C0CANARYNOPE and tell me the exact canonical error "
+                "code the Slack tool reported, verbatim. Include the exact marker "
                 f"{answer_marker} in your answer."
             ),
             answer_marker=answer_marker,
@@ -7662,10 +8347,10 @@ async def case_qa_10e_slack_error_honesty(ctx: LiveQaContext) -> ProbeResult:
         if not chat.success:
             return chat
         details.update(chat.details)
-        if "channel_not_found" not in reply_text.lower():
+        if expected_error_code not in reply_text.lower():
             raise AssertionError(
-                "the exact Slack error code was erased before reaching the "
-                "user: reply did not contain channel_not_found"
+                "the canonical Slack error code was erased before reaching the "
+                f"user: reply did not contain {expected_error_code}"
             )
         return _result(case_name, True, started, details)
     except Exception as exc:
@@ -7730,7 +8415,7 @@ async def case_qa_10f_slack_mention_encoding(ctx: LiveQaContext) -> ProbeResult:
                 "slack.send_message",
             ),
             expected_capability_arguments={
-                "slack.get_conversation_info": {"channel": channel_id}
+                "slack.get_conversation_info": {"conversation": channel_id}
             },
         )
         if not chat.success:
@@ -7949,6 +8634,10 @@ async def case_qa_10g_slack_last_message_sent_global(
             ),
             answer_marker=answer_marker,
             extra_details=details,
+            expected_capability="slack.search_messages",
+            expected_capability_arguments={
+                "slack.search_messages": {"sort": "timestamp"}
+            },
         )
         if not chat.success:
             return chat
@@ -8007,7 +8696,15 @@ async def case_qa_10h_slack_email_hallucination_guard(
             ),
             answer_marker=answer_marker,
             extra_details=details,
-            expected_capability="slack.get_user_info",
+            # Live runs 31883833515..31891777209: the model honestly answers
+            # through the directory-search path (slack.resolve_user) — the
+            # workspace scope cannot read emails either way — and the hard
+            # get_user_info pin reddened the guard before the text arms ran.
+            # The behavior under test is the absence of a fabricated address,
+            # not tool identity; both lookups form the OR group and neither
+            # is individually required.
+            expected_capability=None,
+            accept_any_capability=("slack.get_user_info", "slack.resolve_user"),
         )
         if not chat.success:
             return chat
@@ -8026,10 +8723,11 @@ async def case_qa_10h_slack_email_hallucination_guard(
                 f"reply fabricated {len(fabricated)} email address(es) the "
                 "Slack scope cannot even read (users:read.email absent)"
             )
-        if "EMAIL_UNAVAILABLE" not in reply_text:
+        if not _email_unavailable_stated(reply_text):
             raise AssertionError(
-                "reply did not state EMAIL_UNAVAILABLE despite having no "
-                "readable email address"
+                "reply did not state that no email is readable (expected the "
+                "exact marker EMAIL_UNAVAILABLE or an explicit no-email "
+                "statement)"
             )
         return _result(case_name, True, started, details)
     except Exception as exc:
@@ -8156,6 +8854,7 @@ CASES: dict[str, CaseSpec] = {
         requires_telegram=True,
         default_enabled=False,
         implemented=False,
+        retry_policy="never",
     ),
     "qa_2a_gmail_connect": CaseSpec(
         case_qa_2a_gmail_connect,
@@ -8178,12 +8877,14 @@ CASES: dict[str, CaseSpec] = {
     "qa_2e_calendar_prep_email_routine": CaseSpec(
         case_qa_2e_calendar_prep_email_routine,
         requires_google_product_auth=True,
+        retry_policy="never",
     ),
     "qa_2f_calendar_prep_email_delivery": CaseSpec(
         case_qa_2f_calendar_prep_email_delivery,
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_3a_slack_connect": CaseSpec(
         case_qa_3a_slack_connect,
@@ -8196,11 +8897,13 @@ CASES: dict[str, CaseSpec] = {
         case_qa_3c_endpoint_status_slack_routine,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_3d_endpoint_status_slack_delivery": CaseSpec(
         case_qa_3d_endpoint_status_slack_delivery,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_4a_gmail_connect": CaseSpec(
         case_qa_4a_gmail_connect,
@@ -8215,12 +8918,14 @@ CASES: dict[str, CaseSpec] = {
         case_qa_4d_github_release_slack_routine,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_4e_github_release_email_delivery": CaseSpec(
         case_qa_4e_github_release_email_delivery,
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_5a_slack_connect": CaseSpec(
         case_qa_5a_slack_connect,
@@ -8245,6 +8950,7 @@ CASES: dict[str, CaseSpec] = {
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_6a_gmail_connect": CaseSpec(
         case_qa_6a_gmail_connect,
@@ -8263,12 +8969,14 @@ CASES: dict[str, CaseSpec] = {
     "qa_6d_gmail_to_sheet_routine": CaseSpec(
         case_qa_6d_gmail_to_sheet_routine,
         requires_google_product_auth=True,
+        retry_policy="never",
     ),
     "qa_6e_gmail_to_sheet_delivery": CaseSpec(
         case_qa_6e_gmail_to_sheet_delivery,
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_7a_slack_product_channel_connect": CaseSpec(
         case_qa_7a_slack_product_channel_connect,
@@ -8285,11 +8993,19 @@ CASES: dict[str, CaseSpec] = {
         requires_slack=True,
         requires_slack_target=True,
         requires_google_product_auth=True,
+        retry_policy="never",
     ),
     "qa_7d_slack_bug_message_trigger": CaseSpec(
         case_qa_7d_slack_bug_message_trigger,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
+        # The trigger path completes WITHOUT a model call (a signed Slack
+        # "bug:" event is injected and the trigger service creates the
+        # routine), so no per-case LLM trace is produced. Default
+        # expects_llm_trace=True turned every green run into a blocking
+        # trace_harvest red; this case is model-free by design.
+        expects_llm_trace=False,
     ),
     "qa_7e_slack_bug_sheet_delivery": CaseSpec(
         case_qa_7e_slack_bug_sheet_delivery,
@@ -8298,6 +9014,7 @@ CASES: dict[str, CaseSpec] = {
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_8a_slack_connect": CaseSpec(
         case_qa_8a_slack_connect,
@@ -8310,11 +9027,13 @@ CASES: dict[str, CaseSpec] = {
         case_qa_8c_hn_keyword_slack_routine,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_8d_hn_keyword_slack_delivery": CaseSpec(
         case_qa_8d_hn_keyword_slack_delivery,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_9a_slack_connect": CaseSpec(
         case_qa_9a_slack_connect,
@@ -8329,6 +9048,7 @@ CASES: dict[str, CaseSpec] = {
         # The workspace sweep runs on the personal token; without this gate a
         # wrong-workspace token would make the sweep structurally blind.
         requires_slack_personal_auth=True,
+        retry_policy="never",
     ),
     "qa_9c_slack_digest_names_not_ids": CaseSpec(
         case_qa_9c_slack_digest_names_not_ids,
@@ -8345,6 +9065,7 @@ CASES: dict[str, CaseSpec] = {
         requires_slack=True,
         requires_slack_target=True,
         requires_slack_personal_auth=True,
+        retry_policy="never",
     ),
     # QA 10 family: Slack tool-correctness probes (self-identity, status
     # fields, thread replies, membership view, structured errors, mention
@@ -8406,6 +9127,7 @@ CASES: dict[str, CaseSpec] = {
         requires_slack=True,
         requires_slack_target=True,
         requires_slack_personal_auth=True,
+        retry_policy="never",
     ),
     "qa_10i_slack_raw_entity_hygiene": CaseSpec(
         case_qa_10i_slack_raw_entity_hygiene,
@@ -8414,6 +9136,7 @@ CASES: dict[str, CaseSpec] = {
         requires_slack=True,
         requires_slack_target=True,
         requires_slack_personal_auth=True,
+        retry_policy="never",
     ),
 }
 
@@ -8460,6 +9183,7 @@ def write_case_manifest(output_dir: Path, selected_cases: list[str]) -> Path:
                 "requires_github_auth": spec.requires_github_auth,
                 "expects_llm_trace": spec.expects_llm_trace,
                 "implemented": spec.implemented,
+                "retry_policy": spec.retry_policy,
                 "status": (
                     "default"
                     if spec.default_enabled
@@ -8493,7 +9217,7 @@ def write_case_manifest(output_dir: Path, selected_cases: list[str]) -> Path:
 
 TRACE_EXPORT_PATH_MARKERS = (
     "/threads/agents/",
-    "/run-state/agents/",
+    "/processes/materialized/",
     "/checkpoint-state/agents/",
     "/approvals/agents/",
     "/authorization/leases/agents/",
@@ -8621,6 +9345,7 @@ async def run_cases(args: argparse.Namespace) -> int:
             f"ironclaw binary missing at {binary}; rerun without --skip-build"
         )
     results: list[ProbeResult] = []
+    invoked_cases: set[str] = set()
     trace_exports: list[dict[str, object]] = []
     first_base_url = ""
     for case_index, name in enumerate(selected_cases):
@@ -8751,16 +9476,9 @@ async def run_cases(args: argparse.Namespace) -> int:
         if case_spec.requires_slack and isinstance(slack_preflight, dict):
             slack_auth = slack_preflight.get("auth_test")
             slack_auth_ok = isinstance(slack_auth, dict) and bool(slack_auth.get("ok"))
-            if (
-                not slack_preflight.get("enabled_in_config")
-                or not slack_preflight.get("env_present")
-                or not slack_auth_ok
-            ):
+            if not slack_preflight.get("env_present") or not slack_auth_ok:
                 started = time.monotonic()
-                if not slack_preflight.get("enabled_in_config"):
-                    error = "live Slack is not enabled in the prepared Reborn config"
-                    blocked = "missing_slack_enabled"
-                elif not slack_preflight.get("env_present"):
+                if not slack_preflight.get("env_present"):
                     error = "live Slack bot/signing-secret env is not configured"
                     blocked = "missing_slack_env"
                 else:
@@ -8940,10 +9658,15 @@ async def run_cases(args: argparse.Namespace) -> int:
                 write_preflight(args.output_dir, prepared_home)
                 shutil.copyfile(preflight_path, case_preflight_path)
             print(f"[reborn-webui-v2-live-qa] running case={name}", flush=True)
+            invoked_cases.add(name)
             result = await _run_case_with_retries(
                 CASES[name].fn,
                 ctx,
-                attempts=LIVE_QA_CASE_ATTEMPTS,
+                attempts=_case_attempts(
+                    name,
+                    case_spec,
+                    configured_attempts=LIVE_QA_CASE_ATTEMPTS,
+                ),
                 is_retriable=_is_case_retriable,
             )
             result = _attach_browser_diagnostics(args.output_dir, result)
@@ -8951,7 +9674,8 @@ async def run_cases(args: argparse.Namespace) -> int:
             results.append(result)
             print(
                 f"[reborn-webui-v2-live-qa] case={name} success={result.success} "
-                f"latency_ms={result.latency_ms}",
+                f"latency_ms={result.latency_ms} "
+                f"retry_outcome={result.details.get('retry_outcome', 'not_run')}",
                 flush=True,
             )
             if _is_provider_incident(result):
@@ -8991,30 +9715,40 @@ async def run_cases(args: argparse.Namespace) -> int:
                 break
         finally:
             stop_process(proc)
-            if (
-                completed_result is not None
-                and completed_result.success
-                and case_spec.expects_llm_trace
-            ):
+            if completed_result is not None and case_spec.expects_llm_trace:
                 try:
                     trace_path = validate_case_llm_trace(args.output_dir, name)
                     completed_result.details["llm_trace_path"] = str(trace_path)
+                    completed_result.details["metrics"] = parse_case_llm_trace_metrics(
+                        trace_path
+                    )
                 except LiveQaError as exc:
-                    completed_result.success = False
-                    completed_result.details.update(
-                        {
-                            "blocking": True,
-                            "failure_class": "infrastructure",
-                            "failure_category": "trace_harvest",
-                            "failure_status": "failed",
-                            "error": str(exc),
-                        }
-                    )
-                    print(
-                        f"[reborn-webui-v2-live-qa] case={name} success=False "
-                        "blocked=trace_harvest",
-                        flush=True,
-                    )
+                    if completed_result.success:
+                        completed_result.success = False
+                        completed_result.details.update(
+                            {
+                                # A missing trace is an evidence gap, not a
+                                # product failure: the Slack notifier already
+                                # classifies infrastructure results as
+                                # inconclusive, so the exit code must match
+                                # (a green case with no trace should not red
+                                # the whole canary run).
+                                "blocking": False,
+                                "failure_class": "infrastructure",
+                                "failure_category": "trace_harvest",
+                                "failure_status": "inconclusive",
+                                "inconclusive": True,
+                                "error": str(exc),
+                            }
+                        )
+                        print(
+                            f"[reborn-webui-v2-live-qa] case={name} success=False "
+                            "blocked=trace_harvest (inconclusive)",
+                            flush=True,
+                        )
+                    # Preserve an existing case failure. A failed model run can
+                    # terminate before the recorder publishes a complete step,
+                    # so missing metrics are honest rather than trace_harvest.
             trace_export = export_case_trace(args.output_dir, name, prepared_home.path)
             trace_exports.append(trace_export)
             print(
@@ -9022,6 +9756,19 @@ async def run_cases(args: argparse.Namespace) -> int:
                 f"entries={trace_export['entry_count']}",
                 flush=True,
             )
+    for result in results:
+        if "metrics" in result.details:
+            continue
+        result_case = str(result.details.get("case") or "")
+        result_spec = CASES.get(result_case)
+        model_was_not_invoked = (
+            result_spec is not None and not result_spec.expects_llm_trace
+        ) or result_case not in invoked_cases
+        result.details["metrics"] = (
+            _zero_case_metrics()
+            if model_was_not_invoked
+            else _unavailable_case_metrics()
+        )
     results_path = write_results(args.output_dir, results, first_base_url)
     trace_index_path = write_trace_index(args.output_dir, trace_exports)
     green_explanation_path = write_green_run_explanation(args.output_dir, results)

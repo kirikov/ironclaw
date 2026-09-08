@@ -4,16 +4,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::super::super::harness_mcp::{
-    build_loopback_mcp_runtime, local_dev_host_runtime_with_registry_egress_and_mcp,
-    mcp_loopback_network_policy, mock_mcp_extension_package,
+    build_loopback_mcp_runtime, mcp_loopback_network_policy, mock_mcp_extension_package,
+    standalone_host_runtime_with_registry_egress_and_mcp,
 };
 use super::super::{
     HarnessResult, HostRuntimeCapabilityHarness, RecordingRuntimeHttpEgress,
     host_runtime_storage_roots, workspace_mounts,
 };
-use ironclaw_extensions::ExtensionRegistry;
+use ironclaw_extension_registry::ExtensionRegistry;
 use ironclaw_host_api::{
-    CapabilityId, EffectKind, ExtensionId, MountPermissions, RuntimeKind, UserId,
+    capability::EffectKind,
+    ids::{CapabilityId, ExtensionId, UserId},
+    mount::MountPermissions,
+    runtime::RuntimeKind,
 };
 
 /// Wire a single MCP capability backed by the loopback mock server.
@@ -47,7 +50,7 @@ pub(crate) async fn mock_mcp_tools(
         mcp_url,
         capability_id,
     )?)?;
-    let runtime = local_dev_host_runtime_with_registry_egress_and_mcp(
+    let runtime = standalone_host_runtime_with_registry_egress_and_mcp(
         storage_root,
         registry,
         Arc::clone(&first_party_egress),
@@ -58,6 +61,7 @@ pub(crate) async fn mock_mcp_tools(
     let (io, result_writer_io) = super::super::default_capability_io_pair();
     Ok(HostRuntimeCapabilityHarness {
         runtime: Mutex::new(runtime),
+        resource_governor: None,
         approval_parts: None,
         gate_record_store: super::super::fresh_in_memory_gate_record_store(),
         auto_approve_settings: None,
@@ -65,7 +69,10 @@ pub(crate) async fn mock_mcp_tools(
         io: Mutex::new(io),
         result_writer_io: Mutex::new(result_writer_io),
         durable_capability_io_thread_service: Mutex::new(None),
-        durable_capability_io_requested: false,
+        // Production composes `StagedCapabilityIo`; keep this lane on that
+        // canonical durable writer so MCP result references exercise the same
+        // result_read contract as deployed calls.
+        durable_capability_io_requested: true,
         root,
         workspace_root,
         mounts,

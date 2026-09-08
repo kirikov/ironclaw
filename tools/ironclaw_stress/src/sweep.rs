@@ -8,7 +8,7 @@ use std::{
 use serde::Serialize;
 use serde_json::json;
 
-use crate::{Args, compare, run_once};
+use crate::{Args, CliError, compare, run_once};
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub(crate) struct RunMetrics {
@@ -70,7 +70,7 @@ pub(crate) fn is_enabled(args: &Args) -> bool {
         || args.output_jsonl.is_some()
 }
 
-pub(crate) async fn run(args: &Args, suite_run_id: &str) -> Result<(), String> {
+pub(crate) async fn run(args: &Args, suite_run_id: &str) -> Result<(), CliError> {
     let cases = build_cases(args);
     let mut jsonl = match &args.output_jsonl {
         Some(path) => {
@@ -188,7 +188,7 @@ pub(crate) async fn run(args: &Args, suite_run_id: &str) -> Result<(), String> {
             "users": case.users,
             "active_thread_count": case.active_thread_count,
             "threads_per_owner": case_args.threads_per_owner,
-            "turn_state_backend": case_args.turn_state_backend,
+            "process_journal_backend": case_args.process_journal_backend,
             "gate_blocked_every": case_args.gate_blocked_every,
             "tenants": case_args.tenants,
             "operations_per_thread": case_args.operations,
@@ -253,7 +253,7 @@ pub(crate) async fn run(args: &Args, suite_run_id: &str) -> Result<(), String> {
         .iter()
         .map(|result| (result.label.clone(), result.metrics))
         .collect::<Vec<_>>();
-    enforce_thresholds(args, &threshold_inputs)
+    enforce_thresholds(args, &threshold_inputs).map_err(CliError::from)
 }
 
 pub(crate) fn enforce_thresholds(args: &Args, runs: &[(String, RunMetrics)]) -> Result<(), String> {

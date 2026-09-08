@@ -1,0 +1,164 @@
+export const CHAT_MESSAGE_ROLES = Object.freeze({
+  USER: "user",
+  ASSISTANT: "assistant",
+  SYSTEM: "system",
+  ERROR: "error",
+  TOOL_ACTIVITY: "tool_activity",
+  THINKING: "thinking",
+  /** Live assistant text the loop went on past (a tool call followed it):
+   *  progress narration that belongs with the run's activity, never the
+   *  answer. Set from the projection's `narration` flag. */
+  NARRATION: "narration",
+  IMAGE: "image",
+} as const);
+
+export type ChatMessageRole =
+  (typeof CHAT_MESSAGE_ROLES)[keyof typeof CHAT_MESSAGE_ROLES];
+
+export const RUN_FAILURE_ID_PREFIX = "err-";
+export const REQUEST_FAILURE_ID_PREFIX = "err-request-";
+export const STREAM_FAILURE_ID_PREFIX = "err-stream-";
+export const UNKNOWN_RUN_FAILURE_ID = `${RUN_FAILURE_ID_PREFIX}unknown`;
+// Client-only "Stopped" notice for a run the user cancelled: `stopped-<runId>`.
+export const RUN_STOPPED_ID_PREFIX = "stopped-";
+
+export type ChatAttachment = {
+  id?: string;
+  filename?: string;
+  mime_type?: string;
+  kind?: string;
+  size_label?: string;
+  fetch_url?: string;
+  preview_url?: string | null;
+  workspace_path?: string;
+  [key: string]: unknown;
+};
+
+export type ChatMessage = {
+  id: string;
+  role: ChatMessageRole;
+  content?: string;
+  timestamp?: string;
+  images?: string[];
+  attachments?: ChatAttachment[];
+  generatedImages?: Array<{ data_url?: string | null; path?: string | null }>;
+  isOptimistic?: boolean;
+  status?: string;
+  error?: string;
+  errorKey?: string;
+  toolCalls?: unknown[];
+  [key: string]: unknown;
+};
+
+export function messageBelongsToActiveRun(
+  message: ChatMessage | null | undefined,
+  activeRunId: string | null | undefined,
+): boolean {
+  return (
+    typeof activeRunId === "string" &&
+    activeRunId.length > 0 &&
+    typeof message?.turnRunId === "string" &&
+    message.turnRunId === activeRunId
+  );
+}
+
+export type ErrorChatMessage = {
+  id: string;
+  role: typeof CHAT_MESSAGE_ROLES.ERROR;
+  content: string;
+  timestamp: string;
+  failureStatus?: string | null;
+  failureCategory?: string | null;
+  failureSummary?: string | null;
+  // The failed run's id, when known — lets a terminal run-failure bubble
+  // offer the same run-artifact/trace download action as a completed
+  // assistant reply (#7369).
+  turnRunId?: string | null;
+  [key: string]: unknown;
+};
+
+export type ErrorChatMessageInput = {
+  id: string;
+  content: string;
+  timestamp: string;
+  failureStatus?: string | null;
+  failureCategory?: string | null;
+  failureSummary?: string | null;
+  turnRunId?: string | null;
+  [key: string]: unknown;
+};
+
+export type RequestFailureChatMessage = ErrorChatMessage & {
+  requestForMessageId: string;
+};
+
+export function createErrorChatMessage(
+  input: ErrorChatMessageInput,
+): ErrorChatMessage {
+  return {
+    ...input,
+    role: CHAT_MESSAGE_ROLES.ERROR,
+  };
+}
+
+export function isErrorChatMessage(
+  message: unknown,
+): message is ErrorChatMessage {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    (message as ChatMessage).role === CHAT_MESSAGE_ROLES.ERROR
+  );
+}
+
+export function safeMessageIdToken(value: unknown): string {
+  return String(value || "unknown").replace(/[^a-z0-9_-]+/gi, "-");
+}
+
+export function requestFailureIdForMessage(messageId: unknown): string {
+  return `${REQUEST_FAILURE_ID_PREFIX}${safeMessageIdToken(messageId)}`;
+}
+
+export function createRequestFailureChatMessage({
+  messageId,
+  content,
+  timestamp,
+}: {
+  messageId: unknown;
+  content: string;
+  timestamp: string;
+}): RequestFailureChatMessage {
+  const requestForMessageId = String(messageId || "unknown");
+  return {
+    ...createErrorChatMessage({
+      id: requestFailureIdForMessage(messageId),
+      content,
+      timestamp,
+      requestForMessageId,
+    }),
+    requestForMessageId,
+  };
+}
+
+export function isRequestFailureForMessage(
+  message: unknown,
+  messageId: unknown,
+): boolean {
+  if (!isErrorChatMessage(message)) return false;
+  const requestForMessageId = String(messageId || "unknown");
+  if (message.requestForMessageId === requestForMessageId) return true;
+  return message.id === requestFailureIdForMessage(messageId);
+}
+
+export function isRunFailureMessageId(value: unknown): boolean {
+  const id = typeof value === "string" ? value : "";
+  return (
+    id.startsWith(RUN_FAILURE_ID_PREFIX) &&
+    !id.startsWith(REQUEST_FAILURE_ID_PREFIX) &&
+    !id.startsWith(STREAM_FAILURE_ID_PREFIX)
+  );
+}
+
+export function isRunStoppedMessageId(value: unknown): boolean {
+  return typeof value === "string" && value.startsWith(RUN_STOPPED_ID_PREFIX);
+}

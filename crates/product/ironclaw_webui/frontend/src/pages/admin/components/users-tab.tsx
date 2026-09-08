@@ -1,0 +1,458 @@
+import React from "react";
+import { useT } from "../../../lib/i18n";
+import { Panel, StatusPill } from "../../../design-system/primitives";
+import { Button } from "../../../design-system/button";
+import { ConfirmDialog } from "../../../design-system/confirm-dialog";
+import { Icon } from "../../../design-system/icons";
+import { FormField, Input } from "../../../design-system/input";
+import { InlineNotice } from "../../../design-system/inline-notice";
+import { SearchField } from "../../../design-system/search-field";
+import { SelectMenu } from "../../../design-system/select-menu";
+import { Skeleton } from "../../../design-system/skeleton";
+import { useAdminUsers } from "../hooks/useAdminUsers";
+import {
+  formatRelativeTime,
+  formatCost,
+  truncateId,
+  statusTone,
+  roleTone,
+  formatUserRole,
+  formatUserStatus,
+  filterUsers,
+  buildRoleOptions,
+  adminUserActionErrorMessage,
+} from "../lib/admin-presenters";
+
+function buildFilters(t) {
+  return [
+    { value: "all", label: t("admin.users.filter.all") },
+    { value: "active", label: t("admin.users.filter.active") },
+    { value: "suspended", label: t("admin.users.filter.suspended") },
+    { value: "admin", label: t("admin.users.filter.admins") },
+  ];
+}
+
+function TokenBanner({ token, onDismiss }) {
+  const t = useT();
+  const [copied, setCopied] = React.useState(false);
+
+  const handleCopy = () => {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(token);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  return (
+    <InlineNotice
+      tone="success"
+      role="status"
+      onDismiss={onDismiss}
+      dismissLabel={t("common.dismiss")}
+    >
+      <p className="font-semibold text-iron-100">{t("admin.users.tokenCreated")}</p>
+      <p className="mt-1 text-xs text-iron-300">{t("admin.users.tokenCreatedDesc")}</p>
+      <div className="mt-3 flex items-center gap-2">
+        <code className="min-w-0 flex-1 truncate rounded-md border border-iron-700 bg-iron-800/70 px-3 py-2 font-mono text-xs text-iron-100">
+          {token}
+        </code>
+        <Button variant="secondary" onClick={handleCopy}>
+          {copied ? t("admin.users.copied") : t("admin.users.copy")}
+        </Button>
+      </div>
+    </InlineNotice>
+  );
+}
+
+function CreateUserForm({ onCreate, isCreating, error, resetError }) {
+  const t = useT();
+  const [name, setName] = React.useState("");
+  const [email, setEmail] = React.useState("");
+  const [role, setRole] = React.useState("member");
+  const [isOpen, setIsOpen] = React.useState(false);
+  const roleOptions = React.useMemo(() => buildRoleOptions(t), [t]);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    resetError?.();
+    try {
+      await onCreate({ display_name: name.trim(), email: email.trim() || undefined, role });
+      setName("");
+      setEmail("");
+      setIsOpen(false);
+    } catch (_) {
+      // Keep the form open; the mutation exposes its sanitized error below.
+    }
+  };
+
+  if (!isOpen) {
+    return (
+      <Button variant="secondary" onClick={() => setIsOpen(true)}>
+        <Icon name="plus" className="mr-2 h-4 w-4" />
+        {t("admin.users.newUser")}
+      </Button>
+    );
+  }
+
+  return (
+    <Panel className="p-5 sm:p-6">
+      <h3 className="mb-4 font-mono text-[11px] uppercase tracking-[0.14em] text-signal">{t("admin.users.createUser")}</h3>
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div className="grid gap-4 sm:grid-cols-3">
+          <FormField
+            htmlFor="admin-user-display-name"
+            label={t("admin.users.displayName")}
+            required
+          >
+            <Input
+              id="admin-user-display-name"
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.currentTarget.value)}
+              required
+              size="sm"
+              placeholder={t("admin.users.displayNamePlaceholder")}
+            />
+          </FormField>
+          <FormField
+            htmlFor="admin-user-email"
+            label={t("admin.users.email")}
+          >
+            <Input
+              id="admin-user-email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.currentTarget.value)}
+              size="sm"
+              placeholder={t("admin.users.emailPlaceholder")}
+            />
+          </FormField>
+          <div>
+            <label className="mb-1 block text-xs text-iron-300">{t("admin.users.role")}</label>
+            <SelectMenu
+              value={role}
+              options={roleOptions}
+              onChange={setRole}
+              ariaLabel={t("admin.users.role")}
+              className="w-full"
+              buttonClassName="h-9 rounded-md border-iron-700 bg-iron-800/70 px-3 font-sans text-sm text-iron-100"
+            />
+          </div>
+        </div>
+        {error && (<p className="text-sm text-[var(--v2-danger-text)]">{error.message}</p>)}
+        <div className="flex gap-2">
+          <Button type="submit" disabled={isCreating}>
+            {isCreating ? t("admin.users.creating") : t("admin.users.createUser")}
+          </Button>
+          <Button variant="ghost" type="button" onClick={() => setIsOpen(false)}>{t("admin.users.cancel")}</Button>
+        </div>
+      </form>
+    </Panel>
+  );
+}
+
+export function UserRow({
+  user,
+  onSelect,
+  onSuspend,
+  onActivate,
+  onChangeRole,
+  isActionPending,
+  isSuspending,
+  isActivating,
+  isUpdating,
+}) {
+  const t = useT();
+  return (
+    <div className="flex items-center justify-between gap-4 border-t border-iron-700 py-3.5 first:border-0 first:pt-0">
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => onSelect(user.id)}
+            className="text-sm font-medium text-signal hover:underline"
+          >
+            {user.display_name || user.id}
+          </button>
+          <StatusPill tone={roleTone(user.role)} label={formatUserRole(user.role, t)} />
+          <StatusPill tone={statusTone(user.status)} label={formatUserStatus(user.status, t)} />
+        </div>
+        <div className="mt-0.5 flex flex-wrap gap-x-4 gap-y-0.5">
+          {user.email && (<span className="font-mono text-xs text-iron-300">{user.email}</span>)}
+          <span className="font-mono text-xs text-iron-700">{truncateId(user.id)}</span>
+        </div>
+      </div>
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
+        <span className="hidden font-mono text-xs text-iron-300 sm:inline">
+          {user.job_count != null ? t("admin.users.jobsCount", { count: user.job_count }) : ""}
+          {user.total_cost != null ? ` · ${formatCost(user.total_cost)}` : ""}
+        </span>
+        <span className="hidden text-xs text-iron-700 lg:inline">{formatRelativeTime(user.last_active_at, t)}</span>
+        <div className="flex gap-1">
+          {user.status === "active"
+            ? (<button data-testid="admin-user-suspend" disabled={isActionPending} aria-busy={isSuspending || undefined} onClick={(event) => onSuspend(user, event.currentTarget)} className="rounded-md border border-iron-700 px-2.5 py-1.5 text-[11px] font-medium text-iron-300 hover:border-[color-mix(in_srgb,var(--v2-danger-text)_36%,var(--v2-panel-border))] hover:text-[var(--v2-danger-text)] disabled:cursor-not-allowed disabled:opacity-50">{isSuspending ? t("common.loading") : t("admin.users.suspend")}</button>)
+            : (<button data-testid="admin-user-activate" disabled={isActionPending} aria-busy={isActivating || undefined} onClick={() => onActivate(user.id)} className="rounded-md border border-iron-700 px-2.5 py-1.5 text-[11px] font-medium text-iron-300 hover:border-signal/30 hover:text-signal disabled:cursor-not-allowed disabled:opacity-50">{isActivating ? t("common.loading") : t("admin.users.activate")}</button>)}
+          <button
+            data-testid="admin-user-role"
+            disabled={isActionPending}
+            aria-busy={isUpdating || undefined}
+            onClick={() => onChangeRole(user.id, user.role === "admin" ? "member" : "admin")}
+            className="rounded-md border border-iron-700 px-2.5 py-1.5 text-[11px] font-medium text-iron-300 hover:border-iron-700 hover:text-iron-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {isUpdating
+              ? t("common.saving")
+              : user.role === "admin" ? t("admin.users.demote") : t("admin.users.promote")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function AdminUsersTab({ onSelectUser }) {
+  const adminState = useAdminUsers();
+  return (
+    <AdminUsersTabView
+      onSelectUser={onSelectUser}
+      adminState={adminState}
+    />
+  );
+}
+
+export function AdminUsersTabView({ onSelectUser, adminState }) {
+  const t = useT();
+  const {
+    users, query, isForbidden, createUser, isCreating, createError,
+    resetCreate,
+    hasMore, isLoadingMore, loadMoreError, loadMore,
+    updateUser, suspendUser, activateUser,
+    isUpdating, updateError, updatingUserId,
+    isSuspending, suspendError, suspendingUserId, resetSuspend,
+    isActivating, activateError, activatingUserId,
+    resetActionErrors,
+    newToken, clearToken,
+  } = adminState;
+
+  const [search, setSearch] = React.useState("");
+  const [filter, setFilter] = React.useState("all");
+  const [confirm, setConfirm] = React.useState(null);
+  const suspendInFlightRef = React.useRef(false);
+
+  const filtered = filterUsers(users, { search, filter });
+  const FILTERS = buildFilters(t);
+
+  const isActionPending = isUpdating || isSuspending || isActivating;
+  const actionError = activateError || updateError;
+
+  const handleSuspend = (user, returnFocusTo) => {
+    resetSuspend?.();
+    setConfirm({
+      userId: user.id,
+      returnFocusTo,
+      title: t("admin.users.suspendTitle"),
+      message: t("admin.users.suspendDesc", { name: user.display_name || user.id }),
+      confirmLabel: t("admin.users.suspend"),
+    });
+  };
+
+  const confirmSuspend = async () => {
+    if (!confirm?.userId || isActionPending || suspendInFlightRef.current) return;
+    suspendInFlightRef.current = true;
+    resetActionErrors?.();
+    try {
+      await suspendUser(confirm.userId);
+      setConfirm(null);
+    } catch (_) {
+      // Keep the confirmation open so the administrator can retry.
+    } finally {
+      suspendInFlightRef.current = false;
+    }
+  };
+
+  const handleActivate = async (id) => {
+    if (isActionPending) return;
+    resetActionErrors?.();
+    try {
+      await activateUser(id);
+    } catch (_) {
+      // The mutation exposes its sanitized error in the list panel.
+    }
+  };
+
+  const handleChangeRole = async (id, role) => {
+    if (isActionPending) return;
+    resetActionErrors?.();
+    try {
+      await updateUser(id, { role });
+    } catch (_) {
+      // The mutation exposes its sanitized error in the list panel.
+    }
+  };
+
+  const closeConfirm = () => {
+    if (isSuspending) return;
+    setConfirm(null);
+    resetSuspend?.();
+  };
+
+  if (query.isLoading) {
+    return (
+      <Panel className="p-5 sm:p-6">
+        <Skeleton className="mb-4 h-3 w-24 rounded" />
+        {[1, 2, 3].map((i) => (
+          <div key={i} className="flex items-center justify-between border-t border-iron-700 py-3.5 first:border-0">
+            <Skeleton className="h-4 w-32 rounded" />
+            <Skeleton className="h-6 w-20 rounded-full" />
+          </div>
+        ))}
+      </Panel>
+    );
+  }
+
+  if (isForbidden) {
+    return (
+      <Panel className="p-6 sm:p-8">
+        <div className="flex items-center gap-3">
+          <Icon name="lock" className="h-5 w-5 text-iron-700" />
+          <h3 className="text-lg font-semibold text-iron-100">{t("users.adminRequired")}</h3>
+        </div>
+        <p className="mt-2 max-w-md text-sm leading-6 text-iron-300">
+          {t("users.adminRequiredDesc")}
+        </p>
+      </Panel>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      {newToken && (
+        <TokenBanner
+          token={newToken.token || newToken.plaintext_token}
+          onDismiss={clearToken}
+        />
+      )}
+
+      <CreateUserForm
+        onCreate={createUser}
+        isCreating={isCreating}
+        error={createError}
+        resetError={resetCreate}
+      />
+
+      <Panel className="p-5 sm:p-6">
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <h3 className="font-mono text-[11px] uppercase tracking-[0.14em] text-signal">
+            {t("admin.users.title", { count: filtered.length, total: users.length })}
+          </h3>
+          <div className="flex items-center gap-2">
+            <SearchField
+              placeholder={t("admin.users.searchPlaceholder")}
+              aria-label={t("admin.users.searchPlaceholder")}
+              value={search}
+              onChange={setSearch}
+              onClear={() => setSearch("")}
+              clearLabel={t("settings.clearSearch")}
+              className="w-48"
+            />
+            <div className="flex gap-1">
+              {FILTERS.map(
+                (f) => (
+                  <button
+                    key={f.value}
+                    onClick={() => setFilter(f.value)}
+                    className={[
+                      "rounded-md px-2.5 py-1.5 text-[11px] font-medium",
+                      filter === f.value
+                        ? "border border-signal/35 bg-signal/10 text-iron-100"
+                        : "border border-transparent text-iron-300 hover:text-iron-100",
+                    ].join(" ")}
+                  >
+                    {f.label}
+                  </button>
+                )
+              )}
+            </div>
+          </div>
+        </div>
+
+        {actionError && (
+          <InlineNotice
+            className="mb-4"
+            tone="danger"
+            role="alert"
+            data-testid="admin-user-action-error"
+          >
+            {adminUserActionErrorMessage(actionError, t)}
+          </InlineNotice>
+        )}
+
+        {filtered.length === 0
+          ? (<p className="py-4 text-sm text-iron-300">{t("admin.users.noMatch")}</p>)
+          : filtered.map(
+              (user) => (
+                <UserRow
+                  key={user.id}
+                  user={user}
+                  onSelect={onSelectUser}
+                  onSuspend={handleSuspend}
+                  onActivate={handleActivate}
+                  onChangeRole={handleChangeRole}
+                  isActionPending={isActionPending}
+                  isSuspending={isSuspending && suspendingUserId === user.id}
+                  isActivating={isActivating && activatingUserId === user.id}
+                  isUpdating={isUpdating && updatingUserId === user.id}
+                />
+              )
+            )}
+
+        {(hasMore || loadMoreError) && (
+          <div className="mt-4 flex flex-col items-center gap-2 border-t border-iron-700 pt-4">
+            {loadMoreError && (
+              <p
+                className="text-sm text-[var(--v2-danger-text)]"
+                role="alert"
+                data-testid="admin-users-load-more-error"
+              >
+                {adminUserActionErrorMessage(loadMoreError, t)}
+              </p>
+            )}
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={isLoadingMore}
+              disabled={isLoadingMore}
+              data-testid="admin-users-load-more"
+              onClick={loadMore}
+            >
+              {isLoadingMore ? t("common.loading") : t("common.loadMore")}
+            </Button>
+          </div>
+        )}
+      </Panel>
+
+      <ConfirmDialog
+        open={Boolean(confirm)}
+        title={confirm?.title || ""}
+        description={confirm
+          ? (
+              <>
+                <span>{confirm.message}</span>
+                {suspendError && (
+                  <span className="mt-4 block text-red-200" role="alert" data-testid="admin-user-confirm-error">
+                    {adminUserActionErrorMessage(suspendError, t)}
+                  </span>
+                )}
+              </>
+            )
+          : undefined}
+        confirmLabel={confirm?.confirmLabel || t("admin.users.suspend")}
+        cancelLabel={t("admin.users.cancel")}
+        isConfirming={isSuspending}
+        returnFocusTo={confirm?.returnFocusTo || null}
+        onConfirm={confirmSuspend}
+        onCancel={closeConfirm}
+      />
+    </div>
+  );
+}

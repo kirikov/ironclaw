@@ -75,17 +75,21 @@ tested = [
   "google-calendar.list_events",
   "google-calendar.set_reminder",
   "google-calendar.update_event",
+  "google-docs.apply_text_edits",
   "google-docs.batch_update",
   "google-docs.create_document",
   "google-docs.create_list",
+  "google-docs.create_table_with_data",
   "google-docs.delete_content",
   "google-docs.format_paragraph",
   "google-docs.format_text",
   "google-docs.get_document",
   "google-docs.insert_text",
   "google-docs.insert_table",
+  "google-docs.inspect_document",
   "google-docs.read_content",
   "google-docs.replace_text",
+  "google-docs.verify_document",
   "google-drive.create_folder",
   "google-drive.delete_file",
   "google-drive.download_file",
@@ -124,11 +128,19 @@ tested = [
   "google-slides.replace_all_text",
   "google-slides.replace_shapes_with_image",
   "nearai.web_search",
+  "slack.add_reaction",
+  "slack.delete_message",
+  "slack.edit_message",
   "slack.get_conversation_history",
   "slack.get_conversation_info",
+  "slack.get_message",
   "slack.get_thread_replies",
   "slack.get_user_info",
   "slack.list_conversations",
+  "slack.list_members",
+  "slack.open_dm",
+  "slack.remove_reaction",
+  "slack.resolve_user",
   "slack.search_messages",
   "slack.send_message",
   "slack.whoami",
@@ -154,147 +166,124 @@ capabilities = [
   "agent-market.list_jobs",
   "agent-market.cancel_job",
 ]
+# Telegram's linked-device tools speak MTProto through the user's own account.
+# The real adapter is covered by crate conformance, production-wired group
+# scenarios, and gated live QA, but it has no resettable provider emulator from
+# which this deterministic inventory can obtain request/readback evidence.
+[[waivers]]
+capabilities = [
+  "telegram.add_reaction",
+  "telegram.delete_message",
+  "telegram.edit_message",
+  "telegram.get_conversation_history",
+  "telegram.get_conversation_info",
+  "telegram.get_message",
+  "telegram.get_user_info",
+  "telegram.list_conversations",
+  "telegram.list_members",
+  "telegram.open_dm",
+  "telegram.remove_reaction",
+  "telegram.resolve_user",
+  "telegram.search_messages",
+  "telegram.send_message",
+  "telegram.whoami",
+]
+owner = "Telegram linked-device maintainers"
+reason = "MTProto has no resettable deterministic provider world; production wiring and vendor behavior are covered separately by group scenarios and gated live QA"
+issue = "tests/CLAUDE.md section 7"
+review_condition = "Remove when a resettable MTProto provider world can assert exact requests, outcomes, and readback"
 
 [[integration_evidence]]
 capability = "github.handle_webhook"
+outcome_class = "success"
 target = "reborn_integration_tool_call"
 source = "tests/integration/tool_call.rs"
 test = "github_webhook_normalization_dispatches_through_bundled_wasm"
 
 [[integration_evidence]]
 capability = "nearai.web_search"
+outcome_class = "success"
 target = "reborn_integration_mcp"
 source = "tests/integration/mcp.rs"
 test = "nearai_web_search_dispatches_through_bundled_hosted_mcp"
 
 [[integration_evidence]]
 capability = "web-access.get_content"
+outcome_class = "success"
 target = "reborn_integration_web_access"
 source = "tests/integration/web_access.rs"
 test = "get_content_dispatches_through_scripted_exa_mcp"
 
 [[integration_evidence]]
 capability = "web-access.search"
+outcome_class = "success"
 target = "reborn_integration_web_access"
 source = "tests/integration/web_access.rs"
 test = "web_search_dispatches_through_scripted_exa_mcp"
 
+[[integration_evidence]]
+capability = "nearai.web_search"
+outcome_class = "empty"
+target = "reborn_integration_mcp"
+source = "tests/integration/mcp.rs"
+test = "nearai_web_search_empty_result_dispatches_through_bundled_hosted_mcp"
+
+[[integration_evidence]]
+capability = "web-access.get_content"
+outcome_class = "empty"
+target = "reborn_integration_web_access"
+source = "tests/integration/web_access.rs"
+test = "get_content_empty_result_dispatches_through_scripted_exa_mcp"
+
+[[integration_evidence]]
+capability = "web-access.search"
+outcome_class = "empty"
+target = "reborn_integration_web_access"
+source = "tests/integration/web_access.rs"
+test = "web_search_empty_result_dispatches_through_scripted_exa_mcp"
+
 # Journey evidence: the capability is asserted with provider-side readback
 # inside a harvested full-path journey rather than a typed operation case.
-# The named source, test, and assertion helper must all still exist.
+# The named test and provider-owned assertion helper must all still exist.
 
 [[journey_evidence]]
 capability = "gmail.send_message"
 source = "tests/e2e/scenarios/test_reborn_qa_trace_full_path.py"
 test = "test_qa_journey_provider_leg_replays_through_emulate"
-assertion = "_assert_google_provider_outcome"
+assertion_source = "tests/e2e/provider_journey_google.py"
+assertion = "assert_google_provider_outcome"
 
 [[journey_evidence]]
 capability = "google-docs.create_document"
 source = "tests/e2e/scenarios/test_reborn_qa_trace_full_path.py"
 test = "test_qa_journey_provider_leg_replays_through_emulate"
-assertion = "_assert_google_provider_outcome"
+assertion_source = "tests/e2e/provider_journey_google.py"
+assertion = "assert_google_provider_outcome"
 
 [[journey_evidence]]
 capability = "google-docs.insert_text"
 source = "tests/e2e/scenarios/test_reborn_qa_trace_full_path.py"
 test = "test_qa_journey_provider_leg_replays_through_emulate"
-assertion = "_assert_google_provider_outcome"
+assertion_source = "tests/e2e/provider_journey_google.py"
+assertion = "assert_google_provider_outcome"
 
 [[journey_evidence]]
 capability = "google-sheets.append_values"
 source = "tests/e2e/scenarios/test_reborn_qa_trace_full_path.py"
 test = "test_qa_journey_provider_leg_replays_through_emulate"
-assertion = "_assert_google_provider_outcome"
+assertion_source = "tests/e2e/provider_journey_google.py"
+assertion = "assert_google_provider_outcome"
 
 [[journey_evidence]]
 capability = "google-sheets.create_spreadsheet"
 source = "tests/e2e/scenarios/test_reborn_qa_trace_full_path.py"
 test = "test_qa_journey_provider_leg_replays_through_emulate"
-assertion = "_assert_google_provider_outcome"
+assertion_source = "tests/e2e/provider_journey_google.py"
+assertion = "assert_google_provider_outcome"
 
 [[journey_evidence]]
 capability = "slack.send_message"
 source = "tests/e2e/scenarios/test_reborn_qa_trace_full_path.py"
 test = "test_qa_journey_provider_leg_replays_through_emulate"
-assertion = "_assert_slack_provider_outcome"
-
-
-[[coverage_backlog]]
-rule = "read_requires_outcome_classes"
-owner = "@serrrfirat"
-reason = "Has a seeded success case but no empty-result case; the runtime is unproven to distinguish no results from a failed call."
-issue = "#6524"
-review_condition = "Add a ProviderOperationCase with outcome_class = empty."
-capabilities = [
-  "github.get_authenticated_user",
-  "github.get_combined_status",
-  "github.get_file_content",
-  "github.get_issue",
-  "github.get_job_logs",
-  "github.get_pull_request",
-  "github.get_pull_request_files",
-  "github.get_pull_request_reviews",
-  "github.get_repo",
-  "github.get_workflow_run_artifacts",
-  "github.get_workflow_run_jobs",
-  "github.get_workflow_runs",
-  "github.list_branches",
-  "github.list_issue_comments",
-  "github.list_issues",
-  "github.list_pull_request_comments",
-  "github.list_pull_request_review_threads",
-  "github.list_pull_requests",
-  "github.list_releases",
-  "github.list_repos",
-  "github.search_code",
-  "github.search_issues",
-  "github.search_issues_pull_requests",
-  "github.search_repositories",
-  "google-calendar.find_free_slots",
-  "google-calendar.get_event",
-  "google-calendar.list_calendars",
-  "google-docs.get_document",
-  "google-drive.get_file",
-  "google-drive.list_permissions",
-  "google-drive.list_shared_drives",
-  "google-sheets.batch_read_values",
-  "google-slides.get_presentation",
-  "google-slides.get_thumbnail",
-]
-
-[[coverage_backlog]]
-rule = "read_requires_outcome_classes"
-owner = "@serrrfirat"
-reason = "No typed operation case at all; evidence is a harvested tool-call name or a journey-specific branch, not a per-operation contract."
-issue = "#6524"
-review_condition = "Add seeded success and empty-result ProviderOperationCase entries."
-capabilities = [
-  "gmail.get_message",
-  "gmail.list_messages",
-  "google-calendar.list_events",
-  "google-docs.read_content",
-  "google-drive.download_file",
-  "google-drive.list_files",
-  "google-sheets.get_spreadsheet",
-  "slack.get_conversation_history",
-  "slack.get_conversation_info",
-  "slack.get_thread_replies",
-  "slack.get_user_info",
-  "slack.list_conversations",
-  "slack.search_messages",
-  "slack.whoami",
-]
-
-[[coverage_backlog]]
-rule = "read_requires_outcome_classes"
-owner = "@serrrfirat"
-reason = "Evidenced by a named Cargo integration test at a non-Emulate seam (local WASM, hosted MCP, Exa-backed web access), so there is no provider world in which to seed an empty result. integration_evidence names one executable test per capability and carries no outcome class, so it must not silently exempt these from the read rule."
-issue = "#6524"
-review_condition = "Make integration_evidence outcome-aware, or add a hermetic double for these seams, then require success and empty like every other read."
-capabilities = [
-  "github.handle_webhook",
-  "nearai.web_search",
-  "web-access.get_content",
-  "web-access.search",
-]
+assertion_source = "tests/e2e/provider_journey_slack.py"
+assertion = "assert_slack_provider_outcome"

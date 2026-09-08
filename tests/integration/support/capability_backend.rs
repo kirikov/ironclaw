@@ -74,6 +74,8 @@ pub(super) enum RebornCapabilityBackend {
     /// without a confirmed host-home mount) is observable at the
     /// integration tier.
     BuiltinHttpToolsConfirmedHostMount,
+    /// `builtin.shell` through the production Docker sandbox composition.
+    SandboxShellTools,
 }
 
 /// Which process port the built `BuiltinHttpTools` runtime installs for
@@ -100,7 +102,7 @@ pub(super) enum ShellMode {
 pub(super) struct CapabilityScriptingInputs {
     pub(super) keyed_http_responses: Vec<ScriptedHttpResponse>,
     pub(super) web_access_response_bodies: Vec<Vec<u8>>,
-    pub(super) github_network_statuses: Vec<u16>,
+    pub(super) github_network_responses: Vec<(u16, Option<Vec<u8>>)>,
     pub(super) real_egress_response_bodies: Vec<Vec<u8>>,
 }
 
@@ -121,7 +123,11 @@ impl RebornCapabilityBackend {
         // backend would otherwise dispatch un-parked with no signal to the
         // caller.
         if park_capability_gate.is_some()
-            && !matches!(self, RebornCapabilityBackend::BuiltinHttpTools)
+            && !matches!(
+                self,
+                RebornCapabilityBackend::BuiltinHttpTools
+                    | RebornCapabilityBackend::BuiltinHttpToolsDurableIo
+            )
         {
             return Err(
                 "park_tool_dispatch is only supported by RebornCapabilityBackend::BuiltinHttpTools \
@@ -132,7 +138,7 @@ impl RebornCapabilityBackend {
         let CapabilityScriptingInputs {
             keyed_http_responses,
             web_access_response_bodies,
-            github_network_statuses,
+            github_network_responses,
             real_egress_response_bodies,
         } = scripting;
         Ok(match self {
@@ -170,19 +176,26 @@ impl RebornCapabilityBackend {
                 GroupCapability::HostRuntime(Arc::new(host_runtime))
             }
             RebornCapabilityBackend::BuiltinHttpToolsDurableIo => {
-                if !matches!(shell_mode, ShellMode::Inert) {
+                if matches!(shell_mode, ShellMode::Scripted(_)) {
                     return Err(
-                        "durable builtin-http harness does not support shell mode overrides".into(),
+                        "durable builtin-http harness does not support scripted shell results"
+                            .into(),
                     );
                 }
-                if park_capability_gate.is_some() {
-                    return Err("park_tool_dispatch is only supported by \
-                         RebornCapabilityBackend::BuiltinHttpTools"
-                        .into());
-                }
-                let host_runtime =
-                    core_builtin::core_builtin_tools_with_durable_capability_io().await?;
+                let host_runtime = if matches!(shell_mode, ShellMode::Live) {
+                    core_builtin::core_builtin_tools(
+                        CoreBuiltinOptions::default().with_live_shell(),
+                    )
+                    .await?
+                } else {
+                    core_builtin::core_builtin_tools_default().await?
+                };
+                let host_runtime = host_runtime.with_durable_capability_io();
                 host_runtime.install_http_responses(keyed_http_responses)?;
+                let host_runtime = match park_capability_gate {
+                    Some(gate) => host_runtime.park_capability_dispatch(gate),
+                    None => host_runtime,
+                };
                 GroupCapability::HostRuntime(Arc::new(host_runtime))
             }
             RebornCapabilityBackend::MockMcp { mcp_url } => {
@@ -210,8 +223,12 @@ impl RebornCapabilityBackend {
                 // port — see `reborn_integration_secret_injection.rs`'s module
                 // doc), so a runtime-401-after-injection scenario scripts the
                 // status here instead. A no-op (empty vec) for existing callers.
-                for status in github_network_statuses {
-                    host_runtime.install_network_status_script(status)?;
+                for (status, body) in github_network_responses {
+                    if let Some(body) = body {
+                        host_runtime.install_network_response_script(status, body)?;
+                    } else {
+                        host_runtime.install_network_status_script(status)?;
+                    }
                 }
                 GroupCapability::HostRuntime(Arc::new(host_runtime))
             }
@@ -239,6 +256,18 @@ impl RebornCapabilityBackend {
                 let host_runtime =
                     core_builtin::core_builtin_tools_with_confirmed_host_mount().await?;
                 host_runtime.install_http_responses(keyed_http_responses)?;
+                GroupCapability::HostRuntime(Arc::new(host_runtime))
+            }
+            RebornCapabilityBackend::SandboxShellTools => {
+                if !matches!(shell_mode, ShellMode::Inert) {
+                    return Err(
+                        "sandbox shell harness executes real containers and does not support \
+                         shell mode overrides"
+                            .into(),
+                    );
+                }
+                let host_runtime =
+                    super::harness::profiles::sandbox_shell::sandbox_shell_tools().await?;
                 GroupCapability::HostRuntime(Arc::new(host_runtime))
             }
         })

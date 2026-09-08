@@ -1,0 +1,785 @@
+import { useQueryClient } from "@tanstack/react-query";
+import { Button } from "../../../design-system/button";
+import { Icon } from "../../../design-system/icons";
+import { InlineNotice } from "../../../design-system/inline-notice";
+import { Input } from "../../../design-system/input";
+import { SkeletonList } from "../../../design-system/skeleton";
+import React from "react";
+import { useT } from "../../../lib/i18n";
+import {
+  useExtensionSetup,
+  useHostedMcpAuthSelection,
+  useOauthSetup,
+  useSetupSubmit,
+} from "../hooks/useExtensions";
+import {
+  extensionIsActive,
+} from "../lib/extension-actions";
+import {
+  channelConnection,
+  deviceLinkSetupSecret,
+  hasChannelSurface,
+  isWebGeneratedCodeConnection,
+} from "../lib/extensions-schema";
+import { resolveFocusTarget } from "../lib/focus-target";
+import type { FocusTarget } from "../lib/focus-target";
+import { DeviceLinkPanel } from "../../../components/device-link-panel";
+import { PairingWebCodePanel } from "../../../components/pairing-web-code-panel";
+
+type ExtensionPackageRef = string | { id?: string };
+type ConfigureModalProps = {
+  extension: {
+    displayName?: string;
+    packageRef?: ExtensionPackageRef;
+    surfaces?: unknown[];
+    channel?: unknown;
+    installation_state?: string;
+  };
+  onClose: () => void;
+  onSaved?: (result?: unknown) => void;
+  returnFocusTo?: FocusTarget | null;
+  initialConnection?: "workspace_bot" | "personal_account" | null;
+};
+
+export function ConfigureModal({
+  extension,
+  onClose,
+  onSaved,
+  returnFocusTo,
+  // Preselects one of the two setup paths, so a `?setup=` deep link lands on
+  // the ceremony it named instead of the choice screen. `null` keeps the
+  // choice screen, which is what the Configure button has always shown.
+  initialConnection = null,
+}: ConfigureModalProps) {
+  const t = useT();
+  const extensionName =
+    extension?.displayName ||
+    (typeof extension?.packageRef === "string"
+      ? extension.packageRef
+      : extension?.packageRef?.id) ||
+    t("extensions.defaultName");
+  const {
+    phase,
+    blockers = [],
+    secrets = [],
+    fields = [],
+    onboarding,
+    hostedMcpAuthSelectionRequired,
+    isLoading,
+    error,
+  } =
+    useExtensionSetup(extension?.packageRef);
+  const [values, setValues] = React.useState<Record<string, string>>({});
+  const [hostedMcpAuthSelection, setHostedMcpAuthSelection] = React.useState<
+    "bearer" | "oauth" | "no_auth" | null
+  >(null);
+  const [connectionChoice, setConnectionChoice] = React.useState<
+    "workspace_bot" | "personal_account" | null
+  >(null);
+  const [activeConnection, setActiveConnection] = React.useState(initialConnection);
+  const queryClient = useQueryClient();
+  const packageId =
+    typeof extension?.packageRef === "string"
+      ? extension.packageRef
+      : extension?.packageRef?.id || "";
+  const handleOauthConfigured = React.useCallback(async () => {
+    onClose();
+    // The server-owned OAuth continuation performs lifecycle activation and
+    // connection fan-out transactionally. The browser only refreshes the
+    // authoritative caller-scoped projection after callback completion.
+    await Promise.all(
+      [["extensions"], ["extension-registry"], ["extension-setup", packageId]].map(
+        (queryKey) => queryClient.invalidateQueries({ queryKey }),
+      ),
+    );
+    if (onSaved) onSaved();
+  }, [onClose, onSaved, packageId, queryClient]);
+  // A completed device link mints the credential account host-side, exactly
+  // like the OAuth continuation does — the browser only refreshes the
+  // authoritative caller-scoped projection afterwards. The modal stays open so
+  // the user reads the "linked as …" confirmation, which is the only control
+  // that makes a substituted login visible (PROPOSAL §3.2).
+  const handleDeviceLinkCompleted = React.useCallback(async () => {
+    await Promise.all(
+      [["extensions"], ["extension-registry"], ["extension-setup", packageId]].map(
+        (queryKey) => queryClient.invalidateQueries({ queryKey }),
+      ),
+    );
+    if (onSaved) onSaved();
+  }, [onSaved, packageId, queryClient]);
+  const oauthMutation = useOauthSetup(extension?.packageRef, {
+    onConfigured: handleOauthConfigured,
+  });
+
+  const submitMutation = useSetupSubmit(extension?.packageRef, (res) => {
+    if (res.success !== false) {
+      if (onSaved) onSaved(res);
+      onClose();
+    }
+  });
+  const hostedMcpAuthMutation = useHostedMcpAuthSelection(
+    extension?.packageRef,
+    (res) => {
+      // Bearer selection can successfully resolve the authentication strategy
+      // while leaving a credential blocker for the token itself. The mutation
+      // refreshes setup state, so keep this modal mounted until that form is
+      // available instead of forcing the user to rediscover Configure.
+      if (res.blockers?.length > 0) return;
+      if (onSaved) onSaved(res);
+      onClose();
+    },
+  );
+
+  const handleSubmit = React.useCallback(() => {
+    const secretPayload: Record<string, string> = {};
+    for (const [key, val] of Object.entries(values)) {
+      const trimmed = (val || "").trim();
+      if (trimmed) secretPayload[key] = trimmed;
+    }
+    submitMutation.mutate({ secrets: secretPayload });
+  }, [values, submitMutation]);
+  const handleHostedMcpAuthSelection = React.useCallback(() => {
+    if (!hostedMcpAuthSelection) return;
+    hostedMcpAuthMutation.mutate({
+      authSelection: { kind: hostedMcpAuthSelection },
+    });
+  }, [hostedMcpAuthMutation, hostedMcpAuthSelection]);
+  const [popupBlockedError, setPopupBlockedError] = React.useState("");
+  const handleOauth = React.useCallback(
+    (secret) => {
+      const popup = window.open("about:blank", "_blank", "width=600,height=600");
+      if (popup) popup.opener = null;
+      // Unlike the later noopener open (which returns null even on success
+      // per spec), a null pre-open reliably means the browser blocked the
+      // popup — surface it and stop before burning the OAuth flow start,
+      // mirroring the in-chat startOnboardingOAuth guard.
+      if (!popup) {
+        setPopupBlockedError(t("authGate.popupBlocked"));
+        return;
+      }
+      setPopupBlockedError("");
+      oauthMutation.mutate({ secret, popup });
+    },
+    [oauthMutation, t]
+  );
+
+  const manualSecrets = secrets.filter(
+    (secret) => (secret.setup?.kind || "manual_token") === "manual_token"
+  );
+  // The manifest declares whether the user-facing setup is a host-issued
+  // code/deep-link/QR flow. Do not probe a provider route to infer strategy.
+  const connection = channelConnection(extension);
+  const isWebCodeChannel =
+    hasChannelSurface(extension) &&
+    isWebGeneratedCodeConnection(connection);
+
+  // A device-link credential is linked, never pasted: route the connect
+  // affordance to the multi-step panel instead of a token form.
+  const deviceLinkSecret = deviceLinkSetupSecret(secrets);
+  // Some extensions expose two independent caller-owned ceremonies: pairing
+  // an inbound workspace bot and linking a personal account for user-authority
+  // tools. The manifest remains the source of truth for both paths.
+  const offersBotAndPersonalSetup =
+    Boolean(deviceLinkSecret) && isWebCodeChannel;
+  const handleConnectionChoice = React.useCallback(() => {
+    if (connectionChoice) {
+      setActiveConnection(connectionChoice);
+    }
+  }, [connectionChoice]);
+
+  const canSave = manualSecrets.length > 0;
+  const isActive = extensionIsActive(extension);
+  const oauthBusy = oauthMutation.isPending || oauthMutation.isAuthorizing;
+  const setupUrl = httpsUrl(onboarding?.setup_url);
+  const hasOnboardingActions = Boolean(
+    onboarding?.credential_instructions ||
+      setupUrl ||
+      onboarding?.credential_next_step,
+  );
+  const hasConfiguration =
+    blockers.length > 0 ||
+    secrets.length > 0 ||
+    fields.length > 0 ||
+    hasOnboardingActions;
+  // `ref_id` is internal correlation/diagnostic data. Configure needs only the
+  // typed blocker kind to select localized user copy, so do not pass refs into
+  // the rendered component tree.
+  const readinessBlockers = blockers.map((blocker) => ({ kind: blocker?.kind }));
+  if (
+    offersBotAndPersonalSetup &&
+    !activeConnection &&
+    !hostedMcpAuthSelectionRequired
+  ) {
+    const canContinue = Boolean(connectionChoice);
+    return (
+      <ModalShell
+        onClose={onClose}
+        returnFocusTo={returnFocusTo}
+        title={t("extensions.connectionChoice.title", { name: extensionName })}
+      >
+        <SetupReadiness phase={phase} blockers={readinessBlockers} />
+        <AdminSetupFieldsNotice required={fields.length > 0} />
+        <fieldset className="space-y-3">
+          <legend className="sr-only">
+            {t("extensions.connectionChoice.title", { name: extensionName })}
+          </legend>
+          <label className="flex cursor-pointer gap-3 rounded-md border border-white/12 bg-white/[0.04] p-4">
+            <input
+              type="radio"
+              name="extension-connection-choice"
+              value="workspace_bot"
+              checked={connectionChoice === "workspace_bot"}
+              onChange={() => setConnectionChoice("workspace_bot")}
+              className="mt-1 h-4 w-4 accent-signal"
+            />
+            <span>
+              <span className="block text-sm font-medium text-iron-100">
+                {t("extensions.connectionChoice.workspaceBot")}
+              </span>
+              <span className="mt-1 block text-xs leading-5 text-iron-300">
+                {t("extensions.connectionChoice.workspaceBotDisclosure")}
+              </span>
+            </span>
+          </label>
+          <label className="flex cursor-pointer gap-3 rounded-md border border-white/12 bg-white/[0.04] p-4">
+            <input
+              type="radio"
+              name="extension-connection-choice"
+              value="personal_account"
+              checked={connectionChoice === "personal_account"}
+              onChange={() => setConnectionChoice("personal_account")}
+              className="mt-1 h-4 w-4 accent-signal"
+            />
+            <span>
+              <span className="block text-sm font-medium text-iron-100">
+                {t("extensions.connectionChoice.personalAccount")}
+              </span>
+              <span className="mt-1 block text-xs leading-5 text-iron-300">
+                {t("deviceLink.personalDisclosure", { name: extensionName })}
+              </span>
+            </span>
+          </label>
+        </fieldset>
+        <div className="mt-6 flex justify-end gap-3">
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            variant="primary"
+            onClick={handleConnectionChoice}
+            disabled={!canContinue}
+          >
+            {t("common.continue")}
+          </Button>
+        </div>
+      </ModalShell>
+    );
+  }
+
+  if (
+    deviceLinkSecret &&
+    (!offersBotAndPersonalSetup || activeConnection === "personal_account") &&
+    !hostedMcpAuthSelectionRequired
+  ) {
+    // Self-contained: the panel starts (or resumes) the flow, polls it, and
+    // stops on a terminal step. The modal only hosts it.
+    return (
+      <ModalShell
+        onClose={onClose}
+        returnFocusTo={returnFocusTo}
+        title={t("extensions.configureName").replace("{name}", extensionName)}
+      >
+        <SetupReadiness phase={phase} blockers={readinessBlockers} />
+        <AdminSetupFieldsNotice required={fields.length > 0} />
+        <DeviceLinkPanel
+          provider={deviceLinkSecret.provider}
+          extensionName={packageId}
+          displayName={extensionName}
+          onCompleted={handleDeviceLinkCompleted}
+        />
+      </ModalShell>
+    );
+  }
+
+  if (
+    isWebCodeChannel &&
+    (!offersBotAndPersonalSetup || activeConnection === "workspace_bot") &&
+    !hostedMcpAuthSelectionRequired
+  ) {
+    // The panel is self-contained (mints/rotates codes, polls status,
+    // broadcasts channel-connected on pairing), so the modal only hosts it.
+    return (
+      <ModalShell
+        onClose={onClose}
+        returnFocusTo={returnFocusTo}
+        title={t("extensions.configureName").replace("{name}", extensionName)}
+      >
+        <SetupReadiness phase={phase} blockers={readinessBlockers} />
+        <AdminSetupFieldsNotice required={fields.length > 0} />
+        <PairingWebCodePanel
+          extensionId={packageId}
+          displayName={extensionName}
+          instructions={connection?.instructions || ""}
+          compact
+        />
+      </ModalShell>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <ModalShell
+        onClose={onClose}
+        returnFocusTo={returnFocusTo}
+        title={t("extensions.configureName").replace("{name}", extensionName)}
+      >
+        <SkeletonList
+          count={2}
+          className="space-y-3"
+          itemClassName="h-10 w-full rounded-md"
+        />
+      </ModalShell>
+    );
+  }
+
+  if (error) {
+    return (
+      <ModalShell
+        onClose={onClose}
+        returnFocusTo={returnFocusTo}
+        title={t("extensions.configureName").replace("{name}", extensionName)}
+      >
+        <InlineNotice tone="danger" role="alert">
+          {t("extensions.loadFailed")} {error.message}
+        </InlineNotice>
+      </ModalShell>
+    );
+  }
+
+  if (hostedMcpAuthSelectionRequired) {
+    const authChoices = ["bearer", "oauth", "no_auth"] as const;
+    return (
+      <ModalShell
+        onClose={onClose}
+        returnFocusTo={returnFocusTo}
+        title={t("extensions.configureName").replace("{name}", extensionName)}
+      >
+        <SetupReadiness phase={phase} blockers={readinessBlockers} />
+        <AdminSetupFieldsNotice required={fields.length > 0} />
+        <fieldset className="space-y-2" aria-label={t("extensions.customMcpAuthHint")}>
+          {authChoices.map((kind) => (
+            <label
+              key={kind}
+              className="flex cursor-pointer items-center gap-3 rounded-md border border-white/12 bg-white/[0.04] px-3 py-2 text-sm text-iron-200"
+            >
+              <input
+                type="radio"
+                name={`hosted-mcp-auth-${packageId}`}
+                value={kind}
+                checked={hostedMcpAuthSelection === kind}
+                onChange={() => setHostedMcpAuthSelection(kind)}
+                data-testid={`hosted-mcp-auth-${kind}`}
+                className="h-4 w-4 accent-signal"
+              />
+              {t(`extensions.customMcpAuth.${kind}`)}
+            </label>
+          ))}
+        </fieldset>
+        {hostedMcpAuthMutation.error && (
+          <InlineNotice className="mt-4" tone="danger" role="alert">
+            {hostedMcpAuthMutation.error.message}
+          </InlineNotice>
+        )}
+        <div className="mt-6 flex items-center justify-end gap-3">
+          <Button variant="ghost" onClick={onClose}>{t("common.cancel")}</Button>
+          <Button
+            variant="primary"
+            onClick={handleHostedMcpAuthSelection}
+            loading={hostedMcpAuthMutation.isPending}
+            disabled={!hostedMcpAuthSelection}
+          >
+            {hostedMcpAuthMutation.isPending ? t("common.saving") : t("common.save")}
+          </Button>
+        </div>
+      </ModalShell>
+    );
+  }
+
+  if (!hasConfiguration) {
+    return (
+      <ModalShell
+        onClose={onClose}
+        returnFocusTo={returnFocusTo}
+        title={t("extensions.configureName").replace("{name}", extensionName)}
+      >
+        <SetupReadiness phase={phase} blockers={readinessBlockers} />
+        <InlineNotice tone="info" role="status">
+          {t("extensions.noConfigRequired")}
+        </InlineNotice>
+      </ModalShell>
+    );
+  }
+
+  return (
+    <ModalShell
+      onClose={onClose}
+      returnFocusTo={returnFocusTo}
+      title={t("extensions.configureName").replace("{name}", extensionName)}
+    >
+      <SetupReadiness phase={phase} blockers={readinessBlockers} />
+      <AdminSetupFieldsNotice required={fields.length > 0} />
+      {onboarding?.credential_instructions &&
+      (
+        <p className="mb-4 text-sm leading-6 text-iron-300">
+          {onboarding.credential_instructions}
+        </p>
+      )}
+      {setupUrl &&
+      (
+        <a
+          href={setupUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mb-4 inline-flex items-center gap-1.5 text-sm text-signal hover:underline"
+        >
+          {t("extensions.getCredentials")}
+          <Icon name="bolt" className="h-3.5 w-3.5" />
+        </a>
+      )}
+
+      <div className="space-y-4">
+        {secrets.map(
+          (secret) => (
+            <div key={secret.name}>
+              <label
+                htmlFor={`extension-secret-${secret.name}`}
+                className="mb-1.5 flex items-center gap-2 text-sm text-iron-200"
+              >
+                {secret.prompt || secret.name}
+                {secret.optional &&
+                (
+                  <span className="font-mono text-[10px] text-iron-700"
+                    >{t("common.optional") || "optional"}</span
+                  >
+                )}
+                {secret.provided &&
+                (
+                  <span className="font-mono text-[10px] text-mint"
+                    >{t("common.configured") || "configured"}</span
+                  >
+                )}
+              </label>
+              {(secret.setup?.kind || "manual_token") === "oauth"
+                ? (
+                    <div className="flex items-center justify-between gap-3 rounded-md border border-white/12 bg-white/[0.04] px-3 py-2">
+                      <span className="text-xs text-iron-300">
+                        {secret.provided
+                          ? t("extensions.authConfigured")
+                          : t("extensions.authPopup")}
+                      </span>
+                      <Button
+                        variant={secret.provided ? "secondary" : "primary"}
+                        onClick={() => handleOauth(secret)}
+                        loading={oauthBusy}
+                      >
+                        {oauthBusy
+                          ? t("extensions.opening")
+                          : secret.provided
+                            ? t("extensions.reconnect")
+                            : t("extensions.authorize")}
+                      </Button>
+                    </div>
+                  )
+                : (
+              <>
+              <Input
+                id={`extension-secret-${secret.name}`}
+                type="password"
+                size="sm"
+                placeholder={secret.provided
+                  ? t("extensions.keepSecretPlaceholder")
+                  : ""}
+                value={values[secret.name] || ""}
+                onChange={(e) => {
+                  const value = e.currentTarget.value;
+                  setValues((prev) => ({
+                    ...prev,
+                    [secret.name]: value,
+                  }));
+                }}
+                onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
+              />
+              {secret.auto_generate &&
+              !secret.provided &&
+              (
+                <p className="mt-1 text-xs text-iron-700">
+                  {t("extensions.autoGenerated")}
+                </p>
+              )}
+              </>
+                  )}
+            </div>
+          )
+        )}
+      </div>
+
+      {onboarding?.credential_next_step &&
+      (
+        <p className="mt-4 text-xs leading-5 text-iron-300">
+          {onboarding.credential_next_step}
+        </p>
+      )}
+      {isActive &&
+      (
+        <InlineNotice className="mt-4" tone="success" role="status">
+          {t("extensions.activeConfigured")}
+        </InlineNotice>
+      )}
+      {submitMutation.error &&
+      (
+        <InlineNotice className="mt-4" tone="danger" role="alert">
+          {submitMutation.error.message}
+        </InlineNotice>
+      )}
+      {oauthMutation.error &&
+      (
+        <InlineNotice className="mt-4" tone="danger" role="alert">
+          {oauthMutation.error.message}
+        </InlineNotice>
+      )}
+      {!oauthMutation.error &&
+      oauthMutation.authError &&
+      (
+        <InlineNotice className="mt-4" tone="danger" role="alert">
+          {oauthMutation.authError}
+        </InlineNotice>
+      )}
+      {!oauthMutation.error &&
+      !oauthMutation.authError &&
+      popupBlockedError &&
+      (
+        <InlineNotice className="mt-4" tone="danger" role="alert">
+          {popupBlockedError}
+        </InlineNotice>
+      )}
+
+      <div className="mt-6 flex items-center justify-end gap-3">
+        <Button variant="ghost" onClick={onClose}>{t("common.cancel")}</Button>
+        {canSave &&
+        (
+        <Button
+          variant="primary"
+          onClick={handleSubmit}
+          loading={submitMutation.isPending}
+        >
+          {submitMutation.isPending ? t("common.saving") : t("common.save")}
+        </Button>
+        )}
+      </div>
+    </ModalShell>
+  );
+}
+
+function SetupReadiness({ phase, blockers = [] }) {
+  const t = useT();
+  if (!phase && blockers.length === 0) return null;
+  return (
+    <div className="mb-4 space-y-2">
+      {phase && (
+        <InlineNotice
+          tone={phase === "active" ? "success" : "info"}
+          role="status"
+        >
+          {t("extensions.setupPhaseLabel")} {t(setupPhaseKey(phase))}
+        </InlineNotice>
+      )}
+      {blockers.length > 0 && (
+        <InlineNotice tone="warning" role="status">
+          <>
+            <p className="font-medium">{t("extensions.configurationRequired")}</p>
+            <ul className="mt-1 list-disc space-y-1 pl-4">
+              {blockers.map((blocker, index) => (
+                <li key={`${blocker?.kind || "unknown"}-${index}`}>
+                  {t(setupBlockerKey(blocker?.kind))}
+                </li>
+              ))}
+            </ul>
+          </>
+        </InlineNotice>
+      )}
+    </div>
+  );
+}
+
+function AdminSetupFieldsNotice({ required }) {
+  const t = useT();
+  if (!required) return null;
+  return (
+    <InlineNotice className="mb-4" tone="info" role="status">
+      {t("extensions.setupFieldsAdminRequired")}
+    </InlineNotice>
+  );
+}
+
+function setupPhaseKey(phase) {
+  switch (phase) {
+    case "uninstalled":
+    case "setup_needed":
+    case "active":
+      return `extensions.setupPhase.${phase}`;
+    default:
+      return "extensions.setupPhase.unknown";
+  }
+}
+
+function setupBlockerKey(kind) {
+  switch (kind) {
+    case "setup":
+    case "auth":
+    case "pairing":
+    case "approval":
+    case "policy":
+    case "credential":
+    case "runtime":
+      return `extensions.setupBlocker.${kind}`;
+    default:
+      return "extensions.setupBlocker.unknown";
+  }
+}
+
+function httpsUrl(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[contenteditable='true']",
+  "[tabindex]:not([tabindex^='-'])",
+].join(",");
+
+function isVisible(element: HTMLElement) {
+  if (typeof element.checkVisibility === "function") {
+    return element.checkVisibility({
+      checkOpacity: true,
+      checkVisibilityCSS: true,
+    });
+  }
+
+  const style = window.getComputedStyle(element);
+  return (
+    element.getClientRects().length > 0 &&
+    style.display !== "none" &&
+    style.visibility !== "hidden" &&
+    style.opacity !== "0"
+  );
+}
+
+function focusableElements(container: HTMLElement | null) {
+  if (!container) return [];
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (element) =>
+      element.tabIndex >= 0 &&
+      !element.hidden &&
+      element.getAttribute("aria-hidden") !== "true" &&
+      isVisible(element),
+  );
+}
+
+/**
+ * @param {{
+ *   onClose: () => void;
+ *   returnFocusTo?: FocusTarget | null;
+ *   title: string;
+ *   children: React.ReactNode;
+ * }} props
+ */
+function ModalShell({ onClose, returnFocusTo, title, children }) {
+  const t = useT();
+  const titleId = React.useId();
+  const dialogRef = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    const returnTarget = returnFocusTo || document.activeElement;
+    const dialog = dialogRef.current;
+    const initialFocus = focusableElements(dialog)[0] || dialog;
+    initialFocus?.focus({ preventScroll: true });
+
+    const handleKey = (e) => {
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+
+      const focusable = focusableElements(dialog);
+      if (focusable.length === 0) {
+        e.preventDefault();
+        dialog?.focus({ preventScroll: true });
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const activeElement = document.activeElement;
+      const focusIsOutside = !dialog?.contains(activeElement);
+      if (e.shiftKey && (activeElement === first || focusIsOutside)) {
+        e.preventDefault();
+        last.focus({ preventScroll: true });
+      } else if (!e.shiftKey && (activeElement === last || focusIsOutside)) {
+        e.preventDefault();
+        first.focus({ preventScroll: true });
+      }
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => {
+      window.removeEventListener("keydown", handleKey);
+      const previouslyFocused = resolveFocusTarget(returnTarget);
+      if (
+        previouslyFocused?.isConnected &&
+        typeof previouslyFocused.focus === "function"
+      ) {
+        previouslyFocused.focus({ preventScroll: true });
+      }
+    };
+  }, [onClose, returnFocusTo]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className="v2-panel mx-4 w-full max-w-lg rounded-2xl p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-5 flex items-center justify-between">
+          <h3 id={titleId} className="text-lg font-semibold text-white">{title}</h3>
+          <button
+            onClick={onClose}
+            aria-label={t("common.close")}
+            className="grid h-8 w-8 place-items-center rounded-md text-iron-300 hover:bg-white/[0.06] hover:text-white"
+          >
+            <Icon name="close" className="h-4 w-4" />
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}

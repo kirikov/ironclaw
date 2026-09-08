@@ -1,0 +1,343 @@
+import { useLocation } from "react-router";
+import React from "react";
+import { queryLogs, queryOperatorLogs } from "../../../lib/api";
+import { normalizeOperatorLogsResponse } from "../lib/logs-data";
+
+const POLL_INTERVAL_MS = 2000;
+const LOG_LIMIT = 500;
+const MAX_RETAINED_LOG_ENTRIES = 2000;
+const HIDDEN_ENTRY_ID_CAP = 2000;
+const TERMINAL_UNSUPPORTED_STATUSES = new Set([403, 404]);
+type LogScopeKey =
+  | "threadId"
+  | "runId"
+  | "turnId"
+  | "toolCallId"
+  | "toolName"
+  | "source";
+
+type LogScopeItem = {
+  key: LogScopeKey;
+  param: string;
+  labelKey: string;
+  value: string;
+};
+
+type LogScope = Record<LogScopeKey, string | null> & {
+  active: LogScopeItem[];
+};
+
+type SearchLocation = { search?: string };
+
+const SCOPE_QUERY_PARAMS: ReadonlyArray<
+  readonly [LogScopeKey, string, string]
+> = [
+  ["threadId", "thread_id", "logs.scope.thread"],
+  ["runId", "run_id", "logs.scope.run"],
+  ["turnId", "turn_id", "logs.scope.turn"],
+  ["toolCallId", "tool_call_id", "logs.scope.toolCall"],
+  ["toolName", "tool_name", "logs.scope.tool"],
+  ["source", "source", "logs.scope.source"],
+];
+
+function mergeLogEntries(...pages) {
+  const seen = new Set();
+  const merged = [];
+  for (const page of pages) {
+    for (const entry of page) {
+      if (seen.has(entry.id)) continue;
+      seen.add(entry.id);
+      merged.push(entry);
+      if (merged.length === MAX_RETAINED_LOG_ENTRIES) return merged;
+    }
+  }
+  return merged;
+}
+
+function effectiveLocationSearch(location: SearchLocation = globalThis.location) {
+  return location?.search || globalThis.location?.search || "";
+}
+
+export function readLogScopeFromLocation(
+  location: SearchLocation = globalThis.location,
+  defaultThreadId: string | null = null,
+) {
+  const params = new URLSearchParams(effectiveLocationSearch(location));
+  const scope: LogScope = {
+    active: [],
+    threadId: null,
+    runId: null,
+    turnId: null,
+    toolCallId: null,
+    toolName: null,
+    source: null,
+  };
+  for (const [key, param, labelKey] of SCOPE_QUERY_PARAMS) {
+    const value = params.get(param)?.trim();
+    if (value) {
+      scope[key] = value;
+      scope.active.push({ key, param, labelKey, value });
+    } else {
+      scope[key] = null;
+    }
+  }
+  if (!scope.threadId && defaultThreadId) {
+    scope.threadId = defaultThreadId;
+  }
+  return scope;
+}
+
+// Fail closed to caller-scoped logs if layout context is missing. Operator logs
+// are an optimization for operator-capable sessions, not the default.
+export function useLogs(
+  {
+    isAdmin = false,
+    defaultThreadId = null,
+  }: { isAdmin?: boolean; defaultThreadId?: string | null } = {},
+) {
+  const location = useLocation();
+  const locationSearch = effectiveLocationSearch(location);
+  const scope = React.useMemo(
+    () => readLogScopeFromLocation(location, defaultThreadId),
+    [defaultThreadId, locationSearch]
+  );
+  const { runId, source, threadId, toolCallId, toolName, turnId } = scope;
+  const [entries, setEntries] = React.useState([]);
+  const [levelFilter, setLevelFilter] = React.useState("all");
+  const [targetFilter, setTargetFilter] = React.useState("");
+  const [paused, setPaused] = React.useState(false);
+  const [autoScroll, setAutoScroll] = React.useState(true);
+  const [isLoading, setIsLoading] = React.useState(true);
+  const [error, setError] = React.useState(null);
+  const [nextCursor, setNextCursor] = React.useState(null);
+  const [isLoadingMore, setIsLoadingMore] = React.useState(false);
+  const [loadMoreError, setLoadMoreError] = React.useState(null);
+  const hiddenEntryIdsRef = React.useRef(new Set());
+  const generationRef = React.useRef(0);
+  const refreshRequestIdRef = React.useRef(0);
+  const nextCursorRef = React.useRef(null);
+  const hasLoadedOlderRef = React.useRef(false);
+  const loadMoreInFlightRef = React.useRef(null);
+  const loadMoreAbortRef = React.useRef(null);
+  const needsThreadScope = !isAdmin && !threadId;
+
+  // Pagination invariants:
+  // - generation changes invalidate every response issued for an old scope/filter.
+  // - refresh request IDs keep only the newest poll within one generation.
+  // - once pagination advances, polling must not rewind nextCursor.
+  // - entries are newest-first and bounded so polling work and DOM size stay finite.
+  React.useEffect(() => {
+    loadMoreAbortRef.current?.abort();
+    generationRef.current += 1;
+    refreshRequestIdRef.current += 1;
+    nextCursorRef.current = null;
+    hasLoadedOlderRef.current = false;
+    loadMoreInFlightRef.current = null;
+    loadMoreAbortRef.current = null;
+    setEntries([]);
+    setError(null);
+    setNextCursor(null);
+    setIsLoadingMore(false);
+    setLoadMoreError(null);
+  }, [
+    isAdmin,
+    levelFilter,
+    runId,
+    source,
+    targetFilter,
+    threadId,
+    toolCallId,
+    toolName,
+    turnId,
+  ]);
+
+  const queryLogPage = React.useCallback(async (request) => {
+    try {
+      return await (isAdmin ? queryOperatorLogs(request) : queryLogs(request));
+    } catch (err) {
+      if (!isAdmin || !TERMINAL_UNSUPPORTED_STATUSES.has(err?.status)) {
+        throw err;
+      }
+      return queryLogs(request);
+    }
+  }, [isAdmin]);
+
+  const requestForCursor = React.useCallback((cursor = null, limit = LOG_LIMIT) => ({
+    limit,
+    cursor,
+    level: levelFilter === "all" ? null : levelFilter,
+    target: targetFilter.trim() || null,
+    threadId,
+    runId,
+    turnId,
+    toolCallId,
+    toolName,
+    source,
+  }), [
+    levelFilter,
+    runId,
+    source,
+    targetFilter,
+    threadId,
+    toolCallId,
+    toolName,
+    turnId,
+  ]);
+
+  const loadLogs = React.useCallback(async () => {
+    if (needsThreadScope) {
+      setIsLoading(false);
+      return;
+    }
+    const generation = generationRef.current;
+    const requestId = ++refreshRequestIdRef.current;
+    setIsLoading(true);
+    try {
+      const response = await queryLogPage(requestForCursor());
+      if (
+        generation !== generationRef.current ||
+        requestId !== refreshRequestIdRef.current
+      ) return;
+      const hidden = hiddenEntryIdsRef.current;
+      const logs = normalizeOperatorLogsResponse(response);
+      const nextEntries = logs.entries.filter((entry) => !hidden.has(entry.id));
+      setEntries((current) => mergeLogEntries(nextEntries, current));
+      if (!hasLoadedOlderRef.current) {
+        nextCursorRef.current = logs.nextCursor;
+        setNextCursor(logs.nextCursor);
+      }
+      setError(null);
+    } catch (err) {
+      if (
+        generation !== generationRef.current ||
+        requestId !== refreshRequestIdRef.current
+      ) return;
+      setError(err);
+    } finally {
+      if (
+        generation === generationRef.current &&
+        requestId === refreshRequestIdRef.current
+      ) {
+        setIsLoading(false);
+      }
+    }
+  }, [
+    needsThreadScope,
+    queryLogPage,
+    requestForCursor,
+  ]);
+
+  const loadOlder = React.useCallback(() => {
+    const cursor = nextCursorRef.current;
+    if (!cursor) return Promise.resolve();
+    if (loadMoreInFlightRef.current) return loadMoreInFlightRef.current;
+    const remainingCapacity = MAX_RETAINED_LOG_ENTRIES - entries.length;
+    if (remainingCapacity <= 0) return Promise.resolve();
+
+    const generation = generationRef.current;
+    const controller = new AbortController();
+    loadMoreAbortRef.current = controller;
+    setIsLoadingMore(true);
+    setLoadMoreError(null);
+    const request = queryLogPage({
+      ...requestForCursor(cursor, Math.min(LOG_LIMIT, remainingCapacity)),
+      signal: controller.signal,
+    })
+      .then((response) => {
+        if (generation !== generationRef.current || controller.signal.aborted) return;
+        const hidden = hiddenEntryIdsRef.current;
+        const logs = normalizeOperatorLogsResponse(response);
+        const pageEntries = logs.entries.filter((entry) => !hidden.has(entry.id));
+        hasLoadedOlderRef.current = true;
+        nextCursorRef.current = logs.nextCursor;
+        setEntries((current) => mergeLogEntries(current, pageEntries));
+        setNextCursor(logs.nextCursor);
+        setLoadMoreError(null);
+      })
+      .catch((err) => {
+        if (generation === generationRef.current && !controller.signal.aborted) {
+          setLoadMoreError(err);
+        }
+      })
+      .finally(() => {
+        if (loadMoreInFlightRef.current === request) {
+          loadMoreInFlightRef.current = null;
+          loadMoreAbortRef.current = null;
+          if (generation === generationRef.current) {
+            setIsLoadingMore(false);
+          }
+        }
+      });
+    loadMoreInFlightRef.current = request;
+    return request;
+  }, [entries.length, queryLogPage, requestForCursor]);
+
+  React.useEffect(() => () => {
+    generationRef.current += 1;
+    loadMoreAbortRef.current?.abort();
+    loadMoreAbortRef.current = null;
+    loadMoreInFlightRef.current = null;
+  }, []);
+
+  React.useEffect(() => {
+    loadLogs();
+  }, [loadLogs]);
+
+  React.useEffect(() => {
+    if (paused || needsThreadScope) return undefined;
+    const timer = setInterval(loadLogs, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [loadLogs, needsThreadScope, paused]);
+
+  const togglePause = React.useCallback(() => {
+    setPaused((value) => !value);
+  }, []);
+
+  const clearEntries = React.useCallback(() => {
+    const hidden = [
+      ...hiddenEntryIdsRef.current,
+      ...entries.map((entry) => entry.id),
+    ].slice(-HIDDEN_ENTRY_ID_CAP);
+    hiddenEntryIdsRef.current = new Set(hidden);
+    loadMoreAbortRef.current?.abort();
+    generationRef.current += 1;
+    refreshRequestIdRef.current += 1;
+    nextCursorRef.current = null;
+    hasLoadedOlderRef.current = false;
+    loadMoreInFlightRef.current = null;
+    loadMoreAbortRef.current = null;
+    setEntries([]);
+    setIsLoading(false);
+    setNextCursor(null);
+    setIsLoadingMore(false);
+    setLoadMoreError(null);
+  }, [entries]);
+
+  return {
+    entries,
+    totalCount: entries.length,
+    paused,
+    togglePause,
+    clearEntries,
+    levelFilter,
+    setLevelFilter,
+    targetFilter,
+    setTargetFilter,
+    autoScroll,
+    setAutoScroll,
+    serverLevel: null,
+    changeServerLevel: async () => {},
+    scope,
+    needsThreadScope,
+    status: needsThreadScope ? "needs_scope" : error ? "error" : isLoading ? "loading" : "ready",
+    isLoading,
+    error,
+    nextCursor,
+    retentionLimitReached:
+      Boolean(nextCursor) && entries.length >= MAX_RETAINED_LOG_ENTRIES,
+    maxRetainedEntries: MAX_RETAINED_LOG_ENTRIES,
+    isLoadingMore,
+    loadMoreError,
+    loadOlder,
+  };
+}

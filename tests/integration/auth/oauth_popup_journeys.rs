@@ -23,7 +23,7 @@ use ironclaw_auth::{
     CredentialAccountListRequest, OpaqueStateHash, PkceVerifierHash, RebornOAuthCallbackOutcome,
     RebornOAuthCallbackRequest,
 };
-use ironclaw_reborn_composition::test_support::build_oauth_product_auth_for_test;
+use ironclaw_composition::test_support::build_oauth_product_auth_for_test;
 
 /// Extension-runtime P6 S3: a CHANNEL extension's OAuth connect must bind
 /// the proven vendor identity to the authenticated caller through the
@@ -50,28 +50,30 @@ async fn oauth_connect_binds_channel_identity_through_the_generic_hook() {
         CredentialAccountLookupRequest, NewAuthFlow, OAuthAuthorizationCode, OAuthAuthorizationUrl,
         OAuthProviderCallbackRequest, PkceVerifierSecret, ProviderScope,
     };
+    use ironclaw_composition::test_support::{
+        build_oauth_product_auth_with_identity_for_test,
+        handle_oauth_callback_with_channel_identity_binding_for_test,
+    };
     use ironclaw_extension_host::channel_identity_binding::ChannelIdentityBindingConfig;
     use ironclaw_extension_host::{
         AdminConfigurationIdempotencyKey, AdminConfigurationService,
         AdminConfigurationSubmittedValue, ChannelConfigReactivation,
         ChannelConfigReactivationError, ChannelConfigService, FilesystemAdminConfigurationStore,
     };
-    use ironclaw_extensions::{
+    use ironclaw_extension_registry::{
         ExtensionInstallation, ExtensionInstallationId, ExtensionInstallationStore,
         ExtensionInstallationStorePort, ExtensionManifestRecord, ExtensionManifestRef,
         ManifestSource,
     };
     use ironclaw_filesystem::{InMemoryBackend, RootFilesystem, ScopedFilesystem};
     use ironclaw_host_api::{
-        ExtensionId, InvocationId, MountAlias, MountGrant, MountPermissions, MountView,
-        ResourceScope, SecretHandle, UserId, VirtualPath,
-    };
-    use ironclaw_reborn_composition::{
-        RebornUserIdentityBinding, RebornUserIdentityBindingDeleteStore,
-        RebornUserIdentityBindingError, RebornUserIdentityBindingStore,
-        test_support::{
-            build_oauth_product_auth_with_identity_for_test,
-            handle_oauth_callback_with_channel_identity_binding_for_test,
+        ids::{ExtensionId, InvocationId, SecretHandle, UserId},
+        mount::{MountGrant, MountPermissions, MountView},
+        path::{MountAlias, VirtualPath},
+        resource::ResourceScope,
+        user_identity::{
+            RebornUserIdentityBinding, RebornUserIdentityBindingDeleteStore,
+            RebornUserIdentityBindingError, RebornUserIdentityBindingStore,
         },
     };
     use ironclaw_secrets::{SecretMaterial, SecretStore, SecretStorePort};
@@ -106,7 +108,7 @@ async fn oauth_connect_binds_channel_identity_through_the_generic_hook() {
         async fn delete_user_identity_bindings_for_user(
             &self,
             provider: &str,
-            user_id: &ironclaw_host_api::UserId,
+            user_id: &ironclaw_host_api::ids::UserId,
             provider_user_id_prefix: Option<&str>,
         ) -> Result<usize, RebornUserIdentityBindingError> {
             let mut bindings = self.bindings.lock().unwrap();
@@ -178,8 +180,6 @@ injection = {{ type = "header", name = "authorization", prefix = "Bearer " }}
 [channel]
 id = "messages"
 display_name = "AcmeChat messages"
-inbound = true
-outbound = true
 conversation_model = "continuous"
 
 [channel.ingress]
@@ -218,8 +218,8 @@ app_id = "/app_id"
             Arc::new(InMemoryBackend::new()),
             VirtualPath::new("/system/extensions/.installations/oauth-popup")
                 .expect("valid installation root"),
-            ironclaw_host_runtime::default_host_port_catalog().expect("host port catalog"),
-            ironclaw_host_runtime::default_host_api_contract_registry()
+            ironclaw_host_api::host_port::default_host_port_catalog().expect("host port catalog"),
+            ironclaw_extension_registry::default_host_api_contract_registry()
                 .expect("host API contracts"),
         )
         .await
@@ -228,9 +228,10 @@ app_id = "/app_id"
     let record = ExtensionManifestRecord::from_toml(
         &manifest,
         ManifestSource::HostBundled,
-        &ironclaw_host_runtime::default_host_port_catalog().expect("catalog"),
+        &ironclaw_host_api::host_port::default_host_port_catalog().expect("catalog"),
         None,
-        &ironclaw_host_runtime::default_host_api_contract_registry().expect("contracts"),
+        &ironclaw_extension_registry::default_host_api_contract_registry().expect("contracts"),
+        None,
     )
     .expect("fixture manifest parses");
     let admin_descriptors = record.resolved().admin_configuration.clone();
@@ -244,7 +245,7 @@ app_id = "/app_id"
                 ExtensionManifestRef::new(extension_id.clone(), None),
                 Vec::new(),
                 chrono::Utc::now(),
-                ironclaw_extensions::InstallationOwner::Tenant,
+                ironclaw_extension_registry::InstallationOwner::Tenant,
             )
             .expect("installation"),
         )
@@ -281,7 +282,7 @@ app_id = "/app_id"
     admin
         .replace(
             &admin_scope,
-            &ironclaw_extensions::AdminConfigurationGroupId::new("extension.acmechat")
+            &ironclaw_extension_registry::AdminConfigurationGroupId::new("extension.acmechat")
                 .expect("admin group id"),
             &AdminConfigurationIdempotencyKey::new("oauth-popup-channel-scope")
                 .expect("idempotency key"),
@@ -329,6 +330,7 @@ app_id = "/app_id"
                 .services
                 .flow_manager()
                 .create_flow(NewAuthFlow {
+                    requested_scopes: Vec::new(),
                     id: None,
                     scope: scope.clone(),
                     kind: AuthFlowKind::IntegrationCredential,
@@ -345,6 +347,8 @@ app_id = "/app_id"
                     opaque_state_hash: Some(state_hash.clone()),
                     pkce_verifier_hash: Some(PkceVerifierHash::new(hex64(fill)).unwrap()),
                     expires_at,
+                    // User-driven connect flow in this fixture, not extension-owned.
+                    requester_extension: None,
                 })
                 .await
                 .expect("create_flow must succeed");

@@ -22,32 +22,32 @@ If `$ARGUMENTS` contains `--label=<X>`, append `--label '<X>'` to the `gh pr lis
 Also fetch recently merged PRs (last 7 days) to detect superseded/conflicting work:
 
 ```
-gh pr list --state merged --search "merged:>=$(date -v-7d +%Y-%m-%d)" --limit 100 --json number,title,body,mergedAt
+gh pr list --state merged --search "merged:>=$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d"))')" --limit 100 --json number,title,body,mergedAt
 ```
 
 ## Step 2: Classify each PR by module
 
-For each open PR, determine the primary module it touches by examining the `files` field. Classify into these categories based on the dominant directory:
+For each open PR, determine the primary module it touches by examining the `files` field. Classify into these categories based on the dominant directory. Each path appears in exactly one row; if a future edit introduces an overlap, the more specific row wins over the **Reborn stack** umbrella:
 
 | Category | Directories |
 |----------|------------|
-| **Reborn stack (most current work)** | `crates/ironclaw_runner/`, `crates/ironclaw_reborn_cli/`, `crates/ironclaw_reborn_composition/`, `crates/ironclaw_reborn_event_store/`, `crates/ironclaw_reborn_identity/`, `crates/ironclaw_reborn_openai_compat*/`, `crates/ironclaw_reborn_traces/`, `crates/ironclaw_webui/`, `crates/ironclaw_product/`, `crates/ironclaw_turns/`, `crates/ironclaw_threads/`, `crates/ironclaw_agent_loop/`, `crates/ironclaw_host_runtime/`, `crates/ironclaw_loop_host/`, `crates/ironclaw_capabilities/` |
-| **Legacy v1 crates** | `crates/ironclaw_engine/`, `crates/ironclaw_gateway/`, `crates/ironclaw_oauth/`, `crates/ironclaw_embeddings/`, `crates/ironclaw_tui/` |
-| **LLM & Inference** | `crates/ironclaw_llm/` |
-| **Agent Core** | `src/agent/`, `src/skills/` |
-| **Tools** | `src/tools/`, `tools-src/` |
-| **Channels** | `src/channels/`, `channels-src/` |
-| **Storage & Memory** | `src/db/`, `src/workspace/`, `migrations/` |
-| **Security** | `src/safety/`, `src/secrets/` |
-| **Config & Setup** | `src/config/`, `src/setup/`, `src/cli/`, `crates/ironclaw_reborn_config/` |
-| **Sandbox & Orchestration** | `src/sandbox/`, `src/orchestrator/`, `src/worker/` |
-| **Hooks & Extensions** | `src/hooks/`, `src/extensions/` |
-| **Context & History** | `src/context/`, `src/history/`, `src/estimation/`, `src/evaluation/` |
-| **Web Gateway** | `src/channels/web/` |
+| **Reborn stack (most current work)** | `crates/loop/ironclaw_turn_runner/`, `crates/app/ironclaw_cli/`, `crates/app/ironclaw_composition/`, `crates/events/ironclaw_event_store/`, `crates/domains/ironclaw_identity/`, `crates/product/ironclaw_openai_compat*/`, `crates/domains/ironclaw_trace_commons/`, `crates/product/ironclaw_webui/`, `crates/product/ironclaw_assistant/`, `crates/kernel/ironclaw_turns/`, `crates/domains/ironclaw_threads/`, `crates/loop/ironclaw_agent_loop/`, `crates/kernel/ironclaw_host_runtime/`, `crates/loop/ironclaw_loop_host/`, `crates/kernel/ironclaw_capabilities/` |
+| **LLM & Inference** | `crates/domains/ironclaw_llm/` |
+| **Agent Core** | `crates/domains/ironclaw_skills/` |
+| **Tools & Extensions** | `crates/extensions/ironclaw_extension_support/`, `crates/extensions/ironclaw_extension_host/`, `crates/extensions/ironclaw_extension_registry/` |
+| **Channels** | `crates/extensions/packages/slack/`, `crates/extensions/packages/telegram/` |
+| **Storage & Memory** | `crates/substrates/ironclaw_filesystem/`, `crates/domains/ironclaw_memory*/`, `crates/substrates/ironclaw_libsql_runtime/`, `migrations/` |
+| **Security** | `crates/substrates/ironclaw_safety/`, `crates/substrates/ironclaw_secrets/`, `crates/kernel/ironclaw_trust/`, `crates/kernel/ironclaw_authorization/`, `crates/kernel/ironclaw_approvals/` |
+| **Config & Setup** | `crates/app/ironclaw_config/` |
+| **Sandbox & Processes** | `crates/lanes/ironclaw_sandbox/`, `crates/kernel/ironclaw_processes/`, `crates/lanes/ironclaw_wasm*/` |
+| **Hooks** | `crates/loop/ironclaw_hooks/` |
+| **Events & Projections** | `crates/events/ironclaw_event_log/`, `crates/events/ironclaw_event_projections/`, `crates/events/ironclaw_event_streams/` |
 | **CI/CD & Docs** | `.github/`, `README.md`, `CLAUDE.md`, `*.md` (no src) |
 | **Other** | Anything else |
 
 If a PR touches multiple modules, assign it to the **primary** module (most files changed) but note the cross-cutting modules.
+
+Note: CI's own scope labeler (`.github/workflows/pr-label-scope.yml` + `.github/labeler.yml`) still fires a handful of non-`src/**` labels (`scope: ci` for `.github/**`, `scope: docs` for `**/*.md` and `docs/**`, `scope: dependencies` for `Cargo.toml`/`Cargo.lock`, `DB MIGRATION` for `migrations/**`), but every `src/**`-scoped label (`scope: agent`, `scope: tool*`, `scope: db*`, `scope: safety`, `scope: llm`, …) targets pre-Reborn paths that no longer exist and can never fire on a current PR — `grep -c 'src/' .github/labeler.yml` shows the extent. For unlabelled `crates/**` changes, or to classify anything the labeler doesn't cover, use this manual table; when a `scope: *` label from the list above is already present, use it instead of re-deriving.
 
 ## Step 3: Assess review state
 
@@ -66,7 +66,25 @@ Also check:
 
 ## Step 4: Determine scope and risk
 
-Classify each PR by scope:
+CI already classifies every PR on open/sync via `.github/workflows/pr-label-classify.yml`
+(`.github/scripts/pr-labeler.sh`), which sets an exclusive `size: XS|S|M|L|XL` label (by total
+additions+deletions) and an exclusive `risk: *` label. The `size: *` label is diff-stat-based and
+safe to trust as-is; read it from the `labels` field already fetched in Step 1 instead of
+re-deriving line-count buckets — only fall back to computing size yourself (below) if the PR
+predates the labeler or its label is missing (e.g. CI hasn't run yet).
+
+**Do not trust `risk: *` at face value for `crates/**` PRs.** `classify_risk` in
+`.github/scripts/pr-labeler.sh` pattern-matches only pre-Reborn `src/**` paths (plus `Cargo.toml`
+and `.github/workflows/*`); a PR that touches only `crates/**` — including
+`crates/kernel/ironclaw_trust/`, `crates/substrates/ironclaw_secrets/`, or
+`crates/substrates/ironclaw_safety/` — always falls through to `risk: low`
+(`grep -n 'src/' .github/scripts/pr-labeler.sh` shows the exhaustive pattern list). Treat
+`risk: *` as advisory only, and always cross-check against the **Security** row of the Step 2
+table before trusting a `risk: low` PR. If the `risk: *` label is absent entirely (classifier
+hasn't run, or a transient API failure per the script's own resilience notes), mark risk as
+**unknown** and flag the PR for manual review rather than assuming low.
+
+Fallback scope table (only if `size: *` label absent):
 
 | Scope | Criteria |
 |-------|----------|

@@ -46,7 +46,7 @@ concurrency:
 env:
   # Tests must never touch the real OS keychain (macOS Keychain auth dialog /
   # Linux Secret Service). Guarded by
-  # crates/ironclaw_secrets/src/keychain.rs::os_keychain_suppressed:
+  # crates/substrates/ironclaw_secrets/src/keychain.rs::os_keychain_suppressed:
   # cfg!(test) covers unit tests; this covers integration/e2e that link the
   # non-cfg(test) library.
   IRONCLAW_DISABLE_OS_KEYCHAIN: "1"
@@ -62,6 +62,7 @@ jobs:
   changes:
     name: Detect code changes
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       docs_only: ${{ steps.non_diff.outputs.docs_only || steps.diff.outputs.docs_only }}
       has_core_code: ${{ steps.non_diff.outputs.has_core_code || steps.diff.outputs.has_core_code }}
@@ -79,7 +80,7 @@ jobs:
           echo "has_direct_wasm_abi_risk=true" >> "$GITHUB_OUTPUT"
           echo "has_wasm_abi_risk=true" >> "$GITHUB_OUTPUT"
           echo "has_docker_risk=true" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         with:
           fetch-depth: 0
@@ -106,7 +107,23 @@ jobs:
           printf '%s\n' "$CHANGED_FILES" | scripts/ci/classify-test-scope.sh >> "$GITHUB_OUTPUT"
 
           has_direct_wasm_abi_risk=false
-          if has_match '^(wit/|crates/ironclaw_common/|crates/ironclaw_wasm/|crates/ironclaw_wasm_product_adapters/|crates/ironclaw_first_party_extensions/assets/.*/(manifest\.toml|wasm-src/)|registry/|scripts/build-wasm-extensions\.sh$|scripts/check-version-bumps\.sh$|\.github/workflows/(platform-and-compat|nightly-deep-ci)\.yml$)'; then
+          # Crate scopes are matched by NAME at any depth: `crates/([^/]+/)*<name>/`
+          # keeps matching once crates move into family directories
+          # (crates/<family>/ironclaw_*, PROPOSAL §5). A flat `crates/<name>/`
+          # prefix stops matching there, `has_direct_wasm_abi_risk` goes false,
+          # and every WASM ABI check silently skips — the WS10 failure mode
+          # (#6963). `crates/ironclaw_wasm_product_adapters/` was also dropped:
+          # that crate no longer exists, so the alternative had been matching
+          # nothing. The bare `wit/` alternative went the same way when the WIT
+          # directory moved inside its owning crate (CHECKLIST WS4): the ABI
+          # files are `crates/lanes/ironclaw_wasm/wit/*.wit` now, already in scope via
+          # the `ironclaw_wasm` crate alternative, which unlike a repo-root
+          # prefix survives the WS7 family move too.
+          # scripts/ci/ws12_workflow_contracts.py pins this regex
+          # against the real crate inventory and against a real first-party
+          # extension manifest path, so a renamed, moved or deleted crate fails
+          # loudly here instead of quietly falling out of scope.
+          if has_match '^(crates/([^/]+/)*ironclaw_common/|crates/([^/]+/)*ironclaw_wasm/|crates/([^/]+/)*packages/[^/]+/(manifest\.toml|wasm-src/)|registry/|scripts/build-wasm-extensions\.sh$|scripts/check-version-bumps\.sh$|\.github/workflows/(platform-and-compat|nightly-deep-ci)\.yml$)'; then
             has_direct_wasm_abi_risk=true
           fi
           echo "has_direct_wasm_abi_risk=$has_direct_wasm_abi_risk" >> "$GITHUB_OUTPUT"
@@ -117,7 +134,7 @@ jobs:
             echo "has_wasm_abi_risk=false" >> "$GITHUB_OUTPUT"
           fi
 
-          if has_match '^(Dockerfile|\.dockerignore$|\.github/workflows/platform-and-compat\.yml$)'; then
+          if has_match '^(Dockerfile|\.dockerignore$|docker/reborn/(entrypoint|start-sshd)\.sh$|\.github/workflows/platform-and-compat\.yml$)'; then
             echo "has_docker_risk=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_docker_risk=false" >> "$GITHUB_OUTPUT"
@@ -128,7 +145,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.has_legacy_tests == 'true' && needs.changes.outputs.has_core_code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -144,33 +161,31 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
       DATABASE_URL: postgres://postgres:postgres@localhost/ironclaw_test
       # Turn a missing/unreachable Postgres into a HARD failure so the full
       # cross-backend matrix (in-memory + libSQL + Postgres) cannot skip-pass.
       IRONCLAW_REQUIRE_POSTGRES: "1"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: hooks-parity
-          # Keep saves to protected-branch and merge_group runs so the ~10 GB
-          # repo cache LRU is seeded by shared states, not arbitrary PR branches.
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'merge_group' }}
+          # Saved from pushes to main only (merge_group saves land on a queue
+          # ref nothing else can restore; see reborn-tests.yml).
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # Full parity matrix across all three backends. Backend implementations
       # always compile; --features integration adds the multi-host adversarial
       # suite, and IRONCLAW_REQUIRE_POSTGRES=1 (set above) makes the Postgres
       # leg mandatory. The libSQL leg always runs (embedded temp-file).
       - name: Run hooks parity matrix + multi-host adversarial suite (all backends)
         run: |
-          timeout --signal=INT --kill-after=30s 15m \
+          timeout --signal=INT --kill-after=30s 25m \
             cargo test -p ironclaw_hooks \
               --features integration,test-support \
               --test parity_matrix \
@@ -185,6 +200,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.has_legacy_tests == 'true' && (github.event_name == 'push' || inputs.deep == true)
     runs-on: windows-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -202,12 +218,12 @@ jobs:
             flags: ""
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: windows-${{ matrix.name }}
@@ -228,12 +244,9 @@ jobs:
        (github.event_name == 'pull_request' && needs.changes.outputs.has_direct_wasm_abi_risk == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
@@ -243,29 +256,33 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h /
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-wasip2
       - name: Enable pnpm for setup-node cache
         run: corepack enable pnpm
       - name: Install Node.js for WebUI bundle builds
-        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: "22"
           cache: "pnpm"
-          cache-dependency-path: crates/ironclaw_webui/frontend/pnpm-lock.yaml
+          cache-dependency-path: |
+            crates/product/ironclaw_webui/frontend/pnpm-lock.yaml
+            crates/*/*/ironclaw_webui/frontend/pnpm-lock.yaml
       - name: Enable pnpm
         run: corepack enable pnpm
       - name: Install WebUI frontend dependencies
         run: |
-          cd crates/ironclaw_webui/frontend
+          set -euo pipefail
+          webui_dir="$(bash scripts/ci/crate-dir.sh ironclaw_webui)"
+          cd "${webui_dir}/frontend"
           pnpm install --frozen-lockfile
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: wasm-extensions
-          # Keep saves to protected-branch and merge_group runs so the ~10 GB
-          # repo cache LRU is seeded by shared states, not arbitrary PR branches.
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'merge_group' }}
+          # Saved from pushes to main only (merge_group saves land on a queue
+          # ref nothing else can restore; see reborn-tests.yml).
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-component
         uses: ./.github/actions/install-cargo-component
       - name: Build all WASM extensions against current WIT
@@ -284,27 +301,32 @@ jobs:
       (github.event_name == 'push' || inputs.deep == true) &&
       needs.changes.outputs.has_core_code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: ./.github/actions/setup-rust
       - name: Enable pnpm for setup-node cache
         run: corepack enable pnpm
       - name: Install Node.js for WebUI bundle builds
-        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: "22"
           cache: "pnpm"
-          cache-dependency-path: crates/ironclaw_webui/frontend/pnpm-lock.yaml
+          cache-dependency-path: |
+            crates/product/ironclaw_webui/frontend/pnpm-lock.yaml
+            crates/*/*/ironclaw_webui/frontend/pnpm-lock.yaml
       - name: Enable pnpm
         run: corepack enable pnpm
       - name: Install WebUI frontend dependencies
         run: |
-          cd crates/ironclaw_webui/frontend
+          set -euo pipefail
+          webui_dir="$(bash scripts/ci/crate-dir.sh ironclaw_webui)"
+          cd "${webui_dir}/frontend"
           pnpm install --frozen-lockfile
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -319,9 +341,9 @@ jobs:
     # Dockerfile changes must not be a main-only failure: the merge queue
     # builds the image when the merge group actually touches Docker inputs.
     # The merge_group arm deliberately does not require has_legacy_tests —
-    # the scope classifier matches the literal `Dockerfile`, so a
-    # .dockerignore-only merge group reports has_legacy_tests=false while
-    # has_docker_risk=true.
+    # the scope classifier matches Docker inputs directly, so a merge group
+    # changing only .dockerignore or a Reborn startup script reports
+    # has_legacy_tests=false while has_docker_risk=true.
     if: >
       needs.changes.outputs.docs_only != 'true' &&
       ((needs.changes.outputs.has_legacy_tests == 'true' &&
@@ -329,18 +351,116 @@ jobs:
          (inputs.deep == true && inputs.include_docker))) ||
        (github.event_name == 'merge_group' && needs.changes.outputs.has_docker_risk == 'true'))
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Build Docker image
         run: docker build --target runtime -t ironclaw-reborn-test:ci .
+      - name: Verify in-worker SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(docker image inspect --format '{{.Config.User}}' ironclaw-reborn-test:ci)" = "root"
+          docker image inspect --format '{{json .Config.ExposedPorts}}' ironclaw-reborn-test:ci \
+            | grep -q '"2222/tcp"'
+
+          ssh_work="$(mktemp -d)"
+          container_name="ironclaw-reborn-ssh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          paste_container_name="${container_name}-paste"
+          cleanup() {
+            docker rm --force "$container_name" >/dev/null 2>&1 || true
+            docker rm --force "$paste_container_name" >/dev/null 2>&1 || true
+            rm -rf "$ssh_work"
+          }
+          trap cleanup EXIT
+
+          ssh-keygen -q -t ed25519 -N '' -f "$ssh_work/id_ed25519"
+          docker run --detach \
+            --name "$container_name" \
+            --publish 127.0.0.1::2222 \
+            --env IRONCLAW_REBORN_WEBUI_TOKEN=ssh-ci-webui-token-0123456789abcdef0123456789abcdef \
+            --env "IRONCLAW_REBORN_SSH_PUBLIC_KEY=$(cat "$ssh_work/id_ed25519.pub")" \
+            ironclaw-reborn-test:ci
+
+          ssh_port="$(docker port "$container_name" 2222/tcp | awk -F: 'NR == 1 { print $NF }')"
+          ssh_ready=false
+          for _ in $(seq 1 30); do
+            if ssh \
+              -i "$ssh_work/id_ed25519" \
+              -p "$ssh_port" \
+              -o BatchMode=yes \
+              -o ConnectTimeout=1 \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              agent@127.0.0.1 \
+              'test "$USER" = agent && test "$HOME" = /workspace && test "$PWD" = /workspace'
+            then
+              ssh_ready=true
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "$container_name")" != "true" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ssh_ready" != "true" ]; then
+            docker logs "$container_name"
+            echo "Reborn runtime did not accept an SSH session as agent" >&2
+            exit 1
+          fi
+
+          paste_key="$(cat "$ssh_work/id_ed25519.pub")"$'\n'
+          # The key almost always arrives via `cat id_ed25519.pub`, so the value
+          # carries a trailing newline. start-sshd must tolerate that: it runs
+          # under the entrypoint's `set -e`, so rejecting a usable key does not
+          # merely disable SSH, it aborts the whole container boot. Reuses the
+          # image already built above -- no second build.
+          docker run --detach \
+            --name "$paste_container_name" \
+            --publish 127.0.0.1::2222 \
+            --env IRONCLAW_REBORN_WEBUI_TOKEN=ssh-ci-webui-token-0123456789abcdef0123456789abcdef \
+            --env "IRONCLAW_REBORN_SSH_PUBLIC_KEY=${paste_key}" \
+            ironclaw-reborn-test:ci
+
+          paste_port="$(docker port "$paste_container_name" 2222/tcp | awk -F: 'NR == 1 { print $NF }')"
+          paste_ready=false
+          for _ in $(seq 1 30); do
+            if ssh \
+              -i "$ssh_work/id_ed25519" \
+              -p "$paste_port" \
+              -o BatchMode=yes \
+              -o ConnectTimeout=1 \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              agent@127.0.0.1 'test "$USER" = agent'
+            then
+              paste_ready=true
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "$paste_container_name")" != "true" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$paste_ready" != "true" ]; then
+            docker logs "$paste_container_name"
+            echo "A public key with a trailing newline must still be accepted; rejecting it aborts container boot" >&2
+            exit 1
+          fi
 
   version-check:
     name: Version Bump Check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: changes
     if: >
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
@@ -352,7 +472,7 @@ jobs:
       issues: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
@@ -416,6 +536,7 @@ jobs:
   platform-compat:
     name: Platform & Compat
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: always()
     needs:
       - changes
@@ -427,7 +548,7 @@ jobs:
       - version-check
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
       - name: Check Platform & Compat jobs

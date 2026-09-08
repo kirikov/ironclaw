@@ -20,24 +20,23 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use ironclaw_conversations::{
-    AdapterInstallationId, AdapterKind, ExternalActorRef, InMemoryConversationServices,
+    AdapterInstallationId, AdapterKind, InMemoryConversationServices,
     trusted_trigger_fire_submitter,
 };
+use ironclaw_extension_contracts::external::ExternalActorRef;
+use ironclaw_host_api::turn::{TurnGateRef, TurnRunId, TurnScope, TurnStatus};
 use ironclaw_llm::testing::provider_chain_over;
 use ironclaw_llm::{LlmProvider, SessionConfig, create_session_manager};
+use ironclaw_loop_contracts::ModelProfileId;
 use ironclaw_loop_host::HostManagedModelGateway;
-use ironclaw_runner::model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
+use ironclaw_loop_host::{LlmModelProfilePolicy, LlmProviderModelGateway};
 use ironclaw_triggers::{
     TRIGGER_TRUSTED_ADAPTER_INSTALLATION_ID, TRIGGER_TRUSTED_ADAPTER_KIND,
     TRIGGER_TRUSTED_EXTERNAL_ACTOR_NAMESPACE, TriggerFire, TriggerFireIdentity, TriggerId,
     TriggerInboundContentRef, TriggerMaterializedPrompt, TrustedTriggerFireSubmitOutcome,
     TrustedTriggerSubmitRequest,
 };
-use ironclaw_turns::run_profile::ModelProfileId;
-use ironclaw_turns::{
-    GateRef, GateResumeDisposition, GetRunStateRequest, ResumeTurnPrecondition, TurnRunId,
-    TurnRunState, TurnScope, TurnStateStore, TurnStatus,
-};
+use ironclaw_turns::{GateResumeDisposition, ResumeTurnPrecondition, TurnRunState};
 
 use super::builder::{INTERACTIVE_MODEL_PROFILE, RebornIntegrationHarness};
 use super::reply::RebornScriptedReply;
@@ -76,7 +75,7 @@ impl RebornIntegrationHarness {
             agent_id: self.binding.agent_id.clone(),
             project_id: self.binding.project_id.clone(),
             prompt: prompt.to_string(),
-            delivery_target: None,
+            execution_policy: None,
         }
     }
 
@@ -97,6 +96,7 @@ impl RebornIntegrationHarness {
                 ExternalActorRef::new(
                     TRIGGER_TRUSTED_EXTERNAL_ACTOR_NAMESPACE,
                     self.binding.actor_user_id.as_str(),
+                    None::<String>,
                 )?,
                 self.binding.actor_user_id.clone(),
             )
@@ -122,14 +122,14 @@ impl RebornIntegrationHarness {
         ))?;
         let materialized_prompt = TriggerMaterializedPrompt::for_fire(&fire, content_ref);
         let request =
-            TrustedTriggerSubmitRequest::new_for_test(fire, materialized_prompt, fire_slot);
+            TrustedTriggerSubmitRequest::new_for_test(fire, materialized_prompt, fire_slot)?;
 
         let conversations = self.trigger_conversations_with_paired_actor().await?;
 
         let submitter = trusted_trigger_fire_submitter(
             conversations.clone(),
             conversations,
-            Arc::clone(&self.coordinator),
+            ironclaw_composition::conversation_turn_submitter(Arc::clone(&self.coordinator)),
         );
         match submitter.submit_trusted_trigger_fire(request).await? {
             TrustedTriggerFireSubmitOutcome::Accepted {
@@ -175,7 +175,7 @@ impl RebornIntegrationHarness {
             .ok_or("triggered submit requires a harness binding with an agent id")?;
 
         let (materialized_prompt, turn_scope) =
-            ironclaw_reborn_composition::test_support::materialize_trigger_prompt_for_test(
+            ironclaw_composition::test_support::materialize_trigger_prompt_for_test(
                 conversations.clone(),
                 thread_service,
                 default_agent_id,
@@ -210,11 +210,11 @@ impl RebornIntegrationHarness {
             .register(turn_scope.clone(), gateway);
 
         let request =
-            TrustedTriggerSubmitRequest::new_for_test(fire, materialized_prompt, fire_slot);
+            TrustedTriggerSubmitRequest::new_for_test(fire, materialized_prompt, fire_slot)?;
         let submitter = trusted_trigger_fire_submitter(
             conversations.clone(),
             conversations,
-            Arc::clone(&self.coordinator),
+            ironclaw_composition::conversation_turn_submitter(Arc::clone(&self.coordinator)),
         );
         match submitter.submit_trusted_trigger_fire(request).await? {
             TrustedTriggerFireSubmitOutcome::Accepted {
@@ -252,13 +252,7 @@ impl RebornIntegrationHarness {
     ) -> HarnessResult<TurnRunState> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let state = self
-                .turn_store
-                .get_run_state(GetRunStateRequest {
-                    scope: scope.clone(),
-                    run_id,
-                })
-                .await?;
+            let state = self.turn_runtime.get_run_state(scope, run_id).await?;
             if state.status == expected {
                 return Ok(state);
             }
@@ -287,10 +281,10 @@ impl RebornIntegrationHarness {
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
-        gate_ref: &GateRef,
+        gate_ref: &TurnGateRef,
     ) -> HarnessResult<()> {
         self.capability_recorder
-            .approve_local_dev_gate(gate_ref)
+            .approve_standalone_gate(gate_ref)
             .await?;
         self.resume_run_in_scope(
             scope,
@@ -310,10 +304,10 @@ impl RebornIntegrationHarness {
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
-        gate_ref: &GateRef,
+        gate_ref: &TurnGateRef,
     ) -> HarnessResult<()> {
         self.capability_recorder
-            .deny_local_dev_gate(gate_ref)
+            .deny_standalone_gate(gate_ref)
             .await?;
         self.resume_run_in_scope(
             scope,
@@ -336,7 +330,7 @@ impl RebornIntegrationHarness {
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
-        gate_ref: GateRef,
+        gate_ref: TurnGateRef,
         resume_disposition: Option<GateResumeDisposition>,
         precondition: ResumeTurnPrecondition,
     ) -> HarnessResult<()> {

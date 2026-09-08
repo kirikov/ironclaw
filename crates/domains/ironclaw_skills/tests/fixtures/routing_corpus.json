@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "top_k": 5,
+  "cases": [
+    {
+      "id": "hacker-news-search-no-skill",
+      "class": "negative",
+      "prompt": "search Hacker News for any recent posts mentioning 'IronClaw' or 'NEAR AI'",
+      "relevant": [],
+      "forbidden": ["tech-debt-tracker"],
+      "expect_no_match": true,
+      "baseline_selected": ["tech-debt-tracker"],
+      "source_issue": 5417
+    },
+    {
+      "id": "generic-market-research-no-skill",
+      "class": "negative",
+      "prompt": "Research the latest market share numbers for database vendors and summarize the sources.",
+      "relevant": [],
+      "forbidden": ["product-prioritization"],
+      "expect_no_match": true,
+      "baseline_selected": []
+    },
+    {
+      "id": "security-audit",
+      "class": "positive",
+      "prompt": "Audit these code changes for OWASP issues, injection, and secrets exposure.",
+      "relevant": ["security-review"],
+      "forbidden": ["review-readiness"],
+      "expect_no_match": false,
+      "baseline_selected": ["security-review"]
+    },
+    {
+      "id": "qa-test-plan",
+      "class": "positive",
+      "prompt": "Generate a QA test plan and identify the edge cases and missing regression coverage.",
+      "relevant": ["qa-review"],
+      "forbidden": ["review-readiness"],
+      "expect_no_match": false,
+      "baseline_selected": ["qa-review"]
+    },
+    {
+      "id": "security-and-qa-review",
+      "class": "multi_skill",
+      "prompt": "Run a security audit and generate a QA test plan for these changes.",
+      "relevant": ["security-review", "qa-review"],
+      "forbidden": ["review-readiness"],
+      "expect_no_match": false,
+      "baseline_selected": ["security-review", "qa-review"]
+    },
+    {
+      "id": "merge-readiness",
+      "class": "conflict",
+      "prompt": "Is this PR ready to merge, and which checks or reviews are still missing?",
+      "relevant": ["review-readiness"],
+      "forbidden": ["coding"],
+      "expect_no_match": false,
+      "baseline_selected": ["review-checklist", "review-readiness", "qa-review", "security-review"]
+    },
+    {
+      "id": "commit-staged-changes",
+      "class": "positive",
+      "prompt": "Write a git commit message for my staged changes.",
+      "relevant": ["commit"],
+      "forbidden": ["coding"],
+      "expect_no_match": false,
+      "baseline_selected": ["commit"]
+    },
+    {
+      "id": "record-architecture-decision",
+      "class": "positive",
+      "prompt": "Record this decision: use bounded CAS instead of a process-local mutex.",
+      "relevant": ["decision-capture"],
+      "forbidden": ["idea-parking"],
+      "expect_no_match": false,
+      "baseline_selected": ["decision-capture", "review-readiness"]
+    },
+    {
+      "id": "park-product-idea",
+      "class": "positive",
+      "prompt": "Park this idea for later: build a flaky-test quarantine dashboard.",
+      "relevant": ["idea-parking"],
+      "forbidden": ["decision-capture"],
+      "expect_no_match": false,
+      "baseline_selected": ["idea-parking"]
+    },
+    {
+      "id": "show-commitments",
+      "class": "positive",
+      "prompt": "Show my open commitments and what is overdue.",
+      "relevant": ["commitment-digest"],
+      "forbidden": ["idea-parking"],
+      "expect_no_match": false,
+      "baseline_selected": ["commitment-digest", "commitment-triage", "commit", "decision-capture", "delegation-tracker"]
+    },
+    {
+      "id": "recurring-monitor",
+      "class": "conflict",
+      "prompt": "Check this repository every morning and notify me when new issues appear.",
+      "relevant": ["routine-advisor"],
+      "forbidden": ["delegation"],
+      "expect_no_match": false,
+      "baseline_selected": ["routine-advisor"]
+    },
+    {
+      "id": "delegate-task",
+      "class": "positive",
+      "prompt": "Delegate this task and remind me to follow up tomorrow.",
+      "relevant": ["delegation"],
+      "forbidden": ["idea-parking"],
+      "expect_no_match": false,
+      "baseline_selected": ["delegation-tracker", "delegation", "commitment-triage", "routine-advisor"]
+    },
+    {
+      "id": "track-delegation",
+      "class": "conflict",
+      "prompt": "I delegated this to Maya and need to follow up with her tomorrow.",
+      "relevant": ["delegation-tracker"],
+      "forbidden": ["commitment-digest"],
+      "expect_no_match": false,
+      "baseline_selected": ["delegation-tracker", "commitment-triage", "delegation"]
+    },
+    {
+      "id": "prioritize-roadmap",
+      "class": "positive",
+      "prompt": "Prioritize these roadmap features by user demand and effort.",
+      "relevant": ["product-prioritization"],
+      "forbidden": ["idea-parking"],
+      "expect_no_match": false,
+      "baseline_selected": ["product-prioritization"]
+    },
+    {
+      "id": "pre-merge-checklist",
+      "class": "positive",
+      "prompt": "Run the pre-merge review checklist.",
+      "relevant": ["review-checklist"],
+      "forbidden": ["coding"],
+      "expect_no_match": false,
+      "baseline_selected": ["review-checklist", "review-readiness", "qa-review", "security-review"]
+    },
+    {
+      "id": "fix-code-bug",
+      "class": "positive",
+      "prompt": "Fix this bug in the parser function.",
+      "relevant": ["coding"],
+      "forbidden": ["review-checklist"],
+      "expect_no_match": false,
+      "baseline_selected": ["coding"]
+    },
+    {
+      "id": "record-tech-debt",
+      "class": "positive",
+      "prompt": "This workaround is a hack; add it to the tech debt backlog.",
+      "relevant": ["tech-debt-tracker"],
+      "forbidden": ["idea-parking"],
+      "expect_no_match": false,
+      "baseline_selected": ["tech-debt-tracker"]
+    }
+  ]
+}

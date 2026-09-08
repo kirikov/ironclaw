@@ -11,8 +11,10 @@ use types::{AsciiArt, DrawInput};
 
 wit_bindgen::generate!({
     world: "sandboxed-tool",
-    path: "../../../wit/tool.wit",
+    path: "../../../crates/lanes/ironclaw_wasm/wit/tool.wit",
 });
+
+use exports::near::agent::tool::{ErrorKind, GuestFailure, Response};
 
 struct AsciiRendererTool;
 
@@ -68,14 +70,12 @@ impl exports::near::agent::tool::Guest for AsciiRendererTool {
         };
 
         match serde_json::to_string(&rendered) {
-            Ok(output) => exports::near::agent::tool::Response {
-                output: Some(output),
-                error: None,
-            },
-            Err(error) => exports::near::agent::tool::Response {
-                output: None,
-                error: Some(format!("failed to serialize ascii art: {error}")),
-            },
+            Ok(output) => Response::Success(output),
+            Err(error) => Response::Failure(GuestFailure {
+                kind: ErrorKind::Executor,
+                code: Some("serialization_failed".to_string()),
+                message: Some(format!("failed to serialize ascii art: {error}")),
+            }),
         }
     }
 

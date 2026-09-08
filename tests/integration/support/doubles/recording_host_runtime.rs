@@ -1,12 +1,12 @@
 /// Test double substituting the production `HostRuntime` impl
-/// (`DefaultHostRuntime`, `crates/ironclaw_host_runtime/src/production.rs`).
+/// (`DefaultHostRuntime`, `crates/kernel/ironclaw_host_runtime/src/production.rs`).
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
-use ironclaw_host_api::{ApprovalRequestId, ResourceScope};
+use ironclaw_host_api::{ids::ApprovalRequestId, resource::ResourceScope};
 use ironclaw_host_runtime::{
     CancelRuntimeWorkOutcome, CancelRuntimeWorkRequest, HostRuntime, HostRuntimeError,
     HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalResume, RuntimeCapabilityOutcome,

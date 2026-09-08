@@ -4,12 +4,14 @@
 //! Proves the cancel path end-to-end: the model call parks at the vendor-SDK
 //! seam, the test cancels the in-flight run, releases the park, and the run
 //! reaches `TurnStatus::Cancelled` (not `Completed`). Cancellation is observed
-//! by the loop-driver host's default `TurnStateRunCancellationFactory`, not a
+//! by the loop-driver host's default `AgentTurnRunCancellationFactory`, not a
 //! wired coordinator fan-out.
 //!
 //! Also covers C-ERRORS: a leaked-permit regression guard (precedent: PR
-//! #5206's RAII `ReservationGuard` bugs), thread-busy rejection, and a
-//! non-retryable provider-`Err` reaching a categorized `TurnStatus::Failed`.
+//! #5206's RAII `ReservationGuard` bugs) and a non-retryable provider-`Err`
+//! reaching a categorized `TurnStatus::Failed`. (The busy-thread submit
+//! scenario lives in `steering.rs` now that a busy submit queues as steering
+//! input instead of rejecting.)
 
 #[allow(dead_code)]
 #[path = "support/mod.rs"]
@@ -20,7 +22,7 @@ mod support;
 
 use std::time::Duration;
 
-use ironclaw_product::ProductInboundAck;
+use ironclaw_product_contracts::inbound::ProductInboundAck;
 use ironclaw_turns::TurnStatus;
 use reborn_support::builder::RebornIntegrationHarness;
 use reborn_support::reply::RebornScriptedReply;
@@ -100,43 +102,6 @@ async fn cancelled_run_does_not_block_a_second_turn_on_the_same_thread() {
         .expect("second turn's reply persisted");
 }
 
-/// A second submit on a thread whose first run is still active (parked) must
-/// be rejected — `InboundTurnOutcome::RejectedBusy` — not silently queued or
-/// accepted. Releases the park afterward so no parked task leaks past the test.
-#[tokio::test]
-async fn busy_reject_when_thread_already_has_an_active_run() {
-    let gate = ParkingModelGate::new();
-    let harness = RebornIntegrationHarness::test_default()
-        .park_model(gate.clone())
-        .script([RebornScriptedReply::text("first turn done")])
-        .build()
-        .await
-        .expect("harness builds");
-
-    let run_id = harness
-        .submit_turn_async("do a long thing")
-        .await
-        .expect("first turn submitted");
-    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
-        .await
-        .expect("model call parks before the timeout");
-
-    let ack = harness
-        .submit_turn_ack("interrupt with something else")
-        .await
-        .expect("the busy-reject submit itself does not error");
-    assert!(
-        matches!(ack, ProductInboundAck::RejectedBusy { .. }),
-        "expected RejectedBusy while the thread has an active run, got {ack:?}"
-    );
-
-    gate.release();
-    harness
-        .wait_for_status(run_id, TurnStatus::Completed)
-        .await
-        .expect("first turn still completes after the rejected second submit");
-}
-
 /// A raw provider `Err` classified non-retryable by `ironclaw_llm`
 /// (`LlmError::ContextLengthExceeded`, excluded from `is_retryable`) must
 /// reach `TurnStatus::Failed` after bounded context-shrink recovery is
@@ -179,11 +144,15 @@ async fn mid_turn_provider_error_reaches_failed_with_model_error_category() {
 /// the persisted `SanitizedFailure` seam through the full production path:
 /// provider `Err` -> `map_provider_error` (`CredentialUnavailable`) -> loop
 /// `HostUnavailableWithDiagnostics{Model}` -> runner
-/// `model_stage_failure_category` -> persisted failure.
+/// `host_stage_failure_category` -> persisted failure.
 #[tokio::test]
 async fn mid_turn_auth_provider_error_reaches_failed_with_credentials_category() {
     let harness = RebornIntegrationHarness::test_default()
         .fail_model_auth()
+        // Recording is additive: placing it after the failing mode must not
+        // replace the selected provider behavior.
+        .record_model_calls_for_test()
+        .with_turn_event_sink()
         .build()
         .await
         .expect("harness builds");
@@ -212,6 +181,26 @@ async fn mid_turn_auth_provider_error_reaches_failed_with_credentials_category()
         detail.contains("Authentication failed"),
         "detail should describe the auth failure, got {detail:?}"
     );
+    harness
+        .assert_interactive_model_provider_call_count(1)
+        .await
+        .expect("invalid credentials must not blindly retry the provider");
+    harness
+        .assert_text_model_provider_call_count(0)
+        .await
+        .expect("terminal auth handling must not invoke a model explainer");
+    harness
+        .assert_only_tools_invoked(&[])
+        .await
+        .expect("terminal auth handling must not dispatch a tool");
+    harness
+        .assert_model_message_content_occurrences("model error observation", 0)
+        .await
+        .expect("the failed model must not be credited with seeing an observation");
+    harness
+        .assert_turn_event_recorded(ironclaw_turns::TurnEventKind::Failed)
+        .await
+        .expect("the credentials failure is durably published");
 }
 
 /// Regression guard, `Failed`-path sibling of

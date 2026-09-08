@@ -17,6 +17,7 @@ from typing import Literal
 from aiohttp import ClientSession, ClientTimeout, web
 
 FaultAction = Literal[
+    "forward",
     "respond",
     "disconnect_before_forward",
     "disconnect_after_forward",
@@ -271,6 +272,24 @@ class ProviderFaultProxy:
         return hashlib.sha256(authorization.encode()).hexdigest()[:12]
 
     @staticmethod
+    def _issued_bearer_fingerprint(response: web.Response) -> str | None:
+        try:
+            payload = json.loads(response.body or b"")
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        authenticated_user = payload.get("authed_user")
+        access_token = (
+            authenticated_user.get("access_token")
+            if isinstance(authenticated_user, dict)
+            else None
+        ) or payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            return None
+        return hashlib.sha256(f"Bearer {access_token}".encode()).hexdigest()[:12]
+
+    @staticmethod
     def _abort_transport(request: web.Request) -> None:
         transport = request.transport
         if transport is not None:
@@ -320,6 +339,7 @@ class ProviderFaultProxy:
             "path": request.path,
             "query": request.query_string,
             "credential_fingerprint": self._credential_fingerprint(request.headers),
+            "issued_credential_fingerprint": None,
             "body_sha256": hashlib.sha256(body).hexdigest(),
             "fault": None if rule is None else rule["name"],
             "forwarded": False,
@@ -330,7 +350,9 @@ class ProviderFaultProxy:
 
         if rule is not None:
             action = rule["action"]
-            if action == "delay_before_disconnect":
+            if action == "forward":
+                pass
+            elif action == "delay_before_disconnect":
                 await self._delay_then_disconnect(
                     request,
                     float(rule["delay_seconds"]),
@@ -352,6 +374,9 @@ class ProviderFaultProxy:
         upstream = await self._forward(request, body)
         entry["forwarded"] = True
         entry["upstream_status"] = upstream.status
+        entry["issued_credential_fingerprint"] = self._issued_bearer_fingerprint(
+            upstream
+        )
 
         if rule is not None and rule["action"] == "disconnect_after_forward":
             self._abort_transport(request)

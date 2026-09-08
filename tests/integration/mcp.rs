@@ -13,6 +13,7 @@ mod reborn_support;
 #[path = "../support/mod.rs"]
 mod support;
 
+use ironclaw_network::NetworkHttpRequest;
 use reborn_support::assertions::ToolErrorClass;
 use reborn_support::builder::RebornIntegrationHarness;
 use reborn_support::group::RebornIntegrationGroup;
@@ -48,6 +49,38 @@ fn assert_recorded_tools_call(server: &MockMcpServer, expected_tool: &str, expec
             .and_then(|q| q.as_str()),
         Some(expected_query)
     );
+}
+
+fn observed_hosted_mcp_tools_call<'a>(
+    requests: &'a [NetworkHttpRequest],
+    expected_query: &str,
+) -> (&'a NetworkHttpRequest, serde_json::Value) {
+    let (request, body) = requests
+        .iter()
+        .filter_map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .map(|body| (request, body))
+        })
+        .find(|(_, body)| {
+            body["method"] == "tools/call"
+                && body["params"]["arguments"]["query"] == expected_query
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no hosted MCP tools/call for {expected_query:?} captured across {} redacted request(s)",
+                requests.len()
+            )
+        });
+    assert!(
+        request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization")
+                && value.starts_with("Bearer ")
+                && value.len() > "Bearer ".len()
+        }),
+        "hosted MCP tools/call must carry a mediated bearer credential"
+    );
+    (request, body)
 }
 
 /// The bundled `nearai` package is hosted MCP rather than Emulate-backed.
@@ -103,35 +136,141 @@ async fn nearai_web_search_dispatches_through_bundled_hosted_mcp() {
         .expect("hosted MCP response reached the model-facing result");
 
     let requests = h.captured_network_requests_for_test();
-    let tools_call = requests
-        .iter()
-        .find(|request| {
-            serde_json::from_slice::<serde_json::Value>(&request.body)
-                .ok()
-                .and_then(|body| body["method"].as_str().map(str::to_owned))
-                .as_deref()
-                == Some("tools/call")
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "no hosted MCP tools/call captured across {} redacted request(s)",
-                requests.len()
-            )
-        });
-    let body: serde_json::Value =
-        serde_json::from_slice(&tools_call.body).expect("tools/call body is JSON");
+    let (_, body) = observed_hosted_mcp_tools_call(&requests, "IronClaw capability evidence");
     assert_eq!(body["params"]["name"], "web_search");
+}
+
+/// The bundled hosted-MCP path also preserves an authenticated, successful
+/// empty provider result. This separately pins the request and the outcome so
+/// a locally fabricated empty value cannot satisfy the contract.
+#[tokio::test]
+async fn nearai_web_search_empty_result_dispatches_through_bundled_hosted_mcp() {
+    let group = RebornIntegrationGroup::extension_lifecycle()
+        .await
+        .expect("extension-lifecycle group builds");
+    let h = group
+        .thread("nearai-hosted-mcp-empty-result")
+        .script([
+            RebornScriptedReply::tool_call(
+                "builtin.extension_install",
+                serde_json::json!({"extension_id": "nearai"}),
+            ),
+            RebornScriptedReply::text("NEAR AI search is installed."),
+            RebornScriptedReply::tool_call(
+                "nearai.web_search",
+                serde_json::json!({"query": "NEARAI_EMPTY_PROVIDER_RESULT"}),
+            ),
+            RebornScriptedReply::text("search complete"),
+        ])
+        .build()
+        .await
+        .expect("NEAR AI lifecycle thread builds");
+
+    h.seed_capability_credential_account("nearai", "NEAR AI integration account", &[])
+        .await
+        .expect("NEAR AI account is seeded under the dispatching user");
+    h.submit_turn("install NEAR AI search")
+        .await
+        .expect("install turn completes");
+    h.submit_turn("search for the empty-result sentinel")
+        .await
+        .expect("empty search turn completes");
+    h.assert_tool_invoked("nearai.web_search")
+        .await
+        .expect("canonical NEAR AI capability dispatched");
+
+    let requests = h.captured_network_requests_for_test();
+    observed_hosted_mcp_tools_call(&requests, "NEARAI_EMPTY_PROVIDER_RESULT");
+
+    let output = h
+        .tool_result_output("nearai.web_search")
+        .await
+        .expect("empty hosted MCP result was recorded");
     assert_eq!(
-        body["params"]["arguments"]["query"],
-        "IronClaw capability evidence"
+        output["content"],
+        serde_json::json!([{
+            "type": "text",
+            "text": "[]"
+        }])
     );
+}
+
+/// Provider credentials are selected at the authenticated run-owner boundary:
+/// actor A can dispatch with A's exact account, while actor B cannot install
+/// or call the same hosted extension with A's credential.
+#[tokio::test]
+async fn nearai_hosted_mcp_isolates_provider_accounts_across_actors() {
+    const ACTOR_A_TOKEN: &str = "nearai-provider-account-actor-a";
+    let group = RebornIntegrationGroup::extension_lifecycle_multiuser()
+        .await
+        .expect("multiuser extension-lifecycle group builds");
+    let actor_a = group
+        .thread("nearai-provider-account-actor-a")
+        .script([
+            RebornScriptedReply::tool_call(
+                "builtin.extension_install",
+                serde_json::json!({"extension_id": "nearai"}),
+            ),
+            RebornScriptedReply::text("NEAR AI search is installed."),
+            RebornScriptedReply::tool_call(
+                "nearai.web_search",
+                serde_json::json!({"query": "actor-a-provider-query"}),
+            ),
+            RebornScriptedReply::text("search complete"),
+        ])
+        .build()
+        .await
+        .expect("actor A lifecycle thread builds");
+    actor_a
+        .seed_capability_credential_account_with_token(
+            "nearai",
+            "actor A NEAR AI account",
+            &[],
+            ACTOR_A_TOKEN,
+        )
+        .await
+        .expect("actor A account is seeded under actor A");
+    actor_a
+        .submit_turn("install NEAR AI search for actor A")
+        .await
+        .expect("actor A install completes");
+    actor_a
+        .submit_turn("search with actor A's account")
+        .await
+        .expect("actor A provider read completes");
+
+    let actor_a_requests = actor_a.captured_network_requests_for_test();
+    let (actor_a_tools_call, _) =
+        observed_hosted_mcp_tools_call(&actor_a_requests, "actor-a-provider-query");
     assert!(
-        tools_call.headers.iter().any(|(name, value)| {
+        actor_a_tools_call.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("authorization")
-                && value.starts_with("Bearer ")
-                && value.len() > "Bearer ".len()
+                && value == &format!("Bearer {ACTOR_A_TOKEN}")
         }),
-        "hosted MCP tools/call must carry a mediated bearer credential"
+        "actor A request must carry actor A's exact provider account"
+    );
+
+    let actor_b = group
+        .thread("nearai-provider-account-actor-b")
+        .with_actor_id("nearai-provider-account-distinct-actor-b")
+        .script([RebornScriptedReply::tool_call(
+            "builtin.extension_install",
+            serde_json::json!({"extension_id": "nearai"}),
+        )])
+        .build()
+        .await
+        .expect("actor B lifecycle thread builds");
+    assert_ne!(
+        actor_a.binding.actor_user_id, actor_b.binding.actor_user_id,
+        "the isolation test requires distinct authenticated actors"
+    );
+    actor_b
+        .submit_turn_until_auth_blocked("install NEAR AI search for actor B")
+        .await
+        .expect("actor B must block on its own missing provider account");
+    assert!(
+        actor_b.captured_network_requests_for_test().is_empty(),
+        "actor B must not reach hosted MCP with actor A's provider account"
     );
 }
 
@@ -172,10 +311,204 @@ async fn mcp_tool_call_reaches_mock_server() {
     // call to the loopback server, not just that the capability recorder fired
     // before the egress (the M4 gap).
     assert_recorded_tools_call(&server, "search", "needle-xyz-42");
+    h.assert_latest_result_json_round_trips("mock-mcp.search")
+        .await
+        .expect("MCP output round-trips through durable result_read");
+}
+
+/// A mixed MCP result crosses the real loopback HTTP runtime and the unified
+/// durable result writer. Semantic JSON/text/resource fields remain readable,
+/// while protocol-owned inline binary never reaches the model or result_read.
+#[tokio::test]
+async fn mcp_mixed_content_is_normalized_before_durable_result_storage() {
+    const IMAGE_DATA: &str = "IMAGE_BASE64_MUST_NOT_REACH_DURABLE_STORAGE";
+    const AUDIO_DATA: &str = "AUDIO_BASE64_MUST_NOT_REACH_DURABLE_STORAGE";
+    const BLOB_DATA: &str = "BLOB_BASE64_MUST_NOT_REACH_DURABLE_STORAGE";
+    const UNKNOWN_DATA: &str = "UNKNOWN_PAYLOAD_MUST_NOT_REACH_DURABLE_STORAGE";
+
+    let server = start_mock_mcp_server(vec![MockToolResponse {
+        name: "search".to_string(),
+        content: serde_json::json!({"unused": "exact MCP result override follows"}),
+    }])
+    .await;
+    server.set_tool_call_result(
+        "search",
+        serde_json::json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "readable MCP answer",
+                    "annotations": {
+                        "audience": ["assistant"],
+                        "priority": 0.8,
+                        "transport": "omit"
+                    },
+                    "_meta": {"transport": "omit"}
+                },
+                {"type": "image", "mimeType": "image/png", "data": IMAGE_DATA},
+                {"type": "audio", "mimeType": "audio/wav", "data": AUDIO_DATA},
+                {
+                    "type": "resource_link",
+                    "name": "report",
+                    "title": "Readable report",
+                    "uri": "file:///reports/summary.md",
+                    "description": "Generated summary",
+                    "mimeType": "text/markdown",
+                    "size": 42
+                },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///reports/inline.txt",
+                        "mimeType": "text/plain",
+                        "text": "embedded readable text"
+                    }
+                },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///reports/inline.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": BLOB_DATA
+                    }
+                },
+                {"type": "future_content", "payload": UNKNOWN_DATA}
+            ],
+            "structuredContent": {"items": [{"id": 7, "title": "semantic JSON"}]},
+            "isError": false,
+            "_meta": {"transport": "omit"}
+        }),
+    );
+
+    let h = RebornIntegrationHarness::test_default()
+        .script([
+            RebornScriptedReply::tool_call(
+                "mock-mcp.search",
+                serde_json::json!({"query": "mixed-content"}),
+            ),
+            RebornScriptedReply::text("done"),
+        ])
+        .with_mock_mcp(server.mcp_url())
+        .build()
+        .await
+        .expect("harness builds");
+
+    h.submit_turn("read the mixed MCP result")
+        .await
+        .expect("turn completes");
+    assert_recorded_tools_call(&server, "search", "mixed-content");
+
+    let output = h
+        .tool_result_output("mock-mcp.search")
+        .await
+        .expect("normalized MCP result was durably recorded");
+    assert_eq!(
+        output,
+        serde_json::json!({
+            "content": [
+                {"type": "text", "text": "readable MCP answer"},
+                {"type": "image", "mimeType": "image/png", "encoding": "binary_unsupported"},
+                {"type": "audio", "mimeType": "audio/wav", "encoding": "binary_unsupported"},
+                {
+                    "type": "resource_link",
+                    "name": "report",
+                    "title": "Readable report",
+                    "uri": "file:///reports/summary.md",
+                    "description": "Generated summary",
+                    "mimeType": "text/markdown",
+                    "size": 42
+                },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///reports/inline.txt",
+                        "mimeType": "text/plain",
+                        "text": "embedded readable text"
+                    }
+                },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///reports/inline.pdf",
+                        "mimeType": "application/pdf",
+                        "encoding": "binary_unsupported"
+                    }
+                },
+                {
+                    "type": "unsupported",
+                    "original_type": "future_content",
+                    "status": "unsupported_content_type"
+                }
+            ],
+            "structuredContent": {"items": [{"id": 7, "title": "semantic JSON"}]},
+            "isError": false
+        })
+    );
+    let rendered = output.to_string();
+    for forbidden in [IMAGE_DATA, AUDIO_DATA, BLOB_DATA, UNKNOWN_DATA] {
+        assert!(
+            !rendered.contains(forbidden),
+            "encoded/unknown payload leaked into durable output: {forbidden}"
+        );
+        assert!(
+            h.assert_model_request_contains(forbidden).await.is_err(),
+            "encoded/unknown payload leaked into a model request: {forbidden}"
+        );
+    }
+    h.assert_model_request_contains("readable MCP answer")
+        .await
+        .expect("semantic MCP text reached the next model request");
+    h.assert_latest_result_json_round_trips("mock-mcp.search")
+        .await
+        .expect("builtin.result_read returns the normalized durable JSON");
+}
+
+/// A successful JSON-RPC envelope with a malformed content block is a
+/// model-visible output-decode failure, never a successful durable result.
+#[tokio::test]
+async fn mcp_malformed_success_result_surfaces_output_decode_failure() {
+    let server = start_mock_mcp_server(vec![MockToolResponse {
+        name: "search".to_string(),
+        content: serde_json::json!({"results": []}),
+    }])
+    .await;
+    server.set_tool_call_result(
+        "search",
+        serde_json::json!({
+            "content": [{"text": "missing discriminator"}],
+            "isError": false
+        }),
+    );
+
+    let h = RebornIntegrationHarness::test_default()
+        .script([
+            RebornScriptedReply::tool_call("mock-mcp.search", serde_json::json!({"query": "x"})),
+            RebornScriptedReply::text("done"),
+        ])
+        .with_mock_mcp(server.mcp_url())
+        .build()
+        .await
+        .expect("harness builds");
+
+    h.submit_turn("search").await.expect("turn recovers");
+    assert_recorded_tools_call(&server, "search", "x");
+    h.assert_mcp_tool_called("search")
+        .await
+        .expect("MCP tool call reached the loopback server");
+    h.assert_tool_error(ToolErrorClass::Failed, "output_decode")
+        .await
+        .expect("malformed MCP output became a model-visible decode failure");
+    h.assert_reply_contains("done")
+        .await
+        .expect("run recovered and finalized");
+    assert!(
+        h.tool_result_output("mock-mcp.search").await.is_err(),
+        "malformed MCP output must not be recorded as successful durable output"
+    );
 }
 
 /// Twin of `mcp_tool_call_reaches_mock_server`: same client `Accept:
-/// application/json, text/event-stream` header (`crates/ironclaw_mcp/src/lib.rs`),
+/// application/json, text/event-stream` header (`crates/lanes/ironclaw_mcp/src/lib.rs`),
 /// but here the mock server answers every leg with SSE framing instead of
 /// plain JSON. Exercises `parse_mcp_response`/`response_is_sse` against a
 /// real reqwest response's headers, not just the hand-built fixtures in the

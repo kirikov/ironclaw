@@ -3,25 +3,23 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use ironclaw_product::ResolvedBinding;
+use ironclaw_product_contracts::binding::ResolvedBinding;
 
 use async_trait::async_trait;
 use ironclaw_filesystem::{
     BackendCapabilities, CasExpectation, DirEntry, DiskFilesystem, Entry, EventRecord, FileStat,
-    FilesystemError, Filter, IndexSpec, Page, RecordVersion, RootFilesystem, SeqNo, StorageTxn,
-    VersionedEntry,
+    FilesystemError, Filter, IndexSpec, OrderedPage, Page, RecordVersion, RootFilesystem, SeqNo,
+    StorageTxn, VersionedEntry,
 };
-use ironclaw_host_api::{HostPath, VirtualPath};
+use ironclaw_host_api::path::{HostPath, VirtualPath};
 
 /// Turn-state scope path for `binding` (isolated by tenant/agent/project/
 /// owner user), with `root_prefix` prepended before `/tenants/...`. Shared by
 /// `scoped_turns_fs` (harness.rs) and `scoped_turns_fs_composite` (builder.rs)
 /// so both tiers derive turn paths from one source of truth.
 pub fn turns_scope_path(root_prefix: &str, binding: &ResolvedBinding) -> String {
-    let owner_user_id = binding
-        .subject_user_id
-        .as_ref()
-        .unwrap_or(&binding.actor_user_id);
+    // A run acts as the user who invoked it: the actor owns the turn scope.
+    let owner_user_id = &binding.actor_user_id;
     match (binding.agent_id.as_ref(), binding.project_id.as_ref()) {
         (Some(agent_id), Some(project_id)) => format!(
             "{root_prefix}/tenants/{}/agents/{}/projects/{}/users/{}/turns",
@@ -132,6 +130,15 @@ where
         page: Page,
     ) -> Result<Vec<VersionedEntry>, FilesystemError> {
         self.inner.query(path, filter, page).await
+    }
+
+    async fn query_ordered(
+        &self,
+        path: &VirtualPath,
+        filter: &Filter,
+        page: &OrderedPage,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        self.inner.query_ordered(path, filter, page).await
     }
 
     async fn ensure_index(

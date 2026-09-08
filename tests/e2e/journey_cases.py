@@ -2,30 +2,37 @@
 
 import json
 import os
-import tomllib
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlparse
 
+import tomllib
 from journey_types import (
     CargoEvidence,
+    DeliveryAddressEvidence,
     JourneyCase,
     JourneyDeliveryTarget,
     JourneyExecution,
     JourneyIngress,
+    LiveEvidence,
     ObservableAssertion,
     ProductJourneyCase,
     ProviderJourneyCase,
+    ProviderJourneyReplayFacts,
     ProviderWorld,
     PytestEvidence,
 )
-from provider_capability_inventory import EMULATE_SUPPORTED_TOOLS
+from provider_capability_inventory import (
+    EMULATE_SUPPORTED_TOOLS,
+    TESTED_CAPABILITY_IDS,
+    shipped_provider_manifests,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 TRACE_DIR = ROOT / "tests/fixtures/llm_traces/reborn_qa/live_canary"
 MANIFEST_PATH = TRACE_DIR / "case-manifest.json"
-ASSET_ROOT = ROOT / "crates/ironclaw_first_party_extensions/assets"
+ASSET_ROOT = ROOT / "crates/extensions/packages"
 
 _TOOL_WORLD_PREFIXES = {
     "gmail__": ProviderWorld.GOOGLE,
@@ -40,16 +47,93 @@ _TOOL_WORLD_PREFIXES = {
 _HTTP_WORLD_HOSTS = {
     "api.github.com": ProviderWorld.GITHUB,
 }
-_MUTATING_PROVIDER_TOOLS = {
-    "gmail__send_message": ProviderWorld.GOOGLE,
-    "google-docs__create_document": ProviderWorld.GOOGLE,
-    "google-sheets__create_spreadsheet": ProviderWorld.GOOGLE,
-    "google-sheets__append_values": ProviderWorld.GOOGLE,
-    "slack__send_message": ProviderWorld.SLACK,
-}
+# The five tools this set used to name by hand. Kept only as a regression
+# floor: if the derivation below ever stops finding them, it has broken.
+_HISTORICAL_MUTATING_PROVIDER_TOOLS = frozenset(
+    {
+        "gmail__send_message",
+        "google-docs__create_document",
+        "google-sheets__create_spreadsheet",
+        "google-sheets__append_values",
+        "slack__send_message",
+    }
+)
+
+
+def _production_mutating_tools() -> dict[str, ProviderWorld]:
+    """Deterministically tested provider-world writes from shipped manifests.
+
+    A journey that mutates a provider world must declare that world so the
+    harness resets it afterwards; otherwise whatever the journey created
+    survives into the next test. Capabilities classified as live-only or waived
+    cannot enter the deterministic harness. For tested tools, which ones mutate
+    is not a judgement call -- production already states it as the
+    `external_write` effect (`crates/extensions/packages/*/manifest.toml`).
+
+    This used to be a hand-kept list of five names while production declared
+    seventy such tools. Every one of the other sixty-five -- `github__create_issue`,
+    `google-drive__upload_file`, and so on -- would have run without marking its
+    world mutable, so no reset fired and the leak guards this workstream added
+    never got the chance to.
+    """
+    mutating: dict[str, ProviderWorld] = {}
+    for manifest_path in shipped_provider_manifests():
+        with manifest_path.open("rb") as manifest_file:
+            manifest = tomllib.load(manifest_file)
+        for tool in manifest.get("tools", []) or []:
+            if tool["id"] not in TESTED_CAPABILITY_IDS:
+                continue
+            if "external_write" not in (tool.get("effects") or []):
+                continue
+            # Manifest ids are `github.create_issue`; traces record
+            # `github__create_issue`.
+            tool_name = str(tool["id"]).replace(".", "__", 1)
+            world = next(
+                (
+                    world
+                    for prefix, world in _TOOL_WORLD_PREFIXES.items()
+                    if tool_name.startswith(prefix)
+                ),
+                None,
+            )
+            # Tools outside a world the harness can reset (web-access, nearai)
+            # are not skipped silently -- `unreset_mutating_tools()` below is
+            # what reports them.
+            if world is not None:
+                mutating[tool_name] = world
+    return mutating
+
+
+_MUTATING_PROVIDER_TOOLS = _production_mutating_tools()
+
+
+def unreset_mutating_tools() -> frozenset[str]:
+    """Deterministically tested writes whose provider world cannot be reset."""
+    unreset = set()
+    for manifest_path in shipped_provider_manifests():
+        with manifest_path.open("rb") as manifest_file:
+            manifest = tomllib.load(manifest_file)
+        for tool in manifest.get("tools", []) or []:
+            if tool["id"] not in TESTED_CAPABILITY_IDS:
+                continue
+            if "external_write" not in (tool.get("effects") or []):
+                continue
+            tool_name = str(tool["id"]).replace(".", "__", 1)
+            if tool_name not in _MUTATING_PROVIDER_TOOLS:
+                unreset.add(tool_name)
+    return frozenset(unreset)
+
+
 _REPEAT_AFTER_RESET = {
     "qa_5d_slack_strategy_doc_answer",
-    "qa_10f_slack_mention_encoding",
+}
+_PROVIDER_REPLAY_FACTS = {
+    "qa_7c_slack_bug_logger_routine": ProviderJourneyReplayFacts(
+        google_spreadsheet_id="sheet_reborn_bug_tracker"
+    ),
+    "qa_7e_slack_bug_sheet_delivery": ProviderJourneyReplayFacts(
+        google_spreadsheet_id="sheet_reborn_bug_tracker"
+    ),
 }
 
 _PYTEST_PROVIDER_EVIDENCE = PytestEvidence(
@@ -95,6 +179,7 @@ def _provider_journey_cases() -> tuple[ProviderJourneyCase, ...]:
     excluded = set(manifest["no_model_cases"])
     excluded.update(manifest.get("quarantined_model_cases", []))
     cases = []
+    consumed_replay_facts = set()
     for case_id in manifest["selected_cases"]:
         if case_id in excluded:
             continue
@@ -103,6 +188,8 @@ def _provider_journey_cases() -> tuple[ProviderJourneyCase, ...]:
         calls = _tool_calls(trace)
         if not any(call["name"] in EMULATE_SUPPORTED_TOOLS for call in calls):
             continue
+        if case_id in _PROVIDER_REPLAY_FACTS:
+            consumed_replay_facts.add(case_id)
         cases.append(
             ProviderJourneyCase(
                 case_id=case_id,
@@ -118,9 +205,22 @@ def _provider_journey_cases() -> tuple[ProviderJourneyCase, ...]:
                     ObservableAssertion.PROVIDER_READBACK,
                 ),
                 evidence=_PYTEST_PROVIDER_EVIDENCE,
+                replay=_PROVIDER_REPLAY_FACTS.get(
+                    case_id, ProviderJourneyReplayFacts()
+                ),
                 repeat_after_reset=case_id in _REPEAT_AFTER_RESET,
+                live_evidence=LiveEvidence(
+                    workflow=".github/workflows/live-canary.yml",
+                    job="reborn-webui-v2-live-qa",
+                    case_id=case_id,
+                    artifact="results.json",
+                ),
             )
         )
+    assert consumed_replay_facts == set(_PROVIDER_REPLAY_FACTS), (
+        "replay facts declared for unknown provider journey cases: "
+        f"{sorted(set(_PROVIDER_REPLAY_FACTS) - consumed_replay_facts)}"
+    )
     return tuple(cases)
 
 
@@ -186,6 +286,27 @@ PROVIDER_JOURNEY_RUNS, PROVIDER_JOURNEY_RUN_IDS = provider_journey_runs()
 
 PRODUCT_JOURNEY_CASES = (
     ProductJourneyCase(
+        case_id="generic_extension_webhook_signed_post_becomes_a_turn",
+        provider_worlds=(ProviderWorld.NONE,),
+        mutable_provider_worlds=(),
+        ingress=JourneyIngress.EXTENSION_WEBHOOK,
+        execution=JourneyExecution.REBORN_INTEGRATION,
+        # The cited test ends at durable turn admission: its scripted reply is
+        # never consulted and nothing is delivered, so naming a delivery
+        # target would overstate it.
+        delivery_target=JourneyDeliveryTarget.NONE,
+        # Admission only. The test registers its ingress secret directly, so
+        # the webhook never crosses the runtime credential-injection path --
+        # claiming that assertion would credit this row with coverage that
+        # lives elsewhere.
+        assertions=(ObservableAssertion.DURABLE_STATE,),
+        evidence=CargoEvidence(
+            source="tests/integration/extension_ingress.rs",
+            test="signed_acme_post_flows_through_the_production_mount_into_a_turn",
+            target="reborn_integration_extension_ingress",
+        ),
+    ),
+    ProductJourneyCase(
         case_id="webui_text_turn_persists",
         provider_worlds=(ProviderWorld.NONE,),
         mutable_provider_worlds=(),
@@ -196,6 +317,10 @@ PRODUCT_JOURNEY_CASES = (
         evidence=PytestEvidence(
             source="tests/e2e/scenarios/test_reborn_webui_v2_smoke.py",
             test="test_reborn_v2_text_turn_persists",
+        ),
+        browser_evidence=PytestEvidence(
+            source="tests/e2e/scenarios/test_reborn_webui_v2_smoke.py",
+            test="test_reborn_v2_ui_enter_submits_initial_and_follow_up_messages",
         ),
     ),
     ProductJourneyCase(
@@ -208,12 +333,21 @@ PRODUCT_JOURNEY_CASES = (
         assertions=(
             ObservableAssertion.DURABLE_STATE,
             ObservableAssertion.EXACT_DESTINATION,
+            ObservableAssertion.EXACT_MUTATION_COUNT,
             ObservableAssertion.CREDENTIAL_INJECTION,
         ),
         evidence=CargoEvidence(
             source="tests/integration/extension_delivery.rs",
             test="slack_final_reply_flows_through_the_real_delivery_coordinator",
             target="reborn_integration_extension_delivery",
+        ),
+        delivery_addresses=(
+            DeliveryAddressEvidence(
+                conversation_id="C777",
+                thread_anchor="1710000200.000050",
+                exact_count=1,
+                assertion="assert_slack_thread_delivery_evidence",
+            ),
         ),
     ),
     ProductJourneyCase(
@@ -226,6 +360,7 @@ PRODUCT_JOURNEY_CASES = (
         assertions=(
             ObservableAssertion.DURABLE_STATE,
             ObservableAssertion.EXACT_DESTINATION,
+            ObservableAssertion.EXACT_MUTATION_COUNT,
             ObservableAssertion.CREDENTIAL_INJECTION,
         ),
         evidence=CargoEvidence(
@@ -233,9 +368,53 @@ PRODUCT_JOURNEY_CASES = (
             test="telegram_update_becomes_a_turn_and_a_coordinated_reply",
             target="reborn_integration_extension_delivery",
         ),
+        delivery_addresses=(
+            DeliveryAddressEvidence(
+                conversation_id="-1008675309",
+                thread_anchor="77",
+                exact_count=1,
+                assertion="assert_telegram_topic_delivery_evidence",
+            ),
+        ),
     ),
     ProductJourneyCase(
-        case_id="scheduled_trigger_slack_delivery_default_and_explicit",
+        case_id="telegram_bot_pairing_chat_disconnect_repair",
+        provider_worlds=(ProviderWorld.TELEGRAM,),
+        mutable_provider_worlds=(ProviderWorld.TELEGRAM,),
+        ingress=JourneyIngress.TELEGRAM,
+        execution=JourneyExecution.REBORN_INTEGRATION,
+        delivery_target=JourneyDeliveryTarget.TELEGRAM,
+        assertions=(
+            ObservableAssertion.DURABLE_STATE,
+            ObservableAssertion.EXACT_DESTINATION,
+            ObservableAssertion.EXACT_MUTATION_COUNT,
+        ),
+        evidence=CargoEvidence(
+            source="tests/integration/extension_delivery.rs",
+            test=(
+                "paired_telegram_bot_actor_turns_attribute_to_the_user_"
+                "and_disconnect_revokes_admission"
+            ),
+            target="reborn_integration_extension_delivery",
+        ),
+        delivery_addresses=(
+            DeliveryAddressEvidence(
+                conversation_id="515151",
+                thread_anchor=None,
+                exact_count=1,
+                assertion="assert_telegram_chat_delivery_evidence",
+            ),
+        ),
+    ),
+    ProductJourneyCase(
+        # Renamed from `scheduled_trigger_slack_delivery_default_and_explicit`:
+        # the per-trigger stored-target ("default") delivery model this case
+        # named was deleted (delivery_target_id removed; stored targets
+        # migrate into prompts). The surviving story is explicit-only: a
+        # routine/scheduled fire delivers by calling
+        # `builtin.outbound_deliver`, with no stored per-trigger destination
+        # anywhere in the path (see task-9-report.md §13.5 first half).
+        case_id="scheduled_trigger_explicit_tool_delivery_reaches_slack",
         provider_worlds=(ProviderWorld.SLACK,),
         mutable_provider_worlds=(ProviderWorld.SLACK,),
         ingress=JourneyIngress.SCHEDULED_TRIGGER,
@@ -246,16 +425,71 @@ PRODUCT_JOURNEY_CASES = (
             ObservableAssertion.EXACT_DESTINATION,
             ObservableAssertion.EXACT_MUTATION_COUNT,
             ObservableAssertion.CREDENTIAL_INJECTION,
-            ObservableAssertion.RESTART_IDEMPOTENCY,
         ),
         evidence=CargoEvidence(
-            source=("crates/ironclaw_reborn_composition/tests/trigger_poller_e2e.rs"),
-            test=(
-                "scheduled_trigger_results_reach_exact_slack_targets_once_"
-                "across_restart"
+            source="tests/integration/delivery_user_journeys.rs",
+            test="routine_fire_delivers_via_tool_without_stored_target",
+            target="reborn_integration_delivery_user_journeys",
+        ),
+    ),
+    ProductJourneyCase(
+        case_id="webui_explicit_slack_dm_delivery_with_bot_evidence",
+        provider_worlds=(ProviderWorld.SLACK,),
+        mutable_provider_worlds=(ProviderWorld.SLACK,),
+        ingress=JourneyIngress.WEBUI,
+        execution=JourneyExecution.REBORN_INTEGRATION,
+        delivery_target=JourneyDeliveryTarget.SLACK,
+        assertions=(
+            ObservableAssertion.DURABLE_STATE,
+            ObservableAssertion.EXACT_DESTINATION,
+            ObservableAssertion.EXACT_MUTATION_COUNT,
+            ObservableAssertion.CREDENTIAL_INJECTION,
+        ),
+        evidence=CargoEvidence(
+            source="tests/integration/delivery_user_journeys.rs",
+            test="webui_send_me_on_slack_delivers_via_bot_with_evidence",
+            target="reborn_integration_delivery_user_journeys",
+        ),
+        delivery_addresses=(
+            DeliveryAddressEvidence(
+                conversation_id="D-JOURNEY",
+                thread_anchor=None,
+                exact_count=1,
+                assertion="assert_slack_dm_delivery_evidence",
             ),
-            target="trigger_poller_e2e",
-            manifest="crates/ironclaw_reborn_composition/Cargo.toml",
+        ),
+    ),
+    ProductJourneyCase(
+        # A blocked scheduled fire fans its gate-prompt notice to the
+        # creator's enrolled browser through the web-app channel: one
+        # unthreaded push POST to the endpoint capability URL, host-injected
+        # VAPID authorization, RFC 8291 body. Web push has no provider world
+        # (the endpoint is on the manifest's declared push host, answered by
+        # the harness's recording network substrate), so `NONE`.
+        case_id="scheduled_trigger_gate_notice_reaches_web_app_browser",
+        provider_worlds=(ProviderWorld.NONE,),
+        mutable_provider_worlds=(),
+        ingress=JourneyIngress.SCHEDULED_TRIGGER,
+        execution=JourneyExecution.REBORN_INTEGRATION,
+        delivery_target=JourneyDeliveryTarget.WEB_APP,
+        assertions=(
+            ObservableAssertion.DURABLE_STATE,
+            ObservableAssertion.EXACT_DESTINATION,
+            ObservableAssertion.EXACT_MUTATION_COUNT,
+            ObservableAssertion.CREDENTIAL_INJECTION,
+        ),
+        evidence=CargoEvidence(
+            source="tests/integration/delivery_user_journeys.rs",
+            test="blocked_fire_pushes_web_app_notice_to_enrolled_browser",
+            target="reborn_integration_delivery_user_journeys",
+        ),
+        delivery_addresses=(
+            DeliveryAddressEvidence(
+                conversation_id="https://fcm.googleapis.com/fcm/send/live-subscription-token",
+                thread_anchor=None,
+                exact_count=1,
+                assertion="assert_web_app_delivery_evidence",
+            ),
         ),
     ),
 )
@@ -263,22 +497,49 @@ PRODUCT_JOURNEY_CASES = (
 ALL_JOURNEY_CASES = (*PROVIDER_JOURNEY_CASES, *PRODUCT_JOURNEY_CASES)
 
 
-def _production_channel_surfaces(direction: str) -> set[str]:
-    surfaces = set()
-    for manifest_path in sorted(ASSET_ROOT.glob("*/manifest.toml")):
+def _production_channel_capabilities(
+    direction: str, *, asset_root: Path = ASSET_ROOT
+) -> dict[str, dict]:
+    capabilities: dict[str, dict] = {}
+    for manifest_path in sorted(asset_root.glob("*/manifest.toml")):
         with manifest_path.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)
         channel = manifest.get("channel")
         if channel is not None and channel.get(direction) is True:
-            surfaces.add(manifest["id"])
-    return surfaces
+            surface = manifest.get("id")
+            assert isinstance(surface, str) and surface, (
+                f"{manifest_path}: channel manifest declares no non-empty id"
+            )
+            # The unified channel model folds the browser send path into the
+            # session channel's inbound surface: a channel whose ingress
+            # verification is `authenticated_session` has no webhook mount —
+            # its inbound IS the WebUI session route, so the `webui` journey
+            # cases are its evidence. Map it onto that built-in ingress
+            # instead of demanding a per-channel journey label.
+            verification = (channel.get("ingress") or {}).get("verification") or {}
+            if direction == "inbound" and verification.get("kind") == "authenticated_session":
+                surface = str(JourneyIngress.WEBUI)
+            capabilities[surface] = channel.get("presentation") or {}
+    return capabilities
+
+
+def _production_channel_surfaces(direction: str) -> set[str]:
+    return set(_production_channel_capabilities(direction))
 
 
 def required_ingresses() -> set[str]:
-    """Built-in ingress plus every production channel declaring inbound."""
+    """Built-in ingress plus every production channel declaring inbound.
+
+    `EXTENSION_WEBHOOK` is the generic mount itself, not a third channel.
+    Slack and Telegram both arrive through it, so covering them exercises it
+    incidentally -- but only for two vendors the host already ships. The
+    surface that matters is the one a *new* extension arrives on, and the only
+    way to prove that is with an extension the host has never heard of.
+    """
     return {
         JourneyIngress.WEBUI,
         JourneyIngress.SCHEDULED_TRIGGER,
+        JourneyIngress.EXTENSION_WEBHOOK,
         *_production_channel_surfaces("inbound"),
     }
 

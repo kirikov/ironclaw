@@ -31,10 +31,19 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_approvals::AutoApproveSettingInput;
+use ironclaw_composition::{
+    RebornCompositionProfile, RebornRuntime, RebornRuntimeIdentity, RebornRuntimeInput,
+    RebornRuntimeProfileOptions, TriggerPollerSettings, build_reborn_runtime,
+    local_runtime_build_input_with_options,
+};
 use ironclaw_host_api::{
-    AgentId, CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind,
-    ExecutionContext, ExtensionId, GrantConstraints, MountView, NetworkPolicy, Principal,
-    ResourceEstimate, RunId, RuntimeKind, TenantId, TrustClass, UserId,
+    action::NetworkPolicy,
+    capability::{CapabilityGrant, CapabilitySet, EffectKind, GrantConstraints},
+    ids::{AgentId, CapabilityGrantId, CapabilityId, ExtensionId, RunId, TenantId, UserId},
+    mount::MountView,
+    resource::ResourceEstimate,
+    runtime::{RuntimeKind, TrustClass},
+    scope::{ExecutionContext, Principal},
 };
 use ironclaw_host_runtime::{
     ECHO_CAPABILITY_ID, RuntimeCapabilityOutcome, TRIGGER_CREATE_CAPABILITY_ID,
@@ -44,11 +53,6 @@ use ironclaw_loop_host::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelMessageRole,
     HostManagedModelRequest, HostManagedModelResponse, HostManagedToolResultContent,
 };
-use ironclaw_reborn_composition::{
-    RebornCompositionProfile, RebornRuntime, RebornRuntimeIdentity, RebornRuntimeInput,
-    RebornRuntimeProfileOptions, TriggerPollerSettings, build_reborn_runtime,
-    local_runtime_build_input_with_options,
-};
 use ironclaw_triggers::{TriggerId, TriggerPollerWorkerConfig, TriggerRunStatus, TriggerState};
 use ironclaw_turns::TurnStatus;
 use parity_qa_support::binary_e2e::RebornBinaryE2EHarness;
@@ -57,6 +61,17 @@ use parity_qa_support::model_replay::{
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex as TokioMutex;
+
+fn execution_contract(goal: impl Into<String>) -> Value {
+    json!({
+        "version": 1,
+        "goal": goal.into(),
+        "success_criteria": ["Complete the requested routine task"],
+        "output_instructions": "Return a concise result",
+        "no_result_text": "No result",
+        "policy": { "result_delivery": "deliver" }
+    })
+}
 
 struct RoutineCreationCase {
     room: &'static str,
@@ -79,7 +94,7 @@ async fn run_routine_creation(case: RoutineCreationCase) {
                 "call_qa_trigger_create",
                 json!({
                     "name": case.trigger_name,
-                    "prompt": case.prompt,
+                    "execution_contract": execution_contract(case.prompt),
                     "schedule": {
                         "kind": "cron",
                         "expression": case.cron,
@@ -269,7 +284,7 @@ async fn build_qa_fire_runtime(
     let host_home_root = root.path().join("host-home");
     std::fs::create_dir_all(&host_home_root).expect("host home root");
     let input = local_runtime_build_input_with_options(
-        RebornCompositionProfile::LocalDevYolo,
+        RebornCompositionProfile::StandaloneUnrestricted,
         QA_USER,
         root.path().join("local-dev"),
         RebornRuntimeProfileOptions {
@@ -277,8 +292,9 @@ async fn build_qa_fire_runtime(
         },
     )
     .expect("local-yolo runtime input")
-    .with_local_dev_confirmed_host_home_root(host_home_root);
+    .with_local_runtime_confirmed_host_home_root(host_home_root);
     let input = RebornRuntimeInput::from_build_input(input)
+        .with_tool_disclosure(ironclaw_loop_host::ToolDisclosureMode::Off)
         .with_identity(RebornRuntimeIdentity {
             tenant_id: QA_TENANT.to_string(),
             agent_id: QA_AGENT.to_string(),
@@ -300,7 +316,7 @@ async fn build_qa_fire_runtime(
 
 async fn seed_qa_fire_auto_approve(runtime: &RebornRuntime) {
     let auto_approve = runtime
-        .local_dev_auto_approve_settings_for_test()
+        .standalone_auto_approve_settings_for_test()
         .expect("QA fire runtime exposes local-dev auto-approve settings");
     auto_approve
         .set(AutoApproveSettingInput {
@@ -326,7 +342,7 @@ async fn reborn_qa_routine_created_by_tool_fires_and_runs_routine_prompt() {
         &runtime,
         json!({
             "name": "Deployment health watcher",
-            "prompt": QA_ROUTINE_PROMPT,
+            "execution_contract": execution_contract(QA_ROUTINE_PROMPT),
             "schedule": {
                 "kind": "cron",
                 "expression": "*/5 * * * *",
@@ -482,7 +498,7 @@ async fn reborn_qa_fired_routine_executes_action_and_finalizes_reply() {
         &runtime,
         json!({
             "name": "Deployment health watcher action",
-            "prompt": QA_ROUTINE_PROMPT,
+            "execution_contract": execution_contract(QA_ROUTINE_PROMPT),
             "schedule": {
                 "kind": "cron",
                 "expression": "*/5 * * * *",
@@ -560,11 +576,11 @@ async fn reborn_qa_fired_routine_executes_action_and_finalizes_reply() {
         .find(|message| message.role == HostManagedModelMessageRole::ToolResult)
         .expect("the fired routine's action must reach the model");
     // Issue #5838: a result under the inline first-look preview cap
-    // (`LOCAL_DEV_RESULT_PREVIEW_MAX_BYTES`) legitimately appears inline in
+    // (`STANDALONE_RESULT_PREVIEW_MAX_BYTES`) legitimately appears inline in
     // `detail.preview` so the model does not need a follow-up `result_read`
     // call; the marker here is well under the cap. Mirrors
-    // `assert_local_dev_result_reference` in
-    // `crates/ironclaw_reborn_composition/src/runtime.rs`.
+    // `assert_standalone_result_reference` in
+    // `crates/app/ironclaw_composition/src/runtime.rs`.
     assert!(
         tool_result.content.contains(QA_DM_ACTION_MARKER),
         "a result under the first-look preview cap should appear inline in model replay: {}",

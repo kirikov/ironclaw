@@ -1,15 +1,15 @@
 //! W6-COLD-SPOTS: `OutboundStateStore` (`outbound_preferences`
-//! role) survives a real process-level reopen. Mirrors `local_dev_outbound_store` (factory.rs);
-//! see docs/plans/2026-07-04-w6-cold-spots-plan.md.
+//! role) survives a real process-level reopen. Mirrors `standalone_outbound_store` (factory.rs);
+//! see docs/internal/plans/2026-07-04-w6-cold-spots-plan.md.
 //!
 //! `ThreadNotificationPolicy`/`DeliveredGateRouteStore`/
 //! `TriggeredRunDeliveryStore` excluded — not covered here. Deferred until
 //! PR #5656.
 
+use ironclaw_composition::{RebornRuntimeInput, build_runtime};
 use ironclaw_outbound::{
     CommunicationModality, CommunicationPreferenceKey, CommunicationPreferenceRecord,
 };
-use ironclaw_reborn_composition::{RebornRuntimeInput, build_runtime};
 
 /// Write survives a fresh libsql reopen of the same on-disk file. Failure
 /// class of PR #4782 (two stores over different mount views).
@@ -17,7 +17,7 @@ use ironclaw_reborn_composition::{RebornRuntimeInput, build_runtime};
 async fn filesystem_outbound_state_store_persists_across_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     let services = build_runtime(RebornRuntimeInput::from_build_input(
-        ironclaw_reborn_composition::local_dev_build_input(
+        ironclaw_composition::local_filesystem_build_input(
             "w6-outbound-durability",
             dir.path().join("local-dev"),
         ),
@@ -26,18 +26,18 @@ async fn filesystem_outbound_state_store_persists_across_reopen() {
     .expect("services build");
 
     let store = services
-        .local_dev_outbound_preferences_for_test()
+        .standalone_outbound_preferences_for_test()
         .expect("local-dev outbound_preferences wired");
     // The runtime canonicalizes the local-dev storage root at build time
-    // (`canonicalize_local_dev_path` == `std::fs::canonicalize`), so reproduce
+    // (`canonicalize_standalone_path` == `std::fs::canonicalize`), so reproduce
     // the exact on-disk path the store was opened over from this test's own
     // input path rather than reaching for a removed runtime accessor. The
     // build already created (and canonicalized) this directory.
     let storage_root = std::fs::canonicalize(dir.path().join("local-dev"))
         .expect("canonicalize local-dev storage root");
 
-    let tenant = ironclaw_host_api::TenantId::new("w6-outbound-tenant").unwrap();
-    let user = ironclaw_host_api::UserId::new("w6-outbound-user").unwrap();
+    let tenant = ironclaw_host_api::ids::TenantId::new("w6-outbound-tenant").unwrap();
+    let user = ironclaw_host_api::ids::UserId::new("w6-outbound-user").unwrap();
     let key = CommunicationPreferenceKey::personal(tenant.clone(), user.clone());
 
     // Non-vacuity guard (before-write): a fresh scope has no row at all yet.
@@ -53,11 +53,15 @@ async fn filesystem_outbound_state_store_persists_across_reopen() {
     store
         .put_communication_preference(CommunicationPreferenceRecord {
             scope: key.scope.clone(),
-            final_reply_target: None,
-            progress_target: None,
-            approval_prompt_target: None,
-            auth_prompt_target: None,
+            legacy_notification_target: None,
             default_modality: Some(CommunicationModality::Voice), // distinctive, non-default
+            // Distinctive, non-default: the reopen assert below proves the
+            // stored set itself survives, not just the row (an empty vec is
+            // indistinguishable from the deserialization default).
+            notification_targets: vec![
+                ironclaw_outbound::OutboundDeliveryTargetId::new("slack:durability-dm")
+                    .expect("target id"),
+            ],
             updated_at: chrono::Utc::now(),
             updated_by: user.clone(),
         })
@@ -67,7 +71,7 @@ async fn filesystem_outbound_state_store_persists_across_reopen() {
     // Reopen: a genuinely fresh store over a NEW libsql connection to the
     // same on-disk file — not the same Arc as `store` above.
     let reopened =
-        ironclaw_reborn_composition::test_support::open_local_dev_outbound_preferences_store_for_test(
+        ironclaw_composition::test_support::open_standalone_outbound_preferences_store_for_test(
             &storage_root,
         )
         .await
@@ -81,6 +85,16 @@ async fn filesystem_outbound_state_store_persists_across_reopen() {
     assert_eq!(
         record.record.default_modality,
         Some(CommunicationModality::Voice)
+    );
+    assert_eq!(
+        record
+            .record
+            .notification_targets
+            .iter()
+            .map(|target| target.as_str())
+            .collect::<Vec<_>>(),
+        vec!["slack:durability-dm"],
+        "the stored notification set must survive a fresh-connection reopen"
     );
     assert_eq!(record.record.updated_by, user);
 }

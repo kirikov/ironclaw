@@ -22,8 +22,11 @@ complains, the answer is almost never `#[allow]`.**
 
 clippy's default is 7 args. Reaching it means the function has more
 inputs than a reader can hold in their head. Allowing it once is a
-trade — allowing it eleven times is a refactor someone declined to
-do.
+trade — allowing it dozens of times across dozens of files is a refactor
+someone declined to do. Re-measure with
+`rg -o '#\[allow\(clippy::too_many_arguments\)\]' crates/ | wc -l` for the
+total occurrence count, or `rg -l '#\[allow\(clippy::too_many_arguments\)\]' crates/ | wc -l`
+for the file count, before quoting a number.
 
 **Required pattern** when introducing the allow:
 
@@ -112,8 +115,8 @@ places that each implement their own pre-checks (lease, policy,
 sanitization), they are one pipeline written twice. Every
 safety/policy change must then land in both — and one always lags.
 
-This mirrors the boundary in `safety-and-sandbox.md` ("Every New Ingress Scans Before Storage
-or LLM"). The pattern: identify the converging downstream call,
+This mirrors the boundary in `safety-and-sandbox.md` ("Mediation is the
+boundary"). The pattern: identify the converging downstream call,
 extract a single gateway, route both sides through it.
 
 **Review flag:** a new call site to a registry/executor/dispatcher
@@ -211,9 +214,9 @@ documents as architectural authority.
 
 - Adjacent rules with the same shape (extract a single gateway,
   route everything through it): `safety-and-sandbox.md`,
-  `gateway-events.md`.
+  `events.md`.
 - Type location/multiplicity (mirror DTOs, `host_api` ownership):
   `type-placement.md` — the rule the capability-path collapse applies.
-- Annotation discipline reference: `gateway-events.md` —
-  `// projection-exempt: <category>, <detail>` is the canonical
-  shape this rule borrows.
+- Annotation discipline: the canonical shape is this rule's own
+  `// arch-exempt: <category>, <detail>, plan #NNNN`, enforced by the
+  `ARCH-SPRAWL` checks in `scripts/pre-commit-safety.sh`.

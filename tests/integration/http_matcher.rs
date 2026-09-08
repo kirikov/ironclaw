@@ -219,11 +219,13 @@ async fn capability_keyed_response_matches_and_mismatch_falls_through_to_second_
 const ERR_URL: &str = "https://api.example.test/v1/err";
 
 /// Error path — HTTP 5xx status. A scripted `500` is NOT an egress error: the
-/// `builtin.http` tool surfaces it as a *successful* (Completed) tool result
-/// carrying `"status":500`, so the run completes and the model can react. Proves
-/// a server-error status is model-visible, not a terminal driver failure.
+/// `builtin.http` tool classifies it as a recoverable `OperationFailed`
+/// capability outcome carrying the sanitized status as model-visible
+/// diagnostic context, so the run completes (the model sees a failed tool
+/// outcome, not a terminal driver failure) and can react. Pinned by
+/// `docs/internal/reborn/contracts/host-runtime.md`.
 #[tokio::test]
-async fn http_5xx_status_surfaces_as_completed_result_with_status() {
+async fn http_5xx_status_surfaces_as_failed_tool_outcome_with_status() {
     let h = RebornIntegrationHarness::test_default()
         .with_keyed_http_responses([
             ScriptedHttpResponse::for_url(ERR_URL, br#"{"error":"boom"}"#).with_status(500),
@@ -236,9 +238,9 @@ async fn http_5xx_status_surfaces_as_completed_result_with_status() {
         .await
         .expect("harness builds");
     h.submit_turn("fetch").await.expect("turn completes");
-    h.assert_tool_result_contains("\"status\":500")
+    h.assert_tool_error(ToolErrorClass::Failed, "operation_failed")
         .await
-        .expect("5xx status surfaced in the model-visible tool result");
+        .expect("5xx status must surface as a failed tool outcome");
     h.assert_reply_contains("done")
         .await
         .expect("run recovered and finalized");
@@ -276,7 +278,7 @@ async fn http_network_policy_denied_surfaces_recoverable_denied() {
 /// `Failed{OutputTooLarge}` capability outcome; the run recovers to completion.
 #[tokio::test]
 async fn http_oversize_response_surfaces_recoverable_failed() {
-    use ironclaw_host_api::RUNTIME_HTTP_REASON_RESPONSE_BODY_LIMIT_EXCEEDED;
+    use ironclaw_host_api::http::RUNTIME_HTTP_REASON_RESPONSE_BODY_LIMIT_EXCEEDED;
     let h = RebornIntegrationHarness::test_default()
         .with_keyed_http_responses([ScriptedHttpResponse::response_error(
             ERR_URL,
@@ -370,7 +372,7 @@ const ERR_B_URL: &str = "https://api.example.test/v1/err-b";
 /// the full-history `assert_tool_error` (single-turn-only) can't reach.
 #[tokio::test]
 async fn multi_turn_baseline_sliced_history_assertions() {
-    use ironclaw_host_api::RUNTIME_HTTP_REASON_RESPONSE_BODY_LIMIT_EXCEEDED;
+    use ironclaw_host_api::http::RUNTIME_HTTP_REASON_RESPONSE_BODY_LIMIT_EXCEEDED;
     let h = RebornIntegrationHarness::test_default()
         .with_keyed_http_responses([
             ScriptedHttpResponse::network_error(ERR_A_URL, "policy_denied"),

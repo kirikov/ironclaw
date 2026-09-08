@@ -87,10 +87,12 @@ async def test_reborn_v2_extension_lifecycle_served(reborn_v2_server):
             # Runtime is an implementation badge (`runtime`), never taxonomy;
             # the retired `kind` wire string is gone (NEA-25).
             assert installed["runtime"] == "first_party"
-            # Membership plus readiness is the complete public lifecycle.
-            # A setup-free extension becomes active as part of install; there
-            # is no caller-visible activation checkpoint.
+            # Installation state and the compatibility readiness fields must
+            # describe the same setup-free active extension.
             assert installed["installation_state"] == "active"
+            # The retired compatibility booleans are gone from the wire: the
+            # installation state is the single caller-visible lifecycle field
+            # (restored to the #6520 contract shape).
             for retired in (
                 "authenticated",
                 "active",

@@ -1,0 +1,132 @@
+import { Navigate, useOutletContext, useParams } from "react-router";
+import React from "react";
+import { useT } from "../../lib/i18n";
+import { RouteLoadBoundary } from "../../app/route-load-boundary";
+import { InlineNotice } from "../../design-system/inline-notice";
+import { PageScroll, PageStack } from "../../layout/page-shell";
+import { RestartBanner } from "./components/restart-banner";
+import { SettingsToolbar } from "./components/settings-toolbar";
+import { useSettings } from "./hooks/useSettings";
+import type { GatewayOutletContext } from "../../layout/gateway-layout";
+
+const AppearanceTab = React.lazy(() =>
+  import("./components/appearance-tab").then(({ AppearanceTab }) => ({ default: AppearanceTab }))
+);
+const InferenceTab = React.lazy(() =>
+  import("./components/inference-tab").then(({ InferenceTab }) => ({ default: InferenceTab }))
+);
+const LanguageTab = React.lazy(() =>
+  import("./components/language-tab").then(({ LanguageTab }) => ({ default: LanguageTab }))
+);
+const SkillsTab = React.lazy(() =>
+  import("./components/skills-tab").then(({ SkillsTab }) => ({ default: SkillsTab }))
+);
+const ToolsTab = React.lazy(() =>
+  import("./components/tools-tab").then(({ ToolsTab }) => ({ default: ToolsTab }))
+);
+const TraceCommonsTab = React.lazy(() =>
+  import("./components/trace-commons-tab").then(({ TraceCommonsTab }) => ({
+    default: TraceCommonsTab,
+  }))
+);
+
+export function SettingsPage() {
+  const t = useT();
+  const { tab: requestedTab } = useParams();
+  const {
+    gatewayStatus,
+    gatewayStatusQuery,
+    isAdmin = false,
+    theme,
+    setTheme,
+  } = useOutletContext<GatewayOutletContext>();
+  const defaultTab = isAdmin ? "inference" : "language";
+  const tab = requestedTab || defaultTab;
+  const {
+    settings,
+    query,
+    save,
+    savedKeys,
+    needsRestart,
+    importSettings,
+    isImporting,
+    saveError,
+  } = useSettings();
+  const [searchQuery, setSearchQuery] = React.useState("");
+
+  React.useEffect(() => {
+    setSearchQuery("");
+  }, [tab]);
+
+  const isLoading = query.isLoading;
+
+  const tabContent = {
+    inference: (<InferenceTab
+      isAdmin={isAdmin}
+      settings={settings}
+      gatewayStatus={gatewayStatus}
+      onSave={save}
+      savedKeys={savedKeys}
+      isLoading={isLoading}
+      searchQuery={searchQuery}
+    />),
+    appearance: (<AppearanceTab
+      searchQuery={searchQuery}
+      theme={theme}
+      onThemeChange={setTheme}
+    />),
+    tools: (<ToolsTab
+      settings={settings}
+      onSave={save}
+      savedKeys={savedKeys}
+      isLoading={isLoading}
+      searchQuery={searchQuery}
+    />),
+    skills: (<SkillsTab searchQuery={searchQuery} />),
+    traces: (<TraceCommonsTab searchQuery={searchQuery} />),
+    language: (<LanguageTab searchQuery={searchQuery} />),
+  };
+
+  const tabContentHas = (id) => Object.prototype.hasOwnProperty.call(tabContent, id);
+  const visibleTabIds = Object.keys(tabContent);
+  const defaultTabIsVisible = tabContentHas(defaultTab) && visibleTabIds.includes(defaultTab);
+  const redirectTab = defaultTabIsVisible ? defaultTab : visibleTabIds[0] || "language";
+
+  if (!tabContentHas(tab)) {
+    return (<Navigate to={`/settings/${redirectTab}`} replace />);
+  }
+
+  return (
+    <PageScroll contained>
+      <PageStack>
+            {needsRestart &&
+            (<div className="sticky top-0 z-20 -mx-4 -mt-4 mb-1 bg-[color-mix(in_srgb,var(--v2-canvas)_92%,transparent)] px-4 pt-4 backdrop-blur sm:-mx-6 sm:px-6">
+              <RestartBanner
+                visible={true}
+                gatewayStatus={gatewayStatus}
+                gatewayStatusQuery={gatewayStatusQuery}
+              />
+            </div>)}
+
+            {saveError &&
+            (
+              <InlineNotice tone="danger" role="alert">
+                {t("error.saveFailed", { message: saveError.message })}
+              </InlineNotice>
+            )}
+
+            <SettingsToolbar
+              settingsExport={query.data || null}
+              onImport={importSettings}
+              isImporting={isImporting}
+              searchQuery={searchQuery}
+              onSearchChange={setSearchQuery}
+              onSearchClear={() => setSearchQuery("")}
+              canGoBack={false}
+            />
+
+            <RouteLoadBoundary>{tabContent[tab]}</RouteLoadBoundary>
+      </PageStack>
+    </PageScroll>
+  );
+}

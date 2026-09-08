@@ -1,0 +1,288 @@
+import { Badge } from "../../../design-system/badge";
+import { Card } from "../../../design-system/card";
+import { Icon } from "../../../design-system/icons";
+import { InlineNotice } from "../../../design-system/inline-notice";
+import { Skeleton } from "../../../design-system/skeleton";
+import {
+  SelectMenu,
+  type SelectMenuOption,
+} from "../../../design-system/select-menu";
+import { Switch } from "../../../design-system/switch";
+import { useT } from "../../../lib/i18n";
+import { useTools } from "../hooks/useTools";
+import { matchesSearch } from "../lib/settings-search";
+
+const AUTO_APPROVE_KEY = "agent.auto_approve_tools";
+
+type ToolsTabProps = {
+  settings?: Record<string, unknown>;
+  onSave?: (key: string, value: unknown) => void;
+  savedKeys?: Record<string, boolean>;
+  isLoading?: boolean;
+  searchQuery?: string;
+};
+
+function translatedToolDescription(t, tool) {
+  const key = `tools.description.${tool.name}`;
+  const translated = t(key);
+  return translated && translated !== key ? translated : tool.description || "";
+}
+
+function SavedIndicator({ visible }) {
+  const t = useT();
+  if (!visible) return null;
+  return (
+    <span className="font-mono text-[11px] text-[var(--v2-accent-text)]" role="status">
+      {t("tools.saved")}
+    </span>
+  );
+}
+
+function AutoApproveCard({ settings, onSave, savedKeys, isLoading }) {
+  const t = useT();
+  const label = t("settings.field.autoApproveEligibleTools");
+  // Absent → default ON (mirrors backend AUTO_APPROVE_DEFAULT_ENABLED).
+  const raw = settings?.[AUTO_APPROVE_KEY];
+  const checked = raw == null ? true : raw === true || raw === "true";
+
+  return (
+    <Card padding="md" className="flex items-center justify-between gap-6">
+      <div className="min-w-0">
+        <h3 className="text-sm font-semibold text-[var(--v2-text-strong)]">
+          {label}
+        </h3>
+        <p className="mt-1 text-sm text-[var(--v2-text-muted)]">
+          {t("settings.field.autoApproveEligibleToolsDesc")}
+        </p>
+      </div>
+      <div className="flex shrink-0 items-center gap-3">
+        <SavedIndicator visible={savedKeys?.[AUTO_APPROVE_KEY]} />
+        <Switch
+          checked={checked}
+          disabled={isLoading}
+          aria-label={label}
+          onChange={(value) => onSave(AUTO_APPROVE_KEY, value)}
+        />
+      </div>
+    </Card>
+  );
+}
+
+function ToolRow({ tool, pendingPermission, onPermissionChange, isSaved }) {
+  const t = useT();
+  const description = translatedToolDescription(t, tool);
+  const permissionStates: SelectMenuOption[] = [
+    { value: "default", label: t("tools.followDefault"), tone: "neutral" },
+    { value: "always_allow", label: t("tools.alwaysAllow"), tone: "positive" },
+    { value: "ask_each_time", label: t("tools.askEachTime"), tone: "warning" },
+    { value: "disabled", label: t("tools.disabled"), tone: "danger" },
+  ];
+  const sourceLabels = {
+    default: t("tools.sourceDefault"),
+    global: t("tools.sourceGlobal"),
+    override: t("tools.sourceOverride"),
+  };
+
+  const isLocked = tool.locked;
+  const current =
+    permissionStates.find((p) => p.value === tool.state) || permissionStates[1];
+  const effectiveSource = tool.effective_source || "default";
+  const selectedState =
+    pendingPermission ?? (effectiveSource === "override" ? tool.state : "default");
+  const isDefault = effectiveSource === "default" && tool.state === tool.default_state;
+
+  return (
+    <div
+      data-testid="settings-tool-row"
+      data-tool-name={tool.name}
+      className="flex items-center justify-between gap-4 border-t border-[var(--v2-panel-border)] py-3.5 first:border-0 first:pt-0"
+    >
+      <div className="flex min-w-0 items-center gap-3">
+        {isLocked &&
+        (<span data-testid="settings-tool-lock" className="shrink-0">
+          <Icon
+            name="lock"
+            className="h-3.5 w-3.5 text-[var(--v2-text-faint)]"
+          />
+        </span>)}
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="truncate font-mono text-sm text-[var(--v2-text)]"
+              >{tool.name}</span
+            >
+            {isDefault &&
+            (
+              <span
+                className="rounded border border-[var(--v2-panel-border)] bg-[var(--v2-surface-soft)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--v2-text-faint)]"
+              >
+                {t("tools.default")}
+              </span>
+            )}
+            <span
+              className="rounded border border-[var(--v2-panel-border)] bg-[var(--v2-surface-soft)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--v2-text-faint)]"
+            >
+              {sourceLabels[effectiveSource] || sourceLabels.default}
+            </span>
+          </div>
+          {description &&
+          (
+            <div className="mt-0.5 truncate text-xs text-[var(--v2-text-muted)]">
+              {description}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="flex shrink-0 items-center gap-3">
+        {isLocked
+          ? (<Badge
+              tone={current.tone === "neutral" ? "muted" : current.tone}
+              label={current.label}
+              size="sm"
+            />)
+          : (
+              <SelectMenu
+                value={selectedState}
+                options={permissionStates}
+                onChange={(value) => onPermissionChange(tool.name, value)}
+                ariaLabel={t("tools.permissionFor", { name: tool.name })}
+                aria-busy={pendingPermission != null}
+                className="w-36 sm:w-44"
+                data-testid="settings-tool-permission-select"
+              />
+            )}
+        {isSaved &&
+        (
+          <span className="font-mono text-[11px] text-[var(--v2-accent-text)]"
+            >{t("tools.saved")}</span
+          >
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function ToolsTab({
+  settings = {},
+  onSave = () => {},
+  savedKeys = {},
+  isLoading = false,
+  searchQuery = "",
+}: ToolsTabProps) {
+  const t = useT();
+  const {
+    tools,
+    query,
+    setPermission,
+    savedTools,
+    pendingPermissions,
+    error: permissionError,
+  } = useTools();
+
+  if (query.isLoading) {
+    return (
+      <div className="space-y-4">
+        <AutoApproveCard
+          settings={settings}
+          onSave={onSave}
+          savedKeys={savedKeys}
+          isLoading={isLoading}
+        />
+        <Card padding="md">
+          <Skeleton className="mb-4 h-3 w-28 rounded" />
+          {[1, 2, 3, 4, 5].map(
+            (i) => (
+              <div
+                key={i}
+                className="flex items-center justify-between border-t border-[var(--v2-panel-border)] py-3.5 first:border-0"
+              >
+                <Skeleton className="h-4 w-36 rounded" />
+                <Skeleton className="h-8 w-28 rounded" />
+              </div>
+            )
+          )}
+        </Card>
+      </div>
+    );
+  }
+
+  if (query.error) {
+    return (
+      <div className="space-y-4">
+        <AutoApproveCard
+          settings={settings}
+          onSave={onSave}
+          savedKeys={savedKeys}
+          isLoading={isLoading}
+        />
+        <InlineNotice tone="danger" role="alert">
+          {t("tools.failedLoad", { message: query.error.message })}
+        </InlineNotice>
+      </div>
+    );
+  }
+
+  const filtered = tools.filter((tool) => {
+    const description = translatedToolDescription(t, tool);
+    return matchesSearch(searchQuery, [
+      tool.name,
+      tool.description,
+      description,
+      tool.state,
+      tool.default_state,
+      tool.effective_source,
+      tool.state === "disabled" ? t("tools.disabled") : "",
+    ]);
+  });
+
+  return (
+    <div className="space-y-4">
+      <AutoApproveCard
+        settings={settings}
+        onSave={onSave}
+        savedKeys={savedKeys}
+        isLoading={isLoading}
+      />
+
+      {permissionError &&
+      (
+        <InlineNotice tone="danger" role="alert">
+          {t("error.saveFailed", { message: permissionError.message })}
+        </InlineNotice>
+      )}
+
+      {searchQuery &&
+      (
+        <div className="flex justify-end">
+          <span className="font-mono text-[11px] text-[var(--v2-text-faint)]">
+            {filtered.length} / {tools.length}
+          </span>
+        </div>
+      )}
+
+      <Card padding="md">
+        <h3
+          className="mb-4 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--v2-accent-text)]"
+        >
+          {t("tools.permissions")}
+        </h3>
+        {filtered.length === 0
+          ? (<p className="py-4 text-sm text-[var(--v2-text-muted)]">
+              {t("tools.noMatch")}
+            </p>)
+          : filtered.map(
+              (tool) =>
+                (
+                  <ToolRow
+                    key={tool.name}
+                    tool={tool}
+                    pendingPermission={pendingPermissions?.[tool.name]?.state}
+                    onPermissionChange={setPermission}
+                    isSaved={savedTools[tool.name]}
+                  />
+                )
+            )}
+      </Card>
+    </div>
+  );
+}

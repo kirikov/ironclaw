@@ -1,7 +1,7 @@
 //! W5-WIRING-PARITY (issue #5637): the harness's `DefaultPlannedRuntimeParts`
 //! construction (`support/group.rs`'s `into_group`) stays field-Some/None-
 //! identical to production's local-dev construction
-//! (`ironclaw_reborn_composition::runtime::build_reborn_runtime`), modulo a
+//! (`ironclaw_composition::runtime::build_reborn_runtime`), modulo a
 //! named allowlist of deliberate test-double substitutions — so a new
 //! port/field lands loud instead of silently drifting. Zero production-crate
 //! edits: the mechanism is entirely test-side.
@@ -33,19 +33,21 @@ mod support;
 
 use std::collections::HashSet;
 
-use ironclaw_host_api::CapabilityId;
+use ironclaw_host_api::ids::CapabilityId;
+use ironclaw_product_contracts::inspector::DiagnosticScope;
 use reborn_support::builder::RebornIntegrationHarness;
 use reborn_support::group::RebornIntegrationGroup;
 use reborn_support::harness::HarnessResult;
 use reborn_support::harness::options::ToolsProfile;
 use reborn_support::planned_runtime_parts_shape::DefaultPlannedRuntimePartsShape;
+use reborn_support::reply::RebornScriptedReply;
 
 // ---------------------------------------------------------------------------
 // Part 1: DefaultPlannedRuntimeParts Some/None shape parity
 // ---------------------------------------------------------------------------
 
-/// Hand-derived from `crates/ironclaw_reborn_composition/src/runtime.rs`
-/// lines 3365-3459 (`build_reborn_runtime`, `LocalDev`/`LocalDevYolo`
+/// Hand-derived from `crates/app/ironclaw_composition/src/runtime.rs`
+/// lines 3365-3459 (`build_reborn_runtime`, `Standalone`/`StandaloneUnrestricted`
 /// profile, `local_runtime: Some(..)`). NOT computed from running code —
 /// RE-DERIVE by re-reading that literal whenever it changes. (Verified
 /// against this range 2026-07-04.) The smoke build below at least proves the
@@ -60,15 +62,18 @@ use reborn_support::planned_runtime_parts_shape::DefaultPlannedRuntimePartsShape
 /// below for the exact code path.
 const EXPECTED_PRODUCTION_SHAPE: DefaultPlannedRuntimePartsShape =
     DefaultPlannedRuntimePartsShape {
-        model_route_resolver: false,    // :3406 hardcoded None
-        cancellation_factory: false,    // :3407 hardcoded None
-        skill_context_source: true,     // :2917-2929 local_dev_filesystem_skill_context_source
+        model_route_resolver: false,        // :3406 hardcoded None
+        cancellation_factory: false,        // :3407 hardcoded None
+        skill_context_source: true,         // :2917-2929 standalone_filesystem_skill_context_source
         attachment_read_port: true, // :3372-3376 local_runtime.map(ProjectScopedAttachmentReader)
+        prompt_diagnostic_sink: true, // process-local bounded inspector store
+        reply_attachment_intent_port: true, // shared production outbound-state store
         gate_record_store: true, // local_runtime.map(gate_record_store) — always Some when local_runtime present
-        input_queue: false,      // hardcoded None
+        input_queue: true, // steering/follow-up host input queue — always wired (InMemory or Filesystem)
+        input_queue_reconcile: true, // terminal reclamation surface of the same queue — wired alongside it
         memory_context_service: true, // :3481-3494 local_runtime + native MemoryServiceResolver
         after_turn_memory_writer: true, // :3500-3509 local_runtime + native MemoryServiceResolver
-        model_policy_guard: false, // hardcoded None
+        model_policy_guard: false,   // hardcoded None
         // :3027-3073 — scope: this constant models the NO-LLM local-dev
         // shape. When `model_gateway_override` is set (the harness's
         // scripted `TraceLlm` path, and any test build), `llm_cost_table` is
@@ -86,8 +91,12 @@ const EXPECTED_PRODUCTION_SHAPE: DefaultPlannedRuntimePartsShape =
         hook_security_audit_sink: true, // runtime.rs:3780 always Some(TracingSecurityAuditSink)
         turn_event_sink: true,          // runtime.rs:3781 always Some(turn_event_sink)
         hook_dispatcher_builder_factory: false, // :3230-3258 None, HooksActivationConfig defaults OFF
-        communication_context_provider: true,   // :3337-3357 Some whenever local_runtime present
-        scheduler_wake_wiring: false, // :2847-2857 None outside Production/MigrationDryRun
+        // None unless `[memory].curation_interval_turns` is set AND a memory
+        // provider resolves (#7276). Curation is opt-in, so the default
+        // production shape leaves the after_turn point un-wired.
+        after_turn_hook_wiring: false,
+        communication_context_provider: true, // :3337-3357 Some whenever local_runtime present
+        scheduler_wake_wiring: false,         // :2847-2857 None outside Production/MigrationDryRun
     };
 
 /// Deliberate test-double substitutions: `(field, reason)`. Every other field
@@ -99,7 +108,7 @@ const ALLOWED_DIVERGENCES: &[(&str, &str)] = &[
     (
         "skill_context_source",
         "harness: None outside skill_activation_tools() groups (recorder.rs:56-63); \
-         production: always Some via local_dev_filesystem_skill_context_source (runtime.rs:2917-2929)",
+         production: always Some via standalone_filesystem_skill_context_source (runtime.rs:2917-2929)",
     ),
     (
         "attachment_read_port",
@@ -151,6 +160,10 @@ fn mask(
         "cancellation_factory" => shape.cancellation_factory = from.cancellation_factory,
         "skill_context_source" => shape.skill_context_source = from.skill_context_source,
         "attachment_read_port" => shape.attachment_read_port = from.attachment_read_port,
+        "prompt_diagnostic_sink" => shape.prompt_diagnostic_sink = from.prompt_diagnostic_sink,
+        "reply_attachment_intent_port" => {
+            shape.reply_attachment_intent_port = from.reply_attachment_intent_port
+        }
         "gate_record_store" => shape.gate_record_store = from.gate_record_store,
         "input_queue" => shape.input_queue = from.input_queue,
         "memory_context_service" => shape.memory_context_service = from.memory_context_service,
@@ -170,6 +183,7 @@ fn mask(
         "communication_context_provider" => {
             shape.communication_context_provider = from.communication_context_provider
         }
+        "after_turn_hook_wiring" => shape.after_turn_hook_wiring = from.after_turn_hook_wiring,
         "scheduler_wake_wiring" => shape.scheduler_wake_wiring = from.scheduler_wake_wiring,
         other => panic!(
             "ALLOWED_DIVERGENCES references unknown field {other:?} — update this match and \
@@ -211,6 +225,37 @@ async fn test_default_planned_runtime_parts_shape_matches_production() {
     );
 }
 
+/// Task 5 (run-artifact-timings): the harness must hand out the SAME
+/// `InMemoryDiagnosticStore` instance the loop's diagnostic sinks write into,
+/// mirroring production's one-store shape (`runtime.rs:3455`,
+/// `product_surface.rs:98`). Before this test, `group.rs` built a throwaway
+/// store inline and kept no handle, so nothing could read what a run actually
+/// recorded.
+#[tokio::test]
+async fn harness_shares_one_diagnostic_store_with_the_loop() {
+    let harness = RebornIntegrationHarness::builder("wiring-parity")
+        .script([RebornScriptedReply::text("diagnostic")])
+        .build()
+        .await
+        .expect("harness");
+    let run_id = harness
+        .submit_turn("write diagnostics")
+        .await
+        .expect("scripted turn");
+
+    let snapshot = harness
+        .diagnostic_store()
+        .snapshot(&DiagnosticScope::new(
+            harness.binding.tenant_id.clone(),
+            harness.binding.actor_user_id.clone(),
+            harness.binding.thread_id.clone(),
+            run_id,
+        ))
+        .expect("diagnostic snapshot")
+        .expect("the loop must write to the shared diagnostic store");
+    assert!(!snapshot.model_calls.is_empty());
+}
+
 #[tokio::test]
 async fn builtin_tools_planned_runtime_parts_shape_matches_production() {
     let group = RebornIntegrationGroup::builtin_tools()
@@ -223,24 +268,24 @@ async fn builtin_tools_planned_runtime_parts_shape_matches_production() {
 }
 
 /// Smoke build backing `EXPECTED_PRODUCTION_SHAPE`'s doc comment: proves the
-/// referenced `LocalDev` literal still exists and the profile still builds.
-/// Mirrors `crates/ironclaw_reborn_composition/tests/runtime.rs:132-146`. The
+/// referenced `Standalone` literal still exists and the profile still builds.
+/// Mirrors `crates/app/ironclaw_composition/tests/runtime.rs:132-146`. The
 /// constant's `bool` values still come from the hand-read above, NOT from
 /// introspecting this built `RebornRuntime` (there is no production-side
 /// accessor to do so without a production-crate change — the known accepted
 /// gap noted in the module doc).
 #[tokio::test]
-async fn local_dev_profile_still_builds() {
+async fn standalone_profile_still_builds() {
     let root = tempfile::tempdir().expect("tempdir");
-    let policy = ironclaw_reborn_composition::local_dev_runtime_policy()
+    let policy = ironclaw_composition::standalone_runtime_policy()
         .expect("local-dev runtime policy resolves");
-    let input = ironclaw_reborn_composition::local_dev_build_input(
+    let input = ironclaw_composition::local_filesystem_build_input(
         "wiring-parity-smoke-owner",
         root.path().join("local-dev"),
     )
     .with_runtime_policy(policy);
-    let runtime = ironclaw_reborn_composition::build_reborn_runtime(
-        ironclaw_reborn_composition::RebornRuntimeInput::from_build_input(input),
+    let runtime = ironclaw_composition::build_reborn_runtime(
+        ironclaw_composition::RebornRuntimeInput::from_build_input(input),
     )
     .await
     .expect(
@@ -269,20 +314,20 @@ const SYNTHETIC_CAPABILITY_SKIP_LIST: &[(&str, &str)] = &[
     (
         "project",
         "PROJECT_CREATE_CAPABILITY_ID (harness/profiles/project.rs) is a local-dev synthetic \
-         capability (E-PROJ, ironclaw_reborn_composition::test_support), not part of \
+         capability (E-PROJ, ironclaw_composition::test_support), not part of \
          builtin_first_party_package()",
     ),
     (
         "outbound",
-        "OUTBOUND_DELIVERY_TARGETS_LIST/TARGET_SET_CAPABILITY_ID (harness/profiles/outbound.rs) \
-         are local-dev synthetic capabilities (C-SYNTH outbound, \
-         ironclaw_reborn_composition::test_support), not part of builtin_first_party_package()",
+        "OUTBOUND_DELIVERY_TARGETS_LIST/NOTIFICATION_CHANNELS_SET_CAPABILITY_ID \
+         (harness/profiles/outbound.rs) are local-dev synthetic capabilities (C-SYNTH outbound, \
+         ironclaw_composition::test_support), not part of builtin_first_party_package()",
     ),
     (
         "skill",
         "skill_activation_tools_profile()'s SKILL_ACTIVATE_CAPABILITY_ID \
          (harness/profiles/skill.rs) is a local-dev synthetic capability (E-SKILL, \
-         ironclaw_reborn_composition::test_support), not part of builtin_first_party_package(); \
+         ironclaw_composition::test_support), not part of builtin_first_party_package(); \
          skill_management_tools_profile()'s ids in the same file ARE checked below",
     ),
     (
@@ -302,13 +347,13 @@ const SYNTHETIC_CAPABILITY_SKIP_LIST: &[(&str, &str)] = &[
 /// real manifest-derived ids
 /// (`extension_surface::bundled_extension_manifest_capability_ids()`) — both
 /// parse the actual `manifest.toml` assets under
-/// `crates/ironclaw_first_party_extensions/assets/`, so they are themselves
+/// `crates/extensions/packages/`, so they are themselves
 /// production truth, not a second test-only source.
 ///
 /// **Deliberately NOT unioned**: `extension_surface::EXTENSION_LIFECYCLE_CAPABILITY_IDS`
 /// (the three `builtin.extension_search`/`_install`/`_remove` ids).
 /// Their real values are defined in a production crate
-/// (`ironclaw_reborn_composition::extension_lifecycle_capabilities::EXTENSION_LIFECYCLE_CAPABILITY_IDS`),
+/// (`ironclaw_composition::extension_lifecycle_capabilities::EXTENSION_LIFECYCLE_CAPABILITY_IDS`),
 /// but as a `pub(crate)` constant with no public accessor — visibility-blocked
 /// from this test crate short of a `crates/` change, which is out of scope
 /// here. Unioning the test-support copy of this list back in would recreate
@@ -318,7 +363,7 @@ const SYNTHETIC_CAPABILITY_SKIP_LIST: &[(&str, &str)] = &[
 /// these 3 ids from the check it runs for the same reason, and the PR that
 /// introduced this restructure (W5-WIRING-PARITY finding 1) for the tracked
 /// follow-up (export the list, or add a public accessor, from
-/// `ironclaw_reborn_composition`).
+/// `ironclaw_composition`).
 fn production_capability_surface() -> HashSet<String> {
     let mut surface: HashSet<String> = ironclaw_host_runtime::builtin_first_party_package()
         .expect("builtin first-party package parses")

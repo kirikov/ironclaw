@@ -54,7 +54,7 @@ TOOL_SURFACES = [{"kind": "tool"}]
 TELEGRAM_MANIFEST = tomllib.loads(
     (
         Path(__file__).resolve().parents[3]
-        / "crates/ironclaw_first_party_extensions/assets/telegram/manifest.toml"
+        / "crates/extensions/packages/telegram/manifest.toml"
     ).read_text(encoding="utf-8")
 )
 TELEGRAM_PAIRING_INSTRUCTIONS = TELEGRAM_MANIFEST["channel"]["connection"]["instructions"]
@@ -821,6 +821,9 @@ async def test_reborn_legacy_extensions_offline_attempts_catalog_requests(
         handle_llm_providers,
     )
 
+    async def abort_catalog_request(route):
+        await route.abort("internetdisconnected")
+
     try:
         async with page.expect_response("**/api/webchat/v2/llm/providers"):
             await page.goto(
@@ -835,7 +838,9 @@ async def test_reborn_legacy_extensions_offline_attempts_catalog_requests(
             timeout=15000
         )
 
-        await context.set_offline(True)
+        # Keep the browser online so the lazy Extensions route chunk can load,
+        # then fail only the API calls this scenario owns.
+        await page.route("**/api/webchat/v2/extensions**", abort_catalog_request)
         await page.get_by_role("link", name="Extensions").first.click()
 
         error_banner = page.get_by_role("alert")
@@ -846,11 +851,12 @@ async def test_reborn_legacy_extensions_offline_attempts_catalog_requests(
         assert "/api/webchat/v2/extensions/registry" in catalog_requests
         await expect(page.get_by_text("Registry is empty")).to_have_count(0)
 
-        await context.set_offline(False)
+        await page.unroute(
+            "**/api/webchat/v2/extensions**", abort_catalog_request
+        )
         await error_banner.get_by_role("button", name="Retry").click()
         await expect(error_banner).to_have_count(0, timeout=10000)
     finally:
-        await context.set_offline(False)
         await context.close()
 
 
@@ -912,10 +918,10 @@ async def test_reborn_legacy_extensions_multiple_installs_remain_listed(
 
         installed_tool = _card_by_title(page, "Registry Tool")
         installed_mcp = _card_by_title(page, "Registry MCP Server")
-        await expect(installed_tool.get_by_text("installed", exact=True)).to_be_visible(
+        await expect(installed_tool.get_by_text("active", exact=True)).to_be_visible(
             timeout=5000
         )
-        await expect(installed_mcp.get_by_text("installed", exact=True)).to_be_visible()
+        await expect(installed_mcp.get_by_text("active", exact=True)).to_be_visible()
         await expect(
             installed_tool.get_by_role("button", name="Install")
         ).to_have_count(0)
@@ -1224,7 +1230,7 @@ async def test_reborn_legacy_extensions_reinstall_after_remove_requires_setup_ag
         _assert_install_requests(harness["install_requests"], "config-tool")
 
         reinstalled_card = _card_by_title(page, "Config Tool")
-        await expect(reinstalled_card.get_by_text("setup needed")).to_be_visible(
+        await expect(reinstalled_card.get_by_text("finish setup")).to_be_visible(
             timeout=5000
         )
         await expect(reinstalled_card.get_by_role("button", name="Configure")).to_have_count(
@@ -2317,7 +2323,6 @@ async def test_reborn_v2_current_extension_setup_and_delivery_matrix(
         await expect(pairing_panel.get_by_test_id("pairing-countdown")).to_have_text(
             re.compile(r"^Expires in \d+:\d{2}$")
         )
-        await expect(pairing_panel.get_by_text(re.compile(r"/start"))).to_be_visible()
         await expect(pairing_panel.get_by_text(re.compile(r"/pair\b"))).to_have_count(0)
         await expect(telegram_modal.get_by_text("Telegram Bot Token")).to_have_count(0)
         await telegram_modal.get_by_label("Close").click()
@@ -2328,7 +2333,7 @@ async def test_reborn_v2_current_extension_setup_and_delivery_matrix(
         await notion_card.get_by_role("button", name="Install").click()
         notion_modal = page.get_by_role("dialog", name="Configure Notion Workspace")
         await expect(notion_modal).to_be_visible(timeout=5000)
-        await expect(notion_card.get_by_text("setup needed", exact=True)).to_be_visible()
+        await expect(notion_card.get_by_text("finish setup", exact=True)).to_be_visible()
         await expect(page.get_by_role("button", name="Activate", exact=True)).to_have_count(
             0
         )
@@ -2410,11 +2415,18 @@ async def test_reborn_v2_current_extension_setup_and_delivery_matrix(
                 },
             }
         ]
+        # The notification-channels panel merges this stored-channel response
+        # with the `/outbound/targets` catalog above (see
+        # `mergeNotificationChannelRows`).
         delivery_preferences = {
             "body": {
-                "final_reply_target": slack_target,
-                "final_reply_target_status": "available",
-                "default_modality": "text",
+                "channels": [
+                    {
+                        "target_id": slack_target["target_id"],
+                        "status": "available",
+                        "option": {"target": slack_target},
+                    }
+                ]
             }
         }
 
@@ -2441,7 +2453,7 @@ async def test_reborn_v2_current_extension_setup_and_delivery_matrix(
             if path == "/api/webchat/v2/outbound/targets":
                 await fulfill_json(route, {"targets": delivery_targets})
                 return
-            if path == "/api/webchat/v2/outbound/preferences":
+            if path == "/api/webchat/v2/outbound/notification-channels":
                 await fulfill_json(route, delivery_preferences["body"])
                 return
             await route.continue_()
@@ -2451,17 +2463,11 @@ async def test_reborn_v2_current_extension_setup_and_delivery_matrix(
         await page.goto(
             f"{reborn_v2_server}/automations?token={REBORN_V2_AUTH_TOKEN}"
         )
-        delivery_choices = page.get_by_role(
-            "radiogroup", name="Where triggered results are sent"
-        )
-        await expect(delivery_choices).to_be_visible(timeout=5000)
         await expect(
-            delivery_choices.get_by_text("Slack direct message", exact=True)
-        ).to_be_visible()
+            page.get_by_text("Where notifications are sent", exact=True)
+        ).to_be_visible(timeout=5000)
         await expect(
-            delivery_choices.get_by_text(
-                "Web app only (no external delivery)", exact=True
-            )
+            page.get_by_text("Slack direct message", exact=True)
         ).to_be_visible()
 
         # Removing Slack from the caller's extension membership removes its
@@ -2478,24 +2484,20 @@ async def test_reborn_v2_current_extension_setup_and_delivery_matrix(
         assert harness["remove_requests"] == ["slack"]
 
         delivery_targets.clear()
-        delivery_preferences["body"] = {
-            "final_reply_target_status": "none_configured",
-            "default_modality": "text",
-        }
+        delivery_preferences["body"] = {"channels": []}
         await page.goto(
             f"{reborn_v2_server}/automations?token={REBORN_V2_AUTH_TOKEN}"
         )
-        delivery_choices = page.get_by_role(
-            "radiogroup", name="Where triggered results are sent"
-        )
-        await expect(delivery_choices).to_be_visible(timeout=5000)
         await expect(
-            delivery_choices.get_by_text("Slack direct message", exact=True)
+            page.get_by_text("Where notifications are sent", exact=True)
+        ).to_be_visible(timeout=5000)
+        await expect(
+            page.get_by_text("Slack direct message", exact=True)
         ).to_have_count(0)
-        await expect(page.get_by_text("Current default", exact=True)).to_have_count(0)
         await expect(
-            delivery_choices.get_by_text(
-                "Web app only (no external delivery)", exact=True
+            page.get_by_text(
+                "No notification channel is selected — approval prompts, auth prompts, and failure notices won't be delivered anywhere.",
+                exact=True,
             )
         ).to_be_visible()
 

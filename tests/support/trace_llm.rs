@@ -5,8 +5,8 @@
 //! request-hint validation.
 
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use ironclaw_llm::LlmError;
 use ironclaw_llm::trace_binding::{ObservedToolResult, resolve_trace_result_bindings};
 use ironclaw_llm::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Role, ToolCall,
-    ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
+    ChatMessage, CompletionRequest, CompletionResponse, CompletionResponseFormat,
+    CompletionStreamSink, FinishReason, LlmProvider, Role, ToolCall, ToolCompletionRequest,
+    ToolCompletionResponse, ToolDefinition,
 };
 
 // Re-export shared types from `recording` so downstream test files can
@@ -281,14 +282,98 @@ pub struct TraceLlm {
     steps: Mutex<std::collections::VecDeque<TraceStep>>,
     /// Total non-error calls served, regardless of which step they returned.
     calls_served: AtomicUsize,
+    /// Calls dispatched through the provider streaming method. Kept separate
+    /// from `calls_served` so caller-path tests can prove transport selection.
+    streaming_calls: AtomicUsize,
     hint_mismatches: AtomicUsize,
-    captured_requests: Mutex<Vec<Vec<ChatMessage>>>,
-    /// Captured `tools` argument from each `complete_with_tools` call. Lets
-    /// Tier B tests assert what tool surface the dispatcher / worker shipped
-    /// to the model on each iteration (used for runtime-policy filtering
-    /// caller-tier coverage). Captured in lock-step with `captured_requests`
-    /// — same index = same call.
-    captured_tool_definitions: Mutex<Vec<Vec<ToolDefinition>>>,
+    /// Every model call's request, tools, and response format are captured as
+    /// one record. Keeping these fields under one lock preserves their shared
+    /// index when concurrent model calls interleave.
+    captured_calls: Mutex<Vec<CapturedCall>>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedCall {
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<ToolDefinition>>,
+    response_format: Option<CompletionResponseFormat>,
+    metadata: std::collections::HashMap<String, String>,
+}
+
+/// One request whose cached prompt prefix churned with no surface change.
+///
+/// Both fields are consumed through the `Debug` rendering in
+/// `assert_prompt_cache_prefix_stable`'s failure message, which the lint does
+/// not count as a read — and the many test binaries that mount this support
+/// tree without calling that assertion see them as dead. Same allow the
+/// sibling support modules carry for the same reason.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct PromptCachePrefixChurn {
+    /// Index into `captured_requests()` of the request that diverged.
+    pub request_index: usize,
+    /// Human-readable excerpt around the first differing byte.
+    pub divergence: String,
+}
+
+/// The provider-cached prompt prefix: the LEADING run of system messages.
+///
+/// Only the leading run — a system message positioned after the first
+/// non-system message is transcript content, not part of the cached prefix.
+pub fn leading_system_block(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .take_while(|message| matches!(message.role, Role::System))
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn tool_surface_signature(tools: Option<&Vec<ToolDefinition>>) -> Option<Vec<String>> {
+    tools.map(|defs| {
+        let mut definitions = defs
+            .iter()
+            .map(|def| {
+                serde_json::to_string(&(&def.name, &def.description, &def.parameters))
+                    .expect("ToolDefinition fields are JSON-serializable")
+            })
+            .collect::<Vec<_>>();
+        definitions.sort();
+        definitions
+    })
+}
+
+/// Excerpt around the first differing BYTE, clamped to char boundaries.
+///
+/// Byte offsets are what a cache actually compares; the clamping keeps the
+/// diagnostic printable when the divergence lands inside a multi-byte
+/// character (the prompt is full of em dashes, so this is the common case).
+pub fn first_divergence(before: &str, after: &str) -> String {
+    let at = before
+        .as_bytes()
+        .iter()
+        .zip(after.as_bytes())
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| before.len().min(after.len()));
+    format!(
+        "diverges at byte {at}: before={:?} after={:?}",
+        excerpt_around(before, at),
+        excerpt_around(after, at)
+    )
+}
+
+/// A window around `at`, with both ends walked back to a char boundary so the
+/// slice can never panic and never degrades to an unhelpful placeholder.
+fn excerpt_around(text: &str, at: usize) -> &str {
+    let mut start = at.saturating_sub(80).min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (at + 120).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    &text[start..end]
 }
 
 /// Return the `last_user_message_contains` substring of a step, if any.
@@ -433,9 +518,9 @@ impl TraceLlm {
             model_name: trace.model_name,
             steps: Mutex::new(steps),
             calls_served: AtomicUsize::new(0),
+            streaming_calls: AtomicUsize::new(0),
             hint_mismatches: AtomicUsize::new(0),
-            captured_requests: Mutex::new(Vec::new()),
-            captured_tool_definitions: Mutex::new(Vec::new()),
+            captured_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -450,6 +535,11 @@ impl TraceLlm {
         self.calls_served.load(Ordering::Relaxed)
     }
 
+    /// Number of calls dispatched through [`LlmProvider::complete_streaming`].
+    pub fn streaming_calls(&self) -> usize {
+        self.streaming_calls.load(Ordering::Relaxed)
+    }
+
     /// Number of request-hint mismatches observed (warnings only).
     pub fn hint_mismatches(&self) -> usize {
         self.hint_mismatches.load(Ordering::Relaxed)
@@ -457,14 +547,83 @@ impl TraceLlm {
 
     /// Clone of all captured request message lists.
     pub fn captured_requests(&self) -> Vec<Vec<ChatMessage>> {
-        self.captured_requests.lock().unwrap().clone()
+        self.captured_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.messages.clone())
+            .collect()
+    }
+
+    /// Requests whose provider-cached prompt prefix changed without a
+    /// tool-surface change to explain it (#6985).
+    ///
+    /// Providers cache a prefix of the request, so a system block that is
+    /// rewritten between calls means every call pays full input cost. No
+    /// functional assertion can see that — the model still answers correctly —
+    /// which is why it is checked structurally here, over the same capture the
+    /// other assertions read.
+    ///
+    /// A changed tool surface is the one legitimate cause (installing an
+    /// extension really does rewrite the capability list), so it is excluded.
+    /// Mirrors the `_observe_cache_prefix` gate in `tests/e2e/mock_llm.py`.
+    pub fn prompt_cache_prefix_churn(&self) -> Vec<PromptCachePrefixChurn> {
+        let captures = self.captured_calls.lock().unwrap().clone();
+        let mut churn = Vec::new();
+        for index in 1..captures.len() {
+            let before = leading_system_block(&captures[index - 1].messages);
+            let after = leading_system_block(&captures[index].messages);
+            if before == after {
+                continue;
+            }
+            let before_surface = tool_surface_signature(captures[index - 1].tools.as_ref());
+            let after_surface = tool_surface_signature(captures[index].tools.as_ref());
+            if before_surface.is_none() || after_surface.is_none() {
+                continue;
+            }
+            if before_surface != after_surface {
+                continue;
+            }
+            churn.push(PromptCachePrefixChurn {
+                request_index: index,
+                divergence: first_divergence(&before, &after),
+            });
+        }
+        churn
     }
 
     /// Clone of every `tools` argument the dispatcher / worker shipped to the
     /// model. Index `i` matches the `i`-th `captured_requests()` entry.
     /// Empty for `complete()`-only calls (text-only paths).
     pub fn captured_tool_definitions(&self) -> Vec<Vec<ToolDefinition>> {
-        self.captured_tool_definitions.lock().unwrap().clone()
+        self.captured_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.tools.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// Clone every provider-native response format sent to the model. Index
+    /// `i` matches `captured_requests()`; `None` means ordinary inference.
+    pub fn captured_response_formats(&self) -> Vec<Option<CompletionResponseFormat>> {
+        self.captured_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.response_format.clone())
+            .collect()
+    }
+
+    /// Clone the metadata attached to each provider request. Index `i`
+    /// matches `captured_requests()` and the other captured-call accessors.
+    pub fn captured_request_metadata(&self) -> Vec<std::collections::HashMap<String, String>> {
+        self.captured_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.metadata.clone())
+            .collect()
     }
 
     /// Enqueue one more step at the back of the FIFO. For scenarios where a
@@ -488,17 +647,17 @@ impl TraceLlm {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[ToolDefinition]>,
+        response_format: Option<CompletionResponseFormat>,
+        metadata: &std::collections::HashMap<String, String>,
     ) -> Result<TraceStep, LlmError> {
-        // Capture the request messages for inspection-based assertions.
-        self.captured_requests
-            .lock()
-            .unwrap()
-            .push(messages.to_vec());
-        // Capture the `tools` argument in lock-step (empty for `complete()`).
-        self.captured_tool_definitions
-            .lock()
-            .unwrap()
-            .push(tools.map(|t| t.to_vec()).unwrap_or_default());
+        // Capture the complete provider call atomically so concurrent calls
+        // cannot associate one request's format with another request.
+        self.captured_calls.lock().unwrap().push(CapturedCall {
+            messages: messages.to_vec(),
+            tools: tools.map(|t| t.to_vec()),
+            response_format,
+            metadata: metadata.clone(),
+        });
 
         let last_user_content: Option<String> = messages
             .iter()
@@ -610,6 +769,7 @@ impl TraceLlm {
                 Some(ObservedToolResult {
                     tool_call_id,
                     content: parsed,
+                    structured_json_view: message.tool_result_structured_json_view,
                 })
             })
             .collect()
@@ -759,7 +919,12 @@ impl LlmProvider for TraceLlm {
         // return the next Text step, since in real usage the LLM would
         // produce text when no tools are offered.
         loop {
-            let step = self.next_step(&request.messages, None)?;
+            let step = self.next_step(
+                &request.messages,
+                None,
+                request.response_format.clone(),
+                &request.metadata,
+            )?;
             match step.response {
                 TraceResponse::Text {
                     content,
@@ -793,11 +958,25 @@ impl LlmProvider for TraceLlm {
         }
     }
 
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        _sink: Arc<dyn CompletionStreamSink>,
+    ) -> Result<CompletionResponse, LlmError> {
+        self.streaming_calls.fetch_add(1, Ordering::Relaxed);
+        self.complete(request).await
+    }
+
     async fn complete_with_tools(
         &self,
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let step = self.next_step(&request.messages, Some(&request.tools))?;
+        let step = self.next_step(
+            &request.messages,
+            Some(&request.tools),
+            request.response_format.clone(),
+            &request.metadata,
+        )?;
         match step.response {
             TraceResponse::Text {
                 content,
@@ -849,5 +1028,134 @@ impl LlmProvider for TraceLlm {
                     .to_string(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_tests {
+    use super::*;
+
+    fn tool(description: &str, parameters: serde_json::Value) -> ToolDefinition {
+        ToolDefinition {
+            name: "search".to_string(),
+            description: description.to_string(),
+            parameters,
+        }
+    }
+
+    #[test]
+    fn tool_surface_signature_includes_description_and_parameters() {
+        let baseline = vec![tool("search docs", serde_json::json!({"type": "object"}))];
+        let description_changed = vec![tool(
+            "search all docs",
+            serde_json::json!({"type": "object"}),
+        )];
+        let parameters_changed = vec![tool(
+            "search docs",
+            serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        )];
+
+        assert_ne!(
+            tool_surface_signature(Some(&baseline)),
+            tool_surface_signature(Some(&description_changed))
+        );
+        assert_ne!(
+            tool_surface_signature(Some(&baseline)),
+            tool_surface_signature(Some(&parameters_changed))
+        );
+        assert_ne!(
+            tool_surface_signature(None),
+            tool_surface_signature(Some(&vec![]))
+        );
+    }
+
+    #[test]
+    fn concurrent_request_and_tool_capture_stays_aligned() {
+        fn trace_with_steps(count: usize) -> TraceLlm {
+            TraceLlm::from_trace(LlmTrace {
+                model_name: "capture-test".to_string(),
+                turns: vec![TraceTurn {
+                    user_input: "capture".to_string(),
+                    steps: (0..count)
+                        .map(|_| TraceStep {
+                            request_hint: None,
+                            response: TraceResponse::Text {
+                                content: "ok".to_string(),
+                                input_tokens: 1,
+                                output_tokens: 1,
+                            },
+                            expected_tool_results: Vec::new(),
+                        })
+                        .collect(),
+                    expects: TraceExpects::default(),
+                }],
+                memory_snapshot: Vec::new(),
+                http_exchanges: Vec::new(),
+                expects: TraceExpects::default(),
+                steps: Vec::new(),
+            })
+        }
+
+        let llm = std::sync::Arc::new(trace_with_steps(16));
+        let threads = (0..16)
+            .map(|index| {
+                let llm = std::sync::Arc::clone(&llm);
+                std::thread::spawn(move || {
+                    let tag = format!("call-{index}");
+                    let messages = vec![
+                        ChatMessage::system(format!("system {tag}")),
+                        ChatMessage::user(tag.clone()),
+                    ];
+                    let tools = vec![tool(&tag, serde_json::json!({"type": "object"}))];
+                    llm.next_step(
+                        &messages,
+                        Some(&tools),
+                        None,
+                        &std::collections::HashMap::new(),
+                    )
+                    .expect("concurrent trace step is available");
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("capture thread completes");
+        }
+
+        let captures = llm.captured_calls.lock().unwrap().clone();
+        assert_eq!(captures.len(), 16);
+        for capture in captures {
+            let user = capture
+                .messages
+                .iter()
+                .find(|message| message.role == Role::User)
+                .expect("capture carries its user tag");
+            assert_eq!(capture.tools.as_ref().unwrap()[0].description, user.content);
+        }
+
+        let sequential = trace_with_steps(2);
+        let stable_tools = vec![tool("stable", serde_json::json!({"type": "object"}))];
+        sequential
+            .next_step(
+                &[
+                    ChatMessage::system("system before"),
+                    ChatMessage::user("first"),
+                ],
+                Some(&stable_tools),
+                None,
+                &std::collections::HashMap::new(),
+            )
+            .expect("first trace step is available");
+        sequential
+            .next_step(
+                &[
+                    ChatMessage::system("system after"),
+                    ChatMessage::user("second"),
+                ],
+                Some(&stable_tools),
+                None,
+                &std::collections::HashMap::new(),
+            )
+            .expect("second trace step is available");
+        assert_eq!(sequential.prompt_cache_prefix_churn().len(), 1);
     }
 }

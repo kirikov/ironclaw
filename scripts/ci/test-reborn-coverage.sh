@@ -4,49 +4,15 @@
 #   - reborn-coverage-merge-lcov.sh     (per-lane lcov merge + crate filter)
 #   - reborn-coverage-summary.sh        (report + --zero-crates modes)
 #   - reborn-coverage-comment.sh        (sticky PR comment upsert via `gh api`)
-#   - reborn-coverage-int-tier-tests.sh (int-tier suite discovery)
 #   - reborn-coverage-ratchet.sh        (coverage-floor ratchet gate)
 #
-# Mirrors test-classify-test-scope.sh: self-contained, locates the
-# scripts-under-test relative to this file's own directory, builds its own
-# fixtures in a mktemp dir, and reports PASS/FAIL per case. Unlike that
-# precedent (which exits on the first failure), this suite runs every case
-# and prints a final summary, exiting non-zero only if something failed —
-# with five scripts and 50 cases (M/A/B/C/D/R sections), seeing the full
-# picture in one run beats stopping at the first mismatch.
-#
-# reborn-coverage-summary.sh and reborn-coverage-ratchet.sh share one lcov-
-# parsing + exemption-filtering + by-crate-aggregation implementation
-# (scripts/ci/lib/reborn_coverage_lcov.py) — the M/A/B/C sections below are
-# this module's regression proof (exercised transitively through both
-# consuming scripts), not a separate lib-level test file.
-#
-# The R section (reborn-coverage-ratchet.sh cases) lives in the sibling
-# test-reborn-coverage-ratchet-cases.sh, `source`d near the end of this file —
-# split out to keep this file under 1000 lines once a fifth script's cases
-# joined the suite. That file is not standalone; it shares this script's
-# helpers, fixtures, and PASS_COUNT/FAIL_COUNT counters.
-#
-# reborn-coverage-summary.sh and reborn-coverage-comment.sh consume a merged,
-# crate-filtered lcov tracefile (scripts/ci/reborn-coverage-merge-lcov.sh) plus
-# the exemptions manifest (tests/integration/coverage-exemptions.toml schema),
-# not a cargo-llvm-cov JSON export — the coverage-report job in
-# .github/workflows/reborn-tests.yml downloads 5 per-lane lcov artifacts,
-# merges+filters them, then renders. Fixtures below build lcov tracefiles and
-# exemptions TOML by hand rather than shelling out to cargo-llvm-cov.
-#
-# reborn-coverage-comment.sh shells out to `gh api`. It is exercised here
-# against a fake `gh` (a fixture script placed first on PATH) that emulates
-# `gh api --paginate <path> --jq '<filter>'` by running the given jq filter
-# over a canned comments JSON array, and records the verb/path/body of any
-# mutating call (-X POST / -X PATCH) to a log file this suite inspects.
-#
-# reborn-coverage-int-tier-tests.sh derives its repo root from its own path
-# (`$(dirname BASH_SOURCE)/../..`) and `cd`s there, so it cannot simply be
-# pointed at a fixture tree via an argument. Each case copies the real
-# script into a temp tree's scripts/ci/ and builds a tests/integration/
-# subtree next to it, so the copy's own repo-root resolution lands on the
-# temp tree.
+# The suite is self-contained: it builds temporary fixture repositories, runs
+# every case, and reports all failures at the end. M/A/B/C exercise the shared
+# lcov implementation through its real shell callers. The integration
+# inventory has its own Python contract suite below. R lives in
+# the sourced `test-reborn-coverage-ratchet-cases.sh` sibling and shares this
+# file's fixtures and counters. Coverage comments use a fake `gh`; coverage
+# inputs are hand-built LCOV/TOML fixtures rather than compiler output.
 
 set -euo pipefail
 
@@ -54,8 +20,9 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 merge_sh="${script_dir}/reborn-coverage-merge-lcov.sh"
 summary_sh="${script_dir}/reborn-coverage-summary.sh"
 comment_sh="${script_dir}/reborn-coverage-comment.sh"
-int_tier_sh="${script_dir}/reborn-coverage-int-tier-tests.sh"
 ratchet_sh="${script_dir}/reborn-coverage-ratchet.sh"
+
+python3 "${script_dir}/test_integration_test_inventory.py"
 
 tmp_root="$(mktemp -d)"
 trap 'rm -rf "${tmp_root}"' EXIT
@@ -69,6 +36,52 @@ empty_exemptions="${fixtures_dir}/empty-exemptions.toml"
 cat > "${empty_exemptions}" <<'TOML'
 # No entries.
 TOML
+
+# ---------------------------------------------------------------------------
+# The shared fixture crate tree.
+#
+# Both the merge script and the aggregation library resolve their accounting
+# scope from the *discovered* crate inventory (scripts/ci/lib/crate_tree.py),
+# so every case that names a crate needs that crate to exist somewhere. Before
+# #7083 the library keyed on the literal `crates/ironclaw_*` path shape and
+# needed no tree at all — which is exactly why 11 nested crates could go dark
+# with every one of these cases still green.
+#
+# One tree, exported once, covers every section: it holds the crates the
+# fixtures below name (flat and nested), a `wasm-src` guest declaring its own
+# `[workspace]` so the "excluded by construction" rule has a subject, and
+# filler up to the discovery floor. Cases that need a *different* tree (M6)
+# still pass `IRONCLAW_REPO_ROOT` per invocation and override this.
+fixture_repo="${tmp_root}/fixture_repo"
+make_fixture_crate() {
+  local dir="$1" name="$2"
+  mkdir -p "${fixture_repo}/crates/${dir}/src"
+  printf '[package]\nname = "%s"\n' "${name}" \
+    > "${fixture_repo}/crates/${dir}/Cargo.toml"
+}
+for crate in \
+  ironclaw_turn_runner ironclaw_assistant ironclaw_composition \
+  ironclaw_engine ironclaw_example \
+  ironclaw_reborn_full ironclaw_reborn_half ironclaw_reborn_partial \
+  ironclaw_reborn_zero ironclaw_reborn_zero_a ironclaw_reborn_zero_b; do
+  make_fixture_crate "${crate}" "${crate}"
+done
+make_fixture_crate "extensions/ironclaw_extension_support" "ironclaw_extension_support"
+make_fixture_crate "extensions/packages/slack" "ironclaw_slack_extension"
+make_fixture_crate "extensions/packages/telegram" "ironclaw_telegram_extension"
+make_fixture_crate "extensions/packages/mem0" "ironclaw_memory_mem0"
+make_fixture_crate "extensions/packages/memory-native" "ironclaw_memory_native"
+# A guest component rooting its own workspace: never compiled here, so its
+# lines are uncoverable by construction and must not reach any denominator.
+mkdir -p "${fixture_repo}/crates/extensions/packages/slack/wasm-src/src"
+printf '[workspace]\n\n[package]\nname = "slack-user-tool"\n' \
+  > "${fixture_repo}/crates/extensions/packages/slack/wasm-src/Cargo.toml"
+# Filler up to crate_tree.py's MIN_CRATE_DIRECTORIES floor, so discovery is
+# exercised against a realistic tree rather than a handful of fixtures.
+for i in $(seq 1 10); do
+  make_fixture_crate "ironclaw_filler_${i}" "ironclaw_filler_${i}"
+done
+export IRONCLAW_REPO_ROOT="${fixture_repo}"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -167,12 +180,18 @@ capture() {
 # ---------------------------------------------------------------------------
 
 cat > "${fixtures_dir}/m1_part0.lcov" <<'EOF'
-SF:/work/ironclaw/crates/ironclaw_runner/src/runtime.rs
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/runtime.rs
 DA:1,1
 DA:2,0
 DA:3,1
+BRDA:2,0,0,0
+BRDA:2,0,1,1
+BRDA:3,0,0,-
+BRDA:3,0,1,-
 LF:3
 LH:2
+BRF:4
+BRH:1
 end_of_record
 SF:/work/ironclaw/src/main.rs
 DA:1,1
@@ -182,14 +201,20 @@ end_of_record
 EOF
 
 cat > "${fixtures_dir}/m1_part1.lcov" <<'EOF'
-SF:/work/ironclaw/crates/ironclaw_runner/src/runtime.rs
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/runtime.rs
 DA:1,0
 DA:2,1
 DA:3,0
+BRDA:2,0,0,3
+BRDA:2,0,1,0
+BRDA:3,0,0,-
+BRDA:3,0,1,-
 LF:3
 LH:1
+BRF:4
+BRH:1
 end_of_record
-SF:/work/ironclaw/crates/ironclaw_product/src/lib.rs
+SF:/work/ironclaw/crates/ironclaw_assistant/src/lib.rs
 DA:1,1
 DA:2,1
 LF:2
@@ -201,21 +226,36 @@ capture "${merge_sh}" "${tmp_root}/m1_merged.lcov" "${fixtures_dir}/m1_part0.lco
 assert_exit_code "M1: merge exits 0" 0 "${CAP_RC}"
 
 m1_merged_body="$(cat "${tmp_root}/m1_merged.lcov")"
-assert_contains "M1: merged output keeps crates/ironclaw_runner" "${m1_merged_body}" "SF:/work/ironclaw/crates/ironclaw_runner/src/runtime.rs"
+assert_contains "M1: merged output keeps crates/ironclaw_turn_runner" "${m1_merged_body}" "SF:/work/ironclaw/crates/ironclaw_turn_runner/src/runtime.rs"
 assert_not_contains "M1: merged output drops non-crates/ src/main.rs" "${m1_merged_body}" "src/main.rs"
-assert_contains "M1: merged output keeps crates/ironclaw_product" "${m1_merged_body}" "ironclaw_product"
+assert_contains "M1: merged output keeps crates/ironclaw_assistant" "${m1_merged_body}" "ironclaw_assistant"
 assert_contains "M1: per-line DA counts are SUMMED across lanes (line1: 1+0=1)" "${m1_merged_body}" "DA:1,1"
 assert_contains "M1: per-line DA counts are SUMMED across lanes (line2: 0+1=1)" "${m1_merged_body}" "DA:2,1"
 assert_contains "M1: per-line DA counts are SUMMED across lanes (line3: 1+0=1)" "${m1_merged_body}" "DA:3,1"
 assert_contains "M1: LH recomputed from merged counts, not trusted from either lane (all 3 lines now covered)" \
   "${m1_merged_body}" "$(printf 'LF:3\nLH:3')"
+assert_contains "M1: BRDA counts are summed across lanes for the first arm" \
+  "${m1_merged_body}" "BRDA:2,0,0,3"
+assert_contains "M1: BRDA counts are summed across lanes for the second arm" \
+  "${m1_merged_body}" "BRDA:2,0,1,1"
+assert_contains "M1: never-executed BRDA '-' is normalized to zero" \
+  "${m1_merged_body}" "BRDA:3,0,0,0"
+assert_contains "M1: a second never-executed branch remains zero" \
+  "${m1_merged_body}" "BRDA:3,0,1,0"
+assert_contains "M1: BRF/BRH are recomputed from merged branch counts" \
+  "${m1_merged_body}" "$(printf 'BRF:4\nBRH:2')"
 
 # M2: missing input -> non-zero exit, no output file written over a bad arg.
 capture "${merge_sh}" "${tmp_root}/m2_merged.lcov" "${fixtures_dir}/does_not_exist.lcov"
 assert_exit_code "M2: merge exits non-zero for missing input" 1 "${CAP_RC}"
 assert_contains "M2: merge reports missing input file" "${CAP_ERR}" "input lcov file not found"
 
-# M3: single input with zero matching (crates/ironclaw_*) files -> empty output, exit 0.
+# M3: single input with zero matching workspace-crate files -> fail closed.
+# This used to write an empty tracefile and exit 0. That outcome is
+# indistinguishable from "the crate tree moved and every SF: record now falls
+# outside the filter", which is how coverage goes dark while CI stays green
+# (docs/internal/reborn/target-architecture/CHECKLIST.md WS10). Nothing legitimate
+# produces it: the lanes instrument the whole workspace build.
 cat > "${fixtures_dir}/m3_no_match.lcov" <<'EOF'
 SF:/work/ironclaw/src/other.rs
 DA:1,1
@@ -224,20 +264,109 @@ LH:1
 end_of_record
 EOF
 capture "${merge_sh}" "${tmp_root}/m3_merged.lcov" "${fixtures_dir}/m3_no_match.lcov"
-assert_exit_code "M3: merge exits 0 when nothing matches the crate filter" 0 "${CAP_RC}"
-assert_eq "M3: merge writes an empty tracefile when nothing matches" "" "$(cat "${tmp_root}/m3_merged.lcov")"
+assert_exit_code "M3: merge fails closed when nothing matches the crate filter" 1 "${CAP_RC}"
+assert_contains "M3: merge names the empty-report failure" "${CAP_ERR}" \
+  "no workspace crate source files matched"
+assert_eq "M3: merge writes no tracefile when nothing matches" "absent" \
+  "$([ -e "${tmp_root}/m3_merged.lcov" ] && echo present || echo absent)"
+
+# M5: third-party sources whose own path contains `crates/` are NOT workspace
+# crates and must stay out of the report (the vendored-`crates/` trap that a
+# naive `crates/<anything>/` pattern would fall into).
+cat > "${fixtures_dir}/m5_vendored.lcov" <<'EOF'
+SF:/home/runner/.cargo/registry/src/index.crates.io-1949cf8c/wasmtime-46.0.1/crates/wasmtime/src/lib.rs
+DA:1,9
+LF:1
+LH:1
+end_of_record
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/runtime.rs
+DA:1,3
+LF:1
+LH:1
+end_of_record
+EOF
+capture "${merge_sh}" "${tmp_root}/m5_merged.lcov" "${fixtures_dir}/m5_vendored.lcov"
+assert_exit_code "M5: merge exits 0 with one workspace file present" 0 "${CAP_RC}"
+m5_merged_body="$(cat "${tmp_root}/m5_merged.lcov")"
+assert_contains "M5: merge keeps the workspace crate source" "${m5_merged_body}" \
+  "crates/ironclaw_turn_runner/src/runtime.rs"
+assert_not_contains "M5: merge drops a vendored crate that ships its own crates/ dir" \
+  "${m5_merged_body}" "wasmtime"
+
+# M6: the crate filter follows the tree, it is not keyed to `crates/ironclaw_*`.
+# A repo whose crates live in family directories (the target-architecture
+# layout) still merges; the same tracefile against a repo root with no crate
+# tree at all fails closed instead of reporting an empty success.
+m6_root="${tmp_root}/m6_nested_repo"
+mkdir -p "${m6_root}/crates/substrates/ironclaw_event_log/src"
+printf '[package]\nname = "ironclaw_event_log"\n' \
+  > "${m6_root}/crates/substrates/ironclaw_event_log/Cargo.toml"
+# 20 more crate directories so the discovery floor is satisfied by a realistic
+# tree rather than by a single fixture crate.
+for i in $(seq 1 20); do
+  mkdir -p "${m6_root}/crates/domains/ironclaw_filler_${i}/src"
+  printf '[package]\nname = "ironclaw_filler_%s"\n' "${i}" \
+    > "${m6_root}/crates/domains/ironclaw_filler_${i}/Cargo.toml"
+done
+cat > "${fixtures_dir}/m6_nested.lcov" <<'EOF'
+SF:/work/ironclaw/crates/substrates/ironclaw_event_log/src/lib.rs
+DA:1,4
+DA:2,0
+LF:2
+LH:1
+end_of_record
+EOF
+capture env IRONCLAW_REPO_ROOT="${m6_root}" \
+  "${merge_sh}" "${tmp_root}/m6_merged.lcov" "${fixtures_dir}/m6_nested.lcov"
+assert_exit_code "M6: merge finds a crate nested under a family directory" 0 "${CAP_RC}"
+assert_contains "M6: merged output keeps the nested crate source" \
+  "$(cat "${tmp_root}/m6_merged.lcov")" \
+  "SF:/work/ironclaw/crates/substrates/ironclaw_event_log/src/lib.rs"
+
+m6_empty_root="${tmp_root}/m6_no_crate_tree"
+mkdir -p "${m6_empty_root}"
+capture env IRONCLAW_REPO_ROOT="${m6_empty_root}" \
+  "${merge_sh}" "${tmp_root}/m6_empty_merged.lcov" "${fixtures_dir}/m6_nested.lcov"
+assert_exit_code "M6: merge fails closed when the crate tree is missing" 1 "${CAP_RC}"
+assert_contains "M6: merge names the missing crate tree" "${CAP_ERR}" \
+  "crate discovery cannot run"
+
+# M4: separate cargo-llvm-cov reports without trailing newlines remain
+# separate records. This is the shape consumed by the crate-bucket workflow;
+# raw concatenation would corrupt the boundary as `end_of_recordSF:...`.
+printf '%s' \
+  'SF:/work/ironclaw/crates/extensions/packages/slack/src/attachment_transfer.rs
+DA:100,7
+LF:1
+LH:1
+end_of_record' > "${fixtures_dir}/m4_slack.lcov"
+printf '%s' \
+  'SF:/work/ironclaw/crates/extensions/packages/telegram/src/attachment_transfer.rs
+DA:100,5
+LF:1
+LH:1
+end_of_record' > "${fixtures_dir}/m4_telegram.lcov"
+capture "${merge_sh}" "${tmp_root}/m4_merged.lcov" \
+  "${fixtures_dir}/m4_slack.lcov" \
+  "${fixtures_dir}/m4_telegram.lcov"
+assert_exit_code "M4: merge accepts reports without trailing newlines" 0 "${CAP_RC}"
+m4_merged_body="$(cat "${tmp_root}/m4_merged.lcov")"
+assert_contains "M4: merge keeps the first package report" \
+  "${m4_merged_body}" "extensions/packages/slack/src/attachment_transfer.rs"
+assert_contains "M4: merge keeps the next package report" \
+  "${m4_merged_body}" "extensions/packages/telegram/src/attachment_transfer.rs"
 
 # ---------------------------------------------------------------------------
 # A. reborn-coverage-summary.sh (default report mode)
 # ---------------------------------------------------------------------------
 
 cat > "${fixtures_dir}/a1_mixed.lcov" <<'EOF'
-SF:/work/ironclaw/crates/ironclaw_runner/src/runtime.rs
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/runtime.rs
 DA:1,1
 LF:100
 LH:80
 end_of_record
-SF:/work/ironclaw/crates/ironclaw_product/src/lib.rs
+SF:/work/ironclaw/crates/ironclaw_assistant/src/lib.rs
 LF:50
 LH:50
 end_of_record
@@ -247,9 +376,9 @@ capture "${summary_sh}" "${fixtures_dir}/a1_mixed.lcov" "${empty_exemptions}"
 assert_exit_code "A1: summary exits 0 for a mixed-crate fixture" 0 "${CAP_RC}"
 assert_contains "A1: aggregate matches hand-computed 86.67% (130/150)" "${CAP_OUT}" \
   '**Line coverage (Reborn crates): 86.67%** — 130 / 150 lines'
-assert_contains "A1: table includes ironclaw_runner row" "${CAP_OUT}" "| \`ironclaw_runner\` | 80% | 80 / 100 |"
-assert_contains "A1: table includes ironclaw_product row" "${CAP_OUT}" \
-  "| \`ironclaw_product\` | 100% | 50 / 50 |"
+assert_contains "A1: table includes ironclaw_turn_runner row" "${CAP_OUT}" "| \`ironclaw_turn_runner\` | 80% | 80 / 100 |"
+assert_contains "A1: table includes ironclaw_assistant row" "${CAP_OUT}" \
+  "| \`ironclaw_assistant\` | 100% | 50 / 50 |"
 
 # A2: no data at all -> exit 0, "no data" message.
 : > "${fixtures_dir}/a2_empty.lcov"
@@ -307,6 +436,186 @@ assert_not_contains "A6: non-crates/ file excluded from the table" "${CAP_OUT}" 
 assert_contains "A6: aggregate drops the non-crates file's 999 lines (5/10, not 5/1009)" "${CAP_OUT}" \
   '**Line coverage (Reborn crates): 50%** — 5 / 10 lines'
 
+# A6b (#7083): a crate nested under a family/package directory is accounted
+# for — in the per-crate table AND in the global aggregate, which the same
+# `if match:` gate guards. This is the regression the flat
+# `crates/(ironclaw_[A-Za-z0-9_]+)/` shape produced once #7037 colocated
+# packages: 11 crates, ~33.7k instrumented lines, contributing zero to a gate
+# that read `enforce = true` and went green. Note `slack` and
+# `ironclaw_extension_support` together — the first proves a directory basename
+# containing no `ironclaw` at all resolves (PROPOSAL §5.1 names package
+# directories by extension identity), which no `ironclaw_*` regex can reach.
+cat > "${fixtures_dir}/a6b_nested.lcov" <<'EOF'
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/a.rs
+LF:10
+LH:5
+end_of_record
+SF:/work/ironclaw/crates/extensions/packages/slack/src/channel.rs
+LF:100
+LH:80
+end_of_record
+SF:/work/ironclaw/crates/extensions/ironclaw_extension_support/src/packages/mod.rs
+LF:90
+LH:45
+end_of_record
+EOF
+capture "${summary_sh}" "${fixtures_dir}/a6b_nested.lcov" "${empty_exemptions}"
+assert_exit_code "A6b: nested-crate fixture summary exits 0" 0 "${CAP_RC}"
+assert_contains "A6b: a package crate whose directory basename is not ironclaw_* is in the table" \
+  "${CAP_OUT}" "| \`slack\` | 80% | 80 / 100 |"
+assert_contains "A6b: a crate nested one level under crates/ is in the table" \
+  "${CAP_OUT}" "| \`ironclaw_extension_support\` | 50% | 45 / 90 |"
+assert_contains "A6b: flat crates still resolve unchanged" "${CAP_OUT}" \
+  "| \`ironclaw_turn_runner\` | 50% | 5 / 10 |"
+assert_contains "A6b: nested crates reach the global aggregate too (130/200, not 5/10)" \
+  "${CAP_OUT}" '**Line coverage (Reborn crates): 65%** — 130 / 200 lines'
+
+# A6c (#7083): a guest component that roots its own cargo workspace is never
+# compiled by this workspace, so no line inside it is coverable and none may
+# enter the denominator. crate_tree.py prunes it; this pins that the aggregator
+# inherits that pruning rather than promoting the guest to a crate.
+cat > "${fixtures_dir}/a6c_guest.lcov" <<'EOF'
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/a.rs
+LF:10
+LH:5
+end_of_record
+SF:/work/ironclaw/crates/extensions/packages/slack/wasm-src/src/lib.rs
+LF:5000
+LH:0
+end_of_record
+EOF
+capture "${summary_sh}" "${fixtures_dir}/a6c_guest.lcov" "${empty_exemptions}"
+assert_exit_code "A6c: separate-workspace guest fixture exits 0" 0 "${CAP_RC}"
+assert_not_contains "A6c: the guest is not a crate of this workspace" "${CAP_OUT}" "wasm-src"
+assert_contains "A6c: the guest's 5000 uncoverable lines stay out of the aggregate" \
+  "${CAP_OUT}" '**Line coverage (Reborn crates): 50%** — 5 / 10 lines'
+
+# A6d (#7083): a vendored third-party source that ships its own `crates/`
+# subdirectory must not be attributed to this workspace. The aggregator anchors
+# on the discovered inventory for the same reason the merge script does.
+cat > "${fixtures_dir}/a6d_vendored.lcov" <<'EOF'
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/a.rs
+LF:10
+LH:5
+end_of_record
+SF:/home/runner/.cargo/registry/src/index/wasmtime-46.0.1/crates/wasmtime/src/lib.rs
+LF:7000
+LH:7000
+end_of_record
+EOF
+capture "${summary_sh}" "${fixtures_dir}/a6d_vendored.lcov" "${empty_exemptions}"
+assert_exit_code "A6d: vendored-source fixture exits 0" 0 "${CAP_RC}"
+assert_not_contains "A6d: a vendored crates/ subtree is not a workspace crate" \
+  "${CAP_OUT}" "wasmtime"
+assert_contains "A6d: vendored lines stay out of the aggregate" "${CAP_OUT}" \
+  '**Line coverage (Reborn crates): 50%** — 5 / 10 lines'
+
+# A6e (#7083): the aggregator fails closed when the crate tree cannot be
+# discovered. Reporting a percentage computed over an empty inventory is the
+# WS10 silent-dark failure this whole fix exists to close, so "no tree" must be
+# a refusal, never a 0%/100% number.
+a6e_empty_root="${tmp_root}/a6e_no_crate_tree"
+mkdir -p "${a6e_empty_root}"
+capture env IRONCLAW_REPO_ROOT="${a6e_empty_root}" \
+  "${summary_sh}" "${fixtures_dir}/a6b_nested.lcov" "${empty_exemptions}"
+assert_exit_code "A6e: summary refuses when the crate tree is missing" 1 "${CAP_RC}"
+assert_contains "A6e: names the missing crate tree" "${CAP_ERR}" \
+  "crate discovery cannot run"
+
+# A6f (#7083, review): two crate directories sharing a basename must be a
+# refusal, not a silently merged bucket. `crate_key()` reduces a directory to
+# its basename, so a collision would fold two crates into one row and one
+# ratchet floor — a quieter version of the same bug, since the merged number
+# looks plausible. Unreachable on today's tree (all 65 basenames are distinct);
+# reachable the moment crates move under family directories.
+a6f_root="${tmp_root}/a6f_colliding_basenames"
+mkdir -p "${a6f_root}/crates"
+for i in $(seq 1 22); do
+  mkdir -p "${a6f_root}/crates/ironclaw_filler_${i}/src"
+  printf '[package]\nname = "ironclaw_filler_%s"\n' "${i}" \
+    > "${a6f_root}/crates/ironclaw_filler_${i}/Cargo.toml"
+done
+for family in domains substrates; do
+  mkdir -p "${a6f_root}/crates/${family}/ironclaw_threads/src"
+  printf '[package]\nname = "ironclaw_threads"\n' \
+    > "${a6f_root}/crates/${family}/ironclaw_threads/Cargo.toml"
+done
+capture env IRONCLAW_REPO_ROOT="${a6f_root}" \
+  "${summary_sh}" "${fixtures_dir}/a6b_nested.lcov" "${empty_exemptions}"
+assert_exit_code "A6f: colliding crate basenames are a refusal, not a merged bucket" 1 "${CAP_RC}"
+assert_contains "A6f: names both colliding directories" "${CAP_ERR}" \
+  "crates/domains/ironclaw_threads and crates/substrates/ironclaw_threads"
+assert_contains "A6f: says why a merged number is refused" "${CAP_ERR}" \
+  "one bucket and one floor"
+
+# A6g (#7083, review): the adversarial companion to A6d/M5.
+#
+# The inventory anchor is a path-*suffix* match, so a source outside the
+# repository that repeats a discovered crate directory verbatim
+# (`.../foreign-1.0.0/crates/extensions/packages/slack/src/lib.rs`) is
+# attributed to that crate. A6d and M5 do not exercise this: their `wasmtime`
+# path matches no inventory entry, so they prove the filter *runs* — not that
+# it is contained. A fixture that passes because its input never reaches the
+# code under test is the failure mode this whole file exists to kill, so the
+# input that does reach it is supplied here.
+#
+# What this pins is the property that actually protects the accounting: the
+# producer (`reborn-coverage-merge-lcov.sh`, which filters every record the
+# aggregator ever sees) and the consumer (`lib/reborn_coverage_lcov.py`) make
+# the SAME call on it. Restricting only the consumer to paths contained under
+# the resolved repo root was reviewed and deliberately not taken: the producer
+# applies the identical `(?:^|/)` inventory anchor with no containment, so a
+# one-sided rule puts the two halves back out of step — and producer/consumer
+# disagreement is exactly what made #7083 silent instead of loud. Whichever way
+# the rule goes it goes in both halves at once (and in `crate_tree.py`, which
+# both already share). This case is what turns a one-sided change red.
+#
+# Unreachable from the real pipeline as it stands: `cargo llvm-cov` emits only
+# workspace-member sources, so every `SF:` record in a lane tracefile already
+# lives under the checkout root — 1067 of 1067 per lane, 1139 of 1139 merged,
+# measured on run 30865483401. The guard is for the day that stops being true.
+cat > "${fixtures_dir}/a6g_vendored_collision.lcov" <<'EOF'
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/a.rs
+DA:1,1
+DA:2,0
+LF:2
+LH:1
+end_of_record
+SF:/home/runner/.cargo/registry/src/index/foreign-1.0.0/crates/extensions/packages/slack/src/lib.rs
+DA:1,1
+DA:2,1
+LF:2
+LH:2
+end_of_record
+EOF
+# Both halves are asked about the SAME fixture, in parallel — the merge script
+# on it, and the summary on it directly (as every other A-section case does),
+# not on the merge's output. Chaining them would only ever compare the consumer
+# against a record the producer had already dropped, so a producer-only change
+# would stay invisible; the two verdicts have to be independent for the
+# comparison to mean anything in both directions.
+capture "${merge_sh}" "${tmp_root}/a6g_merged.lcov" \
+  "${fixtures_dir}/a6g_vendored_collision.lcov"
+assert_exit_code "A6g: merge exits 0 on the vendored-collision fixture" 0 "${CAP_RC}"
+if grep -q "foreign-1.0.0" "${tmp_root}/a6g_merged.lcov"; then
+  a6g_producer="kept"
+else
+  a6g_producer="dropped"
+fi
+capture "${summary_sh}" "${fixtures_dir}/a6g_vendored_collision.lcov" "${empty_exemptions}"
+assert_exit_code "A6g: summary exits 0 on the vendored-collision fixture" 0 "${CAP_RC}"
+if [[ "${CAP_OUT}" == *"| \`slack\` |"* ]]; then
+  a6g_consumer="kept"
+else
+  a6g_consumer="dropped"
+fi
+assert_eq "A6g: producer and consumer make the same call on a vendored path that repeats a crate directory" \
+  "${a6g_producer}" "${a6g_consumer}"
+assert_eq "A6g: today both halves keep it — containment belongs in both or neither" \
+  "kept" "${a6g_producer}"
+assert_contains "A6g: the mis-attribution is stated, not implied — the vendored lines land in the slack bucket" \
+  "${CAP_OUT}" "| \`slack\` | 100% | 2 / 2 |"
+
 # A7: exemptions manifest excludes a file from the accounting entirely and
 # lists it in the report's own Exemptions section.
 cat > "${fixtures_dir}/a7_exemptions.toml" <<'TOML'
@@ -359,27 +668,27 @@ assert_contains "A9: non-crates/-prefixed exemption module reports the validatio
 # (never `entry["module"]` — that key doesn't exist on this entry shape, the
 # structural regression this case pins).
 cat > "${fixtures_dir}/a10_two_crates.lcov" <<'EOF'
-SF:/work/ironclaw/crates/ironclaw_embeddings/src/a.rs
+SF:/work/ironclaw/crates/ironclaw_example/src/a.rs
 LF:10
 LH:0
 end_of_record
-SF:/work/ironclaw/crates/ironclaw_runner/src/a.rs
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/a.rs
 LF:10
 LH:5
 end_of_record
 EOF
 cat > "${fixtures_dir}/a10_crate_exemption.toml" <<'TOML'
 [[exemption]]
-crate = "ironclaw_embeddings"
+crate = "ironclaw_example"
 reason = "v1-only: consumed exclusively by the root ironclaw package"
 issue = "https://github.com/nearai/ironclaw/issues/1"
 TOML
 capture "${summary_sh}" "${fixtures_dir}/a10_two_crates.lcov" "${fixtures_dir}/a10_crate_exemption.toml"
 assert_exit_code "A10: whole-crate exemption exits 0 (no KeyError on missing 'module')" 0 "${CAP_RC}"
-assert_not_contains "A10: exempted crate dropped from the per-crate table" "${CAP_OUT}" "| \`ironclaw_embeddings\` |"
+assert_not_contains "A10: exempted crate dropped from the per-crate table" "${CAP_OUT}" "| \`ironclaw_example\` |"
 assert_contains "A10: exempted crate kept out of the table, other crate still reported" "${CAP_OUT}" \
-  "| \`ironclaw_runner\` | 50% | 5 / 10 |"
-assert_contains "A10: whole-crate exemption listed under its 'crate: X' label" "${CAP_OUT}" "\`crate: ironclaw_embeddings\`"
+  "| \`ironclaw_turn_runner\` | 50% | 5 / 10 |"
+assert_contains "A10: whole-crate exemption listed under its 'crate: X' label" "${CAP_OUT}" "\`crate: ironclaw_example\`"
 assert_contains "A10: aggregate excludes the exempted crate's lines (5/10, not 5/20)" "${CAP_OUT}" \
   '**Line coverage (Reborn crates): 50%** — 5 / 10 lines'
 
@@ -387,19 +696,19 @@ assert_contains "A10: aggregate excludes the exempted crate's lines (5/10, not 5
 # entry) renders both, sorted together by their shared `label` field.
 cat > "${fixtures_dir}/a11_mixed_forms.toml" <<'TOML'
 [[exemption]]
-module = "crates/ironclaw_runner/src/a.rs"
+module = "crates/ironclaw_turn_runner/src/a.rs"
 reason = "per-file exemption"
 issue = "https://github.com/nearai/ironclaw/issues/2"
 
 [[exemption]]
-crate = "ironclaw_embeddings"
+crate = "ironclaw_example"
 reason = "whole-crate exemption"
 issue = "https://github.com/nearai/ironclaw/issues/1"
 TOML
 capture "${summary_sh}" "${fixtures_dir}/a10_two_crates.lcov" "${fixtures_dir}/a11_mixed_forms.toml"
 assert_exit_code "A11: mixed module+crate manifest exits 0" 0 "${CAP_RC}"
-assert_contains "A11: per-file form still rendered by its module path" "${CAP_OUT}" "\`crates/ironclaw_runner/src/a.rs\`"
-assert_contains "A11: whole-crate form still rendered by its 'crate: X' label" "${CAP_OUT}" "\`crate: ironclaw_embeddings\`"
+assert_contains "A11: per-file form still rendered by its module path" "${CAP_OUT}" "\`crates/ironclaw_turn_runner/src/a.rs\`"
+assert_contains "A11: whole-crate form still rendered by its 'crate: X' label" "${CAP_OUT}" "\`crate: ironclaw_example\`"
 assert_contains "A11: both exemptions fully drain the table (no data left)" "${CAP_OUT}" \
   "No Reborn crate coverage data found"
 
@@ -407,8 +716,8 @@ assert_contains "A11: both exemptions fully drain the table (no data left)" "${C
 # validation rejects it instead of silently preferring one key.
 cat > "${fixtures_dir}/a12_both_keys.toml" <<'TOML'
 [[exemption]]
-module = "crates/ironclaw_runner/src/a.rs"
-crate = "ironclaw_embeddings"
+module = "crates/ironclaw_turn_runner/src/a.rs"
+crate = "ironclaw_example"
 reason = "ambiguous"
 issue = "https://github.com/nearai/ironclaw/issues/1"
 TOML
@@ -470,7 +779,7 @@ assert_eq "B3: empty lcov --zero-crates emits nothing" "" "${CAP_OUT}"
 
 # B4: a whole-crate `crate =` exemption drops its zero-covered crate from
 # --zero-crates too, not just from the report-mode table (A10 only covers
-# report mode; reuses that fixture — ironclaw_embeddings is 0/10, exempted).
+# report mode; reuses that fixture — ironclaw_example is 0/10, exempted).
 capture "${summary_sh}" --zero-crates "${fixtures_dir}/a10_two_crates.lcov" "${fixtures_dir}/a10_crate_exemption.toml"
 assert_exit_code "B4: --zero-crates with a whole-crate exemption exits 0" 0 "${CAP_RC}"
 assert_eq "B4: exempted zero-covered crate is excluded from --zero-crates output" "" "${CAP_OUT}"
@@ -559,7 +868,7 @@ GHEOF
 chmod +x "${gh_bin_dir}/gh"
 
 cat > "${fixtures_dir}/c_basic_coverage.lcov" <<'EOF'
-SF:/work/ironclaw/crates/ironclaw_runner/src/a.rs
+SF:/work/ironclaw/crates/ironclaw_turn_runner/src/a.rs
 LF:10
 LH:8
 end_of_record
@@ -727,7 +1036,7 @@ fi
 
 # C9: a zero-covered crate excluded by a whole-crate exemption must not surface
 # in the sticky comment's 0-coverage callout (reuses the A10/B4 fixture pair —
-# ironclaw_embeddings is 0/10 but exempted, ironclaw_runner is 5/10 not zero).
+# ironclaw_example is 0/10 but exempted, ironclaw_turn_runner is 5/10 not zero).
 c9_log="${tmp_root}/c9-gh.log"
 capture env \
   GH_TOKEN="fake-token" \
@@ -801,7 +1110,7 @@ fi
 # never gates). Pins PR #5718 user comment.
 cat > "${fixtures_dir}/c12_malformed_floor.toml" <<'TOML'
 [[crate]]
-name = "ironclaw_runner"
+name = "ironclaw_turn_runner"
 floor_percent = 90.0
 TOML
 c12_log="${tmp_root}/c12-gh.log"
@@ -821,140 +1130,6 @@ if [ -f "${c12_log}" ]; then
 else
   report_fail "C12: fake gh did not record a mutation (comment must still render/upsert)"
 fi
-
-# ---------------------------------------------------------------------------
-# D. reborn-coverage-int-tier-tests.sh (int-tier suite discovery)
-# ---------------------------------------------------------------------------
-#
-# The script derives its repo root from its own path and `cd`s there, so
-# each case copies it into a fresh temp tree's scripts/ci/ and builds a
-# tests/integration/ subtree alongside it, then invokes the copy. Discovery
-# is registration-driven (see that script's header comment): every `[[test]]`
-# entry in Cargo.toml whose `path` sits under tests/integration/ is selected,
-# so each case seeds a fake Cargo.toml with one `[[test]]` block per fixture
-# suite it constructs — mirrors the real repo root always having a `[[test]]`
-# entry per suite. The on-disk fixture files are kept for tree realism; an
-# unregistered file must never be selected (D6).
-
-setup_int_tier_case() {
-  local case_dir="$1"
-  shift
-  mkdir -p "${case_dir}/scripts/ci" "${case_dir}/tests/integration"
-  cp "${int_tier_sh}" "${case_dir}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-  chmod +x "${case_dir}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-  : > "${case_dir}/Cargo.toml"
-  local candidate
-  for candidate in "$@"; do
-    cat >>"${case_dir}/Cargo.toml" <<EOF
-[[test]]
-name = "${candidate}"
-path = "tests/integration/${candidate}.rs"
-
-EOF
-  done
-}
-
-# D1: empty tests/integration/ -> non-zero exit + discovery error.
-d1="${tmp_root}/d1"
-setup_int_tier_case "${d1}"
-capture "${d1}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-assert_exit_code "D1: empty tests/integration/ exits non-zero" 1 "${CAP_RC}"
-assert_contains "D1: empty tests/integration/ prints the discovery error" "${CAP_ERR}" \
-  "No Reborn integration-tier test binaries discovered"
-
-# D2: one tests/integration/foo.rs -> --test / reborn_integration_foo.
-d2="${tmp_root}/d2"
-setup_int_tier_case "${d2}" reborn_integration_foo
-: > "${d2}/tests/integration/foo.rs"
-capture "${d2}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-assert_exit_code "D2: single flat integration file exits 0" 0 "${CAP_RC}"
-assert_eq "D2: single flat integration file emits its --test pair" \
-  "$(printf -- '--test\nreborn_integration_foo')" "${CAP_OUT}"
-
-# D3: one tests/integration/group_bar/main.rs -> --test / reborn_group_bar.
-d3="${tmp_root}/d3"
-setup_int_tier_case "${d3}" reborn_group_bar
-mkdir -p "${d3}/tests/integration/group_bar"
-: > "${d3}/tests/integration/group_bar/main.rs"
-capture "${d3}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-assert_exit_code "D3: single group dir exits 0" 0 "${CAP_RC}"
-assert_eq "D3: single group dir emits its --test pair, dir->name rewrite applied" \
-  "$(printf -- '--test\nreborn_group_bar')" "${CAP_OUT}"
-
-# D3b: a half-scaffolded group dir (no main.rs yet) is skipped, not errored.
-d3b="${tmp_root}/d3b"
-setup_int_tier_case "${d3b}" reborn_group_bar
-mkdir -p "${d3b}/tests/integration/group_bar" "${d3b}/tests/integration/group_incomplete"
-: > "${d3b}/tests/integration/group_bar/main.rs"
-capture "${d3b}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-assert_exit_code "D3b: half-scaffolded group dir does not error the whole discovery" 0 "${CAP_RC}"
-assert_eq "D3b: half-scaffolded group dir (no main.rs) is skipped" \
-  "$(printf -- '--test\nreborn_group_bar')" "${CAP_OUT}"
-
-# D4: multiple files + dirs, created out of alphabetical order -> sorted,
-# deduped output. Group dirs ('g') sort before integration files ('i').
-d4="${tmp_root}/d4"
-setup_int_tier_case "${d4}" reborn_group_beta reborn_group_omega reborn_integration_alpha reborn_integration_zeta
-: > "${d4}/tests/integration/zeta.rs"
-: > "${d4}/tests/integration/alpha.rs"
-mkdir -p "${d4}/tests/integration/group_omega" "${d4}/tests/integration/group_beta"
-: > "${d4}/tests/integration/group_omega/main.rs"
-: > "${d4}/tests/integration/group_beta/main.rs"
-capture "${d4}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-assert_exit_code "D4: multiple suites exits 0" 0 "${CAP_RC}"
-assert_eq "D4: multiple suites sorted+deduped in expected order" \
-  "$(printf -- '--test\nreborn_group_beta\n--test\nreborn_group_omega\n--test\nreborn_integration_alpha\n--test\nreborn_integration_zeta')" \
-  "${CAP_OUT}"
-
-# D5: a `support/` subdirectory alongside the flat files must not be
-# mistaken for a suite (no main.rs, and doesn't match the `group_*` name
-# pattern either) — mirrors the real tests/integration/support/ harness tree.
-d5="${tmp_root}/d5"
-setup_int_tier_case "${d5}" reborn_integration_only
-: > "${d5}/tests/integration/only.rs"
-mkdir -p "${d5}/tests/integration/support"
-: > "${d5}/tests/integration/support/mod.rs"
-capture "${d5}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-assert_exit_code "D5: support/ dir alongside flat suites exits 0" 0 "${CAP_RC}"
-assert_eq "D5: support/ dir is not discovered as a suite" \
-  "$(printf -- '--test\nreborn_integration_only')" "${CAP_OUT}"
-
-# D6: domain-folder bins (tests/integration/auth/oauth_connect.rs) are
-# selected via their [[test]] registration, while a #[path]-mounted sibling
-# with no [[test]] entry (auth/common.rs) is not. Pins the #6520-audit blind
-# spot: the retired `find -maxdepth 1` walk could not see domain-folder bins,
-# so the six tests/integration/auth/ suites ran in no PR coverage lane.
-# The third stanza writes `path` BEFORE `name` and the fourth uses compact
-# `key="value"` spacing with a trailing comment: Cargo accepts all of these,
-# so the selector must too — a line-regex parser keyed to one formatting
-# style would silently skip such stanzas and recreate the blind spot this
-# case pins.
-d6="${tmp_root}/d6"
-setup_int_tier_case "${d6}" reborn_integration_flat
-: > "${d6}/tests/integration/flat.rs"
-mkdir -p "${d6}/tests/integration/auth"
-: > "${d6}/tests/integration/auth/oauth_connect.rs"
-: > "${d6}/tests/integration/auth/common.rs"
-: > "${d6}/tests/integration/auth/pathfirst_probe.rs"
-: > "${d6}/tests/integration/auth/compact_probe.rs"
-cat >>"${d6}/Cargo.toml" <<'EOF'
-[[test]]
-name = "reborn_integration_oauth_connect"
-path = "tests/integration/auth/oauth_connect.rs"
-
-[[test]]
-path = "tests/integration/auth/pathfirst_probe.rs"
-name = "reborn_integration_pathfirst_probe"
-
-[[test]]
-name="reborn_integration_compact_probe" # compact TOML: no spaces, trailing comment
-path="tests/integration/auth/compact_probe.rs"
-EOF
-capture "${d6}/scripts/ci/reborn-coverage-int-tier-tests.sh"
-assert_exit_code "D6: domain-folder bin exits 0" 0 "${CAP_RC}"
-assert_eq "D6: registered domain-folder bins (any key order or spacing) are selected; unregistered sibling is not" \
-  "$(printf -- '--test\nreborn_integration_compact_probe\n--test\nreborn_integration_flat\n--test\nreborn_integration_oauth_connect\n--test\nreborn_integration_pathfirst_probe')" \
-  "${CAP_OUT}"
 
 # ---------------------------------------------------------------------------
 # R. reborn-coverage-ratchet.sh (coverage-floor ratchet gate)

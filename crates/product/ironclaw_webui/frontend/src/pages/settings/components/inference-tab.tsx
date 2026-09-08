@@ -1,0 +1,189 @@
+import { Badge } from "../../../design-system/badge";
+import { Card } from "../../../design-system/card";
+import { Skeleton } from "../../../design-system/skeleton";
+import { useT } from "../../../lib/i18n";
+import { INFERENCE_FIELDS } from "../lib/settings-schema";
+import { filterSettingsSections, matchesSearch } from "../lib/settings-search";
+import { ProviderManagement } from "./provider-management";
+import { SettingsGroup } from "./settings-field";
+import { SettingsSearchEmpty } from "./settings-search-empty";
+import { useLlmProviders } from "../hooks/useLlmProviders";
+import { UserModelPreferenceSelector } from "./user-model-preference-selector";
+import { ModelSelectionPolicyEditor } from "./model-selection-policy-editor";
+import { modelEntryFor, normalizeModelCatalog } from "../lib/model-capabilities";
+import { ModelCapabilityBadges } from "./model-capability-badges";
+
+type InferenceTabProps = {
+  isAdmin?: boolean;
+  settings: Record<string, unknown> & { selected_model?: string };
+  gatewayStatus?: { llm_backend?: string; llm_model?: string } | null;
+  onSave: (key: string, value: unknown) => void;
+  savedKeys: Record<string, boolean>;
+  isLoading: boolean;
+  searchQuery?: string;
+};
+
+export function InferenceTab({
+  isAdmin = false,
+  settings,
+  gatewayStatus,
+  onSave,
+  savedKeys,
+  isLoading,
+  searchQuery = "",
+}: InferenceTabProps) {
+  const t = useT();
+  // Source the active backend/model from the `/llm/providers` snapshot (the
+  // same query the provider list below renders from) rather than the empty
+  // settings/gatewayStatus stubs, which left the Model field showing "—".
+  // Shares the `["llm-providers"]` react-query cache, so no extra fetch.
+  const providerState = useLlmProviders({
+    settings,
+    gatewayStatus,
+    enabled: isAdmin,
+  });
+  const { activeProviderId, selectedModel, providers, hasActiveProvider } = providerState;
+  if (isLoading) {
+    return (<SettingsSkeleton />);
+  }
+
+  // `activeProviderId` falls back to `nearai` for downstream defaults, so the
+  // summary must gate on `hasActiveProvider` — otherwise a first-run/unconfigured
+  // deployment shows `nearai` with a positive Active badge that isn't true.
+  const backend = hasActiveProvider ? activeProviderId : "";
+  // Match the provider card's fallback (active model → provider default_model)
+  // so the summary never shows "—" while the list below shows a model.
+  const activeProvider = providers.find((provider) => provider.id === activeProviderId);
+  const model = hasActiveProvider
+    ? selectedModel || activeProvider?.default_model || settings.selected_model || ""
+    : "";
+  const policyCatalog = normalizeModelCatalog({
+    models:
+      providerState.userModelPolicy?.provider_id === activeProviderId
+        ? providerState.userModelPolicy.allowed_models
+        : [],
+    model_entries:
+      providerState.userModelPolicy?.provider_id === activeProviderId
+        ? providerState.userModelPolicy.model_entries
+        : [],
+  });
+  const activeModelEntry = modelEntryFor(policyCatalog.modelEntries, model);
+  const sections = filterSettingsSections(INFERENCE_FIELDS, settings, searchQuery, t);
+  const showProviderSummary = matchesSearch(searchQuery, [
+    t("inference.provider"),
+    t("inference.backend"),
+    backend,
+    t("inference.model"),
+    model,
+  ]);
+  const showProviderManagement = matchesSearch(searchQuery, [
+    t("llm.providers"),
+    t("llm.providersDesc"),
+    t("llm.addProvider"),
+    "llm",
+    "provider",
+    "openai",
+    "anthropic",
+    "ollama",
+    "near",
+  ]);
+
+  if (isAdmin && !showProviderSummary && !showProviderManagement && sections.length === 0) {
+    return (<SettingsSearchEmpty query={searchQuery} />);
+  }
+
+  return (
+    <div className="space-y-5">
+      {isAdmin && <ModelSelectionPolicyEditor providerState={providerState} />}
+
+      <UserModelPreferenceSelector />
+
+      {isAdmin && showProviderSummary &&
+      (
+      <Card padding="none" className="p-4 sm:p-5">
+        <h3 className="mb-4 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--v2-accent-text)]">{t("inference.provider")}</h3>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="rounded-md border border-[var(--v2-panel-border)] bg-[var(--v2-surface-soft)] px-4 py-3">
+            <div className="text-xs text-[var(--v2-text-muted)]">{t("inference.backend")}</div>
+            <div className="mt-1 flex items-center gap-2">
+              <span className="font-mono text-lg font-semibold text-[var(--v2-text-strong)]">{backend || t("inference.none")}</span>
+              {hasActiveProvider
+                ? (<Badge tone="positive" label={t("inference.active")} size="sm" />)
+                : (<Badge tone="muted" label={t("llm.notConfigured")} size="sm" />)}
+            </div>
+          </div>
+          <div className="rounded-md border border-[var(--v2-panel-border)] bg-[var(--v2-surface-soft)] px-4 py-3">
+            <div className="text-xs text-[var(--v2-text-muted)]">{t("inference.model")}</div>
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <span className="font-mono text-lg font-semibold text-[var(--v2-text-strong)]">
+                {model || t("inference.none")}
+              </span>
+              <ModelCapabilityBadges entry={activeModelEntry} />
+            </div>
+          </div>
+        </div>
+      </Card>
+      )}
+
+      {isAdmin && showProviderManagement &&
+      (
+        <ProviderManagement
+          settings={settings}
+          gatewayStatus={gatewayStatus}
+          searchQuery={searchQuery}
+        />
+      )}
+
+      {isAdmin && sections.map(
+        (section) =>
+          (
+            <SettingsGroup
+              key={section.groupKey}
+              groupKey={section.groupKey}
+              fields={section.fields}
+              settings={settings}
+              onSave={onSave}
+              savedKeys={savedKeys}
+            />
+          )
+      )}
+    </div>
+  );
+}
+
+function SettingsSkeleton() {
+  return (
+    <div className="space-y-5">
+      <Card padding="md">
+        <Skeleton className="mb-4 h-3 w-24 rounded" />
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="rounded-md border border-[var(--v2-panel-border)] bg-[var(--v2-surface-soft)] p-4">
+            <Skeleton className="h-3 w-16 rounded" />
+            <Skeleton className="mt-2 h-6 w-28 rounded" />
+          </div>
+          <div className="rounded-md border border-[var(--v2-panel-border)] bg-[var(--v2-surface-soft)] p-4">
+            <Skeleton className="h-3 w-16 rounded" />
+            <Skeleton className="mt-2 h-6 w-40 rounded" />
+          </div>
+        </div>
+      </Card>
+      {[1, 2].map(
+        (i) =>
+          (
+            <Card key={i} padding="md">
+              <Skeleton className="mb-4 h-3 w-20 rounded" />
+              {[1, 2, 3].map(
+                (j) =>
+                  (
+                    <div key={j} className="flex items-center justify-between border-t border-[var(--v2-panel-border)] py-4 first:border-0">
+                      <Skeleton className="h-4 w-32 rounded" />
+                      <Skeleton className="h-9 w-36 rounded" />
+                    </div>
+                  )
+              )}
+            </Card>
+          )
+      )}
+    </div>
+  );
+}
