@@ -688,7 +688,11 @@ impl ExtensionRuntimeV2 {
 /// Attribution contract a hosted-MCP provider opted into (v3 `[mcp]
 /// attribution`). Absent for every provider that did not explicitly request
 /// caller attribution — the host stamps nothing for them.
+// Persisted on `ResolvedExtensionManifest`, so it follows the repo's
+// snake_case convention for stored enums; the current variant keeps its
+// explicit wire name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum McpAttribution {
     /// SEP-414 `_meta` block (`io.ironclaw/userId` / `invocationId` /
     /// optional `threadId`) on outbound `tools/list` + `tools/call`.
