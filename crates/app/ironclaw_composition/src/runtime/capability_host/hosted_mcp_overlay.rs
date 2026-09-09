@@ -55,6 +55,13 @@ const TURN_DISCOVERY_MAX_TOOLS: u32 = 1024;
 /// not a wedged turn.
 const TURN_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Ceiling on ALL of a turn's discovery, not just one call. The per-call bound
+/// is multiplied by however many hosted-MCP providers are eligible, so without
+/// this a turn with N slow providers stalls for N × [`TURN_DISCOVERY_TIMEOUT`]
+/// before its capability port is even built. Packages past the budget keep
+/// their last-good surface, exactly as a per-call timeout leaves them.
+const TURN_DISCOVERY_BUDGET: Duration = Duration::from_secs(12);
+
 /// How long a missing-credential / permanent-failure verdict suppresses
 /// re-probing. Long enough to keep failed discovery off every turn, short
 /// enough that a freshly provisioned token is picked up within ~2 minutes.
@@ -97,7 +104,9 @@ impl HostedMcpOverlayRefresher {
                 .extensions()
                 .filter_map(|package| {
                     per_user_secret_discovery_template(package).map(
-                        |(capability_id, requirement)| (package.clone(), capability_id, requirement),
+                        |(capability_id, requirement)| {
+                            (package.clone(), capability_id, requirement)
+                        },
                     )
                 })
                 .collect();
@@ -106,7 +115,17 @@ impl HostedMcpOverlayRefresher {
             scope.user_id.clone(),
             scope.thread_id.clone(),
         );
+        let deadline = tokio::time::Instant::now() + TURN_DISCOVERY_BUDGET;
         for (package, capability_id, requirement) in eligible {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::debug!(
+                    extension_id = %package.id,
+                    user_id = %scope.user_id,
+                    "hosted MCP per-user discovery skipped: turn budget spent; \
+                     keeping last-good surface"
+                );
+                continue;
+            }
             let key = (owner.clone(), package.id.clone());
             if matches!(
                 self.overlay.get(&owner, &package.id),
@@ -117,12 +136,11 @@ impl HostedMcpOverlayRefresher {
             if self.negative_cache_active(&key) {
                 continue;
             }
-            if !self.begin(&key) {
+            let Some(_in_flight) = InFlightGuard::acquire(self, key) else {
                 continue;
-            }
+            };
             self.refresh_one(scope, &owner, &package, &capability_id, &requirement)
                 .await;
-            self.finish(&key);
         }
     }
 
@@ -229,7 +247,9 @@ impl HostedMcpOverlayRefresher {
                 self.negative_insert(owner, package);
             }
             Ok(Err(HostedMcpDiscoveryError::Permanent(reason))) => {
-                tracing::warn!(
+                // `debug!`, not `warn!`: this runs on a background turn path
+                // and `warn!` corrupts the REPL/TUI (CLAUDE.md logging rule).
+                tracing::debug!(
                     extension_id = %package.id,
                     user_id = %scope.user_id,
                     reason,
@@ -352,4 +372,33 @@ fn per_user_secret_discovery_template(
         })
         .cloned()?;
     Some((template.id.clone(), requirement))
+}
+
+/// Releases the single-flight slot on drop.
+///
+/// `finish` used to run only after `refresh_one` returned. A turn future
+/// dropped mid-await — turn abort, client disconnect, shutdown — skipped it,
+/// leaving `(owner, extension)` pinned in `in_flight` for the process
+/// lifetime; every later turn for that caller then short-circuited and never
+/// re-discovered, so the caller stayed on its last-good surface (or the static
+/// manifest) until restart. `tokio::time::timeout` does not help: it bounds
+/// the inner discovery, not the dropping of the outer future.
+struct InFlightGuard<'a> {
+    refresher: &'a HostedMcpOverlayRefresher,
+    key: (OverlayScope, ExtensionId),
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn acquire(
+        refresher: &'a HostedMcpOverlayRefresher,
+        key: (OverlayScope, ExtensionId),
+    ) -> Option<Self> {
+        refresher.begin(&key).then(|| Self { refresher, key })
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.refresher.finish(&self.key);
+    }
 }
