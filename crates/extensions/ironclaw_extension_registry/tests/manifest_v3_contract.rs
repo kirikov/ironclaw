@@ -1801,6 +1801,26 @@ fn mcp_attribution_sep414_parses() {
 }
 
 #[test]
+fn mcp_attribution_survives_rehydration_from_the_persisted_record() {
+    // An installed extension is rebuilt from its persisted resolved record on
+    // every load, never by reparsing its TOML. If that path drops the opt-in,
+    // attribution works until the first restart and then silently stops.
+    let manifest = mcp_manifest().replace("[mcp]\n", "[mcp]\nattribution = \"sep414\"\n");
+    let record = parse_v3(&manifest).expect("attributed mcp manifest parses");
+    let rehydrated = ExtensionManifestRecord::from_resolved(
+        record.raw_toml(),
+        ManifestSource::HostBundled,
+        record.resolved().clone(),
+        None,
+    )
+    .expect("persisted record rehydrates");
+    assert_eq!(
+        rehydrated.manifest().mcp_attribution,
+        Some(ironclaw_extension_registry::McpAttribution::Sep414)
+    );
+}
+
+#[test]
 fn mcp_attribution_unknown_value_is_rejected() {
     let manifest = mcp_manifest().replace(
         "[mcp]\n",
