@@ -235,6 +235,18 @@ where
                 method,
                 McpJsonRpcMethod::ToolsList | McpJsonRpcMethod::ToolsCall
             ) {
+            // A provider that opted in and gets no thread key cannot correlate
+            // the call to a conversation, and silently falls back to guessing.
+            // Say so once per call rather than let it degrade quietly.
+            if request.scope.thread_id.is_none() {
+                tracing::debug!(
+                    provider = %request.provider,
+                    capability_id = %request.capability_id,
+                    method = method.as_str(),
+                    "SEP-414 attribution is on but the turn scope carries no thread; \
+                     omitting io.ironclaw/threadId"
+                );
+            }
             let params = Some(params_with_sep414_meta(params, &request.scope));
             encode_json_rpc_request(id, method.as_str(), params)
                 .map_err(McpClientError::client)?

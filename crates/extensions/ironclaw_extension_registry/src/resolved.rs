@@ -345,8 +345,10 @@ impl ResolvedExtensionManifest {
             capabilities: self.tools.clone(),
             host_api_surfaces,
             hooks: self.hooks.clone(),
-            // v2 manifests have no `[mcp]` section, so no attribution opt-in.
-            mcp_attribution: None,
+            // Carried from the stored `[mcp] attribution`, or the opt-in is
+            // silently lost every time a package is rebuilt from its installed
+            // record and the provider stops receiving caller attribution.
+            mcp_attribution: self.mcp.as_ref().and_then(|mcp| mcp.attribution),
         })
     }
 }
