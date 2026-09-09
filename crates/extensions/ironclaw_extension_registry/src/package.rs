@@ -119,9 +119,9 @@ impl ExtensionPackage {
             ManifestSource::HostBundled | ManifestSource::InstalledLocal
         ) {
             return Err(ExtensionError::InvalidManifest {
-                reason:
-                    "inline dynamic descriptor schemas are only supported for host-bundled packages"
-                        .to_string(),
+                reason: "inline dynamic descriptor schemas are only supported for host-bundled \
+                     and operator-installed packages"
+                    .to_string(),
             });
         }
         ensure_extension_root_matches(&manifest.id, &root)?;
