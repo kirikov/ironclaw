@@ -82,7 +82,11 @@ impl RegistryMcpEgressPlanner {
                     .get_capability(capability_id)
                     .cloned()
             }
-            None => self.registry.snapshot().get_capability(capability_id).cloned(),
+            None => self
+                .registry
+                .snapshot()
+                .get_capability(capability_id)
+                .cloned(),
         }
     }
 

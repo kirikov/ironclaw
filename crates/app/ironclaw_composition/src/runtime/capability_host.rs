@@ -1181,9 +1181,11 @@ fn visible_capability_request(
             .extension_surface
             .placeholder_credential_handles(&user_id);
     }
-    grants
-        .grants
-        .extend(inputs.extension_surface.grants(&extension_id, &overlay_owner));
+    grants.grants.extend(
+        inputs
+            .extension_surface
+            .grants(&extension_id, &overlay_owner),
+    );
     let mut context = ExecutionContext::local_default(
         user_id,
         extension_id,

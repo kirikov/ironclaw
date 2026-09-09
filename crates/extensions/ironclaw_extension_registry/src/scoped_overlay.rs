@@ -471,12 +471,14 @@ runtime_credentials = [
     }
 
     fn discovered_package(tool: &str) -> ExtensionPackage {
-        let tools = vec![ironclaw_extension_contracts::hosted_mcp::HostedMcpDiscoveredTool {
-            name: tool.to_string(),
-            description: format!("discovered {tool}"),
-            input_schema: serde_json::json!({"type": "object"}),
-            annotations: Default::default(),
-        }];
+        let tools = vec![
+            ironclaw_extension_contracts::hosted_mcp::HostedMcpDiscoveredTool {
+                name: tool.to_string(),
+                description: format!("discovered {tool}"),
+                input_schema: serde_json::json!({"type": "object"}),
+                annotations: Default::default(),
+            },
+        ];
         crate::package_with_discovered_hosted_mcp_tools(&static_package(), &tools)
             .expect("discoverable package")
     }
@@ -752,7 +754,11 @@ runtime_credentials = [
         // And a thread-less scope for the same owner is its own bucket — it sees
         // neither job's surface.
         let threadless = owner("worker-agent");
-        assert!(!overlay.view_for(&threadless, global_registry()).has_overlays());
+        assert!(
+            !overlay
+                .view_for(&threadless, global_registry())
+                .has_overlays()
+        );
     }
 
     #[test]

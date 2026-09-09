@@ -46,9 +46,8 @@ use crate::resolved::{
     PackageRootBinding, ResolvedAuthSurface, ResolvedExtensionManifest, ResolvedMcpDeclaration,
 };
 use crate::v2::{
-    McpAttribution,
     CapabilityDeclV2, CapabilitySurfaceDeclV2, ExtensionManifestV2, ExtensionRuntimeV2,
-    MAX_MANIFEST_BYTES, ManifestSource, RawCapabilityV2, RawRuntimeCredentialV2,
+    MAX_MANIFEST_BYTES, ManifestSource, McpAttribution, RawCapabilityV2, RawRuntimeCredentialV2,
     requested_trust_to_descriptor_trust,
 };
 

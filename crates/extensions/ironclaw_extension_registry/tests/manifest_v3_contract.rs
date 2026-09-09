@@ -1789,10 +1789,7 @@ fn mcp_attribution_defaults_to_none() {
 
 #[test]
 fn mcp_attribution_sep414_parses() {
-    let manifest = mcp_manifest().replace(
-        "[mcp]\n",
-        "[mcp]\nattribution = \"sep414\"\n",
-    );
+    let manifest = mcp_manifest().replace("[mcp]\n", "[mcp]\nattribution = \"sep414\"\n");
     let record = parse_v3(&manifest).expect("attributed mcp manifest parses");
     assert_eq!(
         record.manifest().mcp_attribution,
@@ -1802,10 +1799,7 @@ fn mcp_attribution_sep414_parses() {
 
 #[test]
 fn mcp_attribution_unknown_value_is_rejected() {
-    let manifest = mcp_manifest().replace(
-        "[mcp]\n",
-        "[mcp]\nattribution = \"telemetry-v9\"\n",
-    );
+    let manifest = mcp_manifest().replace("[mcp]\n", "[mcp]\nattribution = \"telemetry-v9\"\n");
     parse_v3(&manifest).expect_err("unknown attribution value must not parse");
 }
 
@@ -1832,9 +1826,15 @@ effects = ["network", "use_secret", "financial"]
         .iter()
         .find(|c| c.id.as_str() == "zeta.buy_thing")
         .expect("tool present");
-    assert!(tool.effects.contains(&ironclaw_host_api::capability::EffectKind::Financial));
+    assert!(
+        tool.effects
+            .contains(&ironclaw_host_api::capability::EffectKind::Financial)
+    );
     // Template effects survive (superset requirement).
-    assert!(tool.effects.contains(&ironclaw_host_api::capability::EffectKind::UseSecret));
+    assert!(
+        tool.effects
+            .contains(&ironclaw_host_api::capability::EffectKind::UseSecret)
+    );
 }
 
 #[test]

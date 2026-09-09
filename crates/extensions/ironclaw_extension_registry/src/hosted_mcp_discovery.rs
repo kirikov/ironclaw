@@ -1,5 +1,5 @@
-use ironclaw_extension_contracts::hosted_mcp::HostedMcpDiscoveredTool;
 use crate::resolved::PackageRootBinding;
+use ironclaw_extension_contracts::hosted_mcp::HostedMcpDiscoveredTool;
 use ironclaw_extension_contracts::runtime::ExtensionRuntime;
 use ironclaw_host_api::{
     action::{NetworkScheme, NetworkTargetPattern},
@@ -58,7 +58,12 @@ pub fn package_with_discovered_hosted_mcp_tools(
         .collect();
 
     match package.manifest.source {
-        ManifestSource::HostBundled => {
+        // An operator-installed volume package is materialized exactly like a
+        // compiled-in one; its catalog is discovered at runtime just the same,
+        // so it takes the same inline-dynamic reconstruction. Sending it to the
+        // fallback instead made discovery fail for every installed-local
+        // provider.
+        ManifestSource::HostBundled | ManifestSource::InstalledLocal => {
             ExtensionPackage::from_host_bundled_manifest_with_inline_dynamic_schemas(
                 manifest,
                 package
@@ -155,7 +160,9 @@ fn hosted_http_mcp_url(package: &ExtensionPackage) -> Option<&str> {
     // credential.
     if !matches!(
         package.manifest.source,
-        ManifestSource::HostBundled | ManifestSource::InstalledLocal | ManifestSource::UserRegistered
+        ManifestSource::HostBundled
+            | ManifestSource::InstalledLocal
+            | ManifestSource::UserRegistered
     ) {
         return None;
     }
@@ -546,8 +553,14 @@ runtime_credentials = [
             .iter()
             .find(|c| c.id.as_str() == "notion.notion-buy")
             .expect("declared tool discovered");
-        assert!(buy.effects.contains(&EffectKind::Financial), "declared financial survives discovery");
-        assert_eq!(buy.default_permission, ironclaw_host_api::capability::PermissionMode::Allow);
+        assert!(
+            buy.effects.contains(&EffectKind::Financial),
+            "declared financial survives discovery"
+        );
+        assert_eq!(
+            buy.default_permission,
+            ironclaw_host_api::capability::PermissionMode::Allow
+        );
 
         let unknown = discovered
             .capabilities
@@ -555,7 +568,11 @@ runtime_credentials = [
             .find(|c| c.id.as_str() == "notion.notion-unknown")
             .expect("unknown tool discovered");
         assert!(!unknown.effects.contains(&EffectKind::Financial));
-        assert_eq!(unknown.default_permission, ironclaw_host_api::capability::PermissionMode::Ask, "unknown discovered tools stay Ask");
+        assert_eq!(
+            unknown.default_permission,
+            ironclaw_host_api::capability::PermissionMode::Ask,
+            "unknown discovered tools stay Ask"
+        );
     }
 
     /// A host-internal manifest row (the synthesized `<id>.mcp_server`

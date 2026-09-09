@@ -152,11 +152,7 @@ impl ExtensionCapabilitySurface {
     /// authorization reuses the grants minted here, so a capability filtered
     /// out is both invisible in the surface AND denied at dispatch — grant
     /// absence fails closed with no separate preflight.
-    pub fn grants(
-        &self,
-        grantee: &ExtensionId,
-        caller: &OverlayScope,
-    ) -> Vec<CapabilityGrant> {
+    pub fn grants(&self, grantee: &ExtensionId, caller: &OverlayScope) -> Vec<CapabilityGrant> {
         self.caller_capabilities(caller)
             .iter()
             .map(|capability| CapabilityGrant {
@@ -200,10 +196,7 @@ impl ExtensionCapabilitySurface {
     /// Provider trust for the same request; filtered by the same owner rule as
     /// [`Self::grants`] so a user-private extension's provider is not even
     /// advertised to other users' surfaces.
-    pub fn provider_trust(
-        &self,
-        caller: &OverlayScope,
-    ) -> BTreeMap<ExtensionId, TrustDecision> {
+    pub fn provider_trust(&self, caller: &OverlayScope) -> BTreeMap<ExtensionId, TrustDecision> {
         let mut effects_by_provider: BTreeMap<ExtensionId, Vec<EffectKind>> = BTreeMap::new();
         for capability in &self.caller_capabilities(caller) {
             let effects = effects_by_provider
