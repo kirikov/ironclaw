@@ -86,31 +86,6 @@ impl RegistryMcpEgressPlanner {
         }
     }
 
-    /// Resolve `provider`'s package for `scope` through the caller's overlay,
-    /// for the same reason [`Self::scoped_capability`] does: a per-user
-    /// DISCOVERED provider is absent from the global registry, and reading the
-    /// global snapshot alone silently loses whatever its manifest declares.
-    fn scoped_package(
-        &self,
-        scope: &ResourceScope,
-        provider: &ExtensionId,
-    ) -> Option<ExtensionPackage> {
-        match &self.scoped_overlay {
-            Some(overlay) => {
-                let owner = OverlayScope::new(
-                    scope.tenant_id.clone(),
-                    scope.user_id.clone(),
-                    scope.thread_id.clone(),
-                );
-                overlay
-                    .view_for(&owner, self.registry.snapshot())
-                    .get_extension(provider)
-                    .cloned()
-            }
-            None => self.registry.snapshot().get_extension(provider).cloned(),
-        }
-    }
-
     fn credential_injections(
         &self,
         scope: &ResourceScope,
@@ -164,7 +139,9 @@ impl McpHostHttpEgressPlanner for RegistryMcpEgressPlanner {
         // manifest declares `[mcp] attribution = "sep414"` gets the SEP-414
         // `_meta` block stamped on its tool calls.
         let sep414_attribution = self
-            .scoped_package(request.scope, request.provider)
+            .registry
+            .snapshot()
+            .get_extension(request.provider)
             .is_some_and(|package| {
                 package.manifest.mcp_attribution
                     == Some(ironclaw_extension_registry::McpAttribution::Sep414)
