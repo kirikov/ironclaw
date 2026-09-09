@@ -347,10 +347,21 @@ fn merged_effective_tools(
                 }
             })
             .collect();
+    // `max_tools` bounds what a REMOTE server may inject into the surface, so
+    // it is spent on discovered-only entries. Declared tools are manifest
+    // authored and already counted against the ceiling at parse time, so they
+    // are never dropped to make room — the alternative silently deletes a
+    // capability the operator wrote down.
+    let room = base
+        .mcp
+        .as_ref()
+        .map(|mcp| (mcp.max_tools as usize).saturating_sub(merged.len()))
+        .unwrap_or(usize::MAX);
     merged.extend(
         published
             .iter()
             .filter(|fresh| !base.tools.iter().any(|declared| declared.id == fresh.id))
+            .take(room)
             .cloned(),
     );
     merged
