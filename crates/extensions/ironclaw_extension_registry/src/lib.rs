@@ -227,13 +227,13 @@ pub use resolved::{
     ResolvedHostApiRef, ResolvedMcpDeclaration, ResolvedSectionSurface,
 };
 pub use v2::{
-    McpAttribution,
     CapabilityDeclV2, CapabilitySurfaceDeclV2, CapabilityVisibility, ExtensionManifestV2,
     ExtensionRuntimeV2, HookSectionEntryV2, HostApiContractRegistry, HostApiId,
     HostApiManifestContext, HostApiManifestContract, HostApiManifestProjection,
     HostApiMultiplicity, HostApiRefV2, HostApiSectionError, MANIFEST_SCHEMA_VERSION,
     MAX_HOOK_ENTRY_BYTES, MAX_MANIFEST_BYTES, MAX_MANIFEST_HOOKS, ManifestSectionPath,
-    ManifestSource, ManifestV2Error, RESERVED_HOST_BUNDLED_ID_PREFIX, RESERVED_MCP_ID_PREFIX,
+    ManifestSource, ManifestV2Error, McpAttribution, RESERVED_HOST_BUNDLED_ID_PREFIX,
+    RESERVED_MCP_ID_PREFIX,
 };
 pub use v3::{MANIFEST_SCHEMA_VERSION_V3, ManifestV3Error};
 

@@ -46,9 +46,8 @@ use crate::resolved::{
     PackageRootBinding, ResolvedAuthSurface, ResolvedExtensionManifest, ResolvedMcpDeclaration,
 };
 use crate::v2::{
-    McpAttribution,
     CapabilityDeclV2, CapabilitySurfaceDeclV2, ExtensionManifestV2, ExtensionRuntimeV2,
-    MAX_MANIFEST_BYTES, ManifestSource, RawCapabilityV2, RawRuntimeCredentialV2,
+    MAX_MANIFEST_BYTES, ManifestSource, McpAttribution, RawCapabilityV2, RawRuntimeCredentialV2,
     requested_trust_to_descriptor_trust,
 };
 
@@ -660,7 +659,7 @@ pub(crate) fn parse_v3(
                     network_targets: Vec::new(),
                     max_egress_bytes: None,
                     description: tool.description,
-                    effects: with_dispatch_effect(tool_effects),
+                    effects: with_dispatch_effect(tool_effects.clone()),
                     default_permission: tool.default_permission,
                     visibility: tool.visibility,
                     // The guard above rejects standard operations on MCP
@@ -670,7 +669,12 @@ pub(crate) fn parse_v3(
                     input_schema_ref,
                     output_schema_ref: None,
                     prompt_doc_ref: tool.prompt_doc_ref,
-                    required_host_ports: derived_host_ports(&mcp.effects, true),
+                    // From the tool's EFFECTIVE effects, not the connection
+                    // template's: a tool that adds `network` on top of a
+                    // template without it would otherwise carry
+                    // `EffectKind::Network` and no HTTP-egress port, so its
+                    // egress would not be host-mediated.
+                    required_host_ports: derived_host_ports(&tool_effects, true),
                     runtime_credentials: template_credentials.clone(),
                     resource_profile: None,
                     origin_gate_matrix: mcp.origin_gate_matrix.clone(),
