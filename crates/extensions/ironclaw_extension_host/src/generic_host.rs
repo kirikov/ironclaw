@@ -285,10 +285,6 @@ pub fn effective_resolved_for_package(
     base: &ResolvedExtensionManifest,
     package: &ExtensionPackage,
 ) -> ResolvedExtensionManifest {
-    let mut resolved = ResolvedExtensionManifest {
-        tools: merged_effective_tools(base, package),
-        ..base.clone()
-    };
     // Discovered per-tool schemas must be persisted for both the virtual
     // (user-registered, remote-only) package shape and the materialized
     // host-bundled shape whose descriptors are inline-dynamic (hosted MCP
@@ -303,8 +299,20 @@ pub fn effective_resolved_for_package(
             ironclaw_extension_registry::PackageRootBinding::Materialized(_)
         ) && package.descriptor_schema_mode
             == ironclaw_extension_registry::CapabilityDescriptorSchemaMode::InlineDynamic);
+    let mut resolved = ResolvedExtensionManifest {
+        tools: merged_effective_tools(base, package, captures_dynamic_schemas),
+        ..base.clone()
+    };
+    let kept: std::collections::BTreeSet<String> = resolved
+        .tools
+        .iter()
+        .map(|tool| tool.id.as_str().to_string())
+        .collect();
     if captures_dynamic_schemas && let Some(mcp) = resolved.mcp.as_mut() {
-        mcp.dynamic_input_schemas = package
+        // Overlay onto the stored map rather than replacing it: a tool carried
+        // over from an earlier discovery keeps the schema that made carrying it
+        // safe. Entries for tools no longer in the catalog are pruned below.
+        let fresh: std::collections::BTreeMap<String, serde_json::Value> = package
             .capabilities
             .iter()
             .map(|descriptor| {
@@ -314,6 +322,8 @@ pub fn effective_resolved_for_package(
                 )
             })
             .collect();
+        mcp.dynamic_input_schemas.extend(fresh);
+        mcp.dynamic_input_schemas.retain(|id, _| kept.contains(id));
     }
     resolved
 }
@@ -325,28 +335,43 @@ pub fn effective_resolved_for_package(
 fn merged_effective_tools(
     base: &ResolvedExtensionManifest,
     package: &ExtensionPackage,
+    captures_dynamic_schemas: bool,
 ) -> Vec<ironclaw_extension_registry::CapabilityDeclV2> {
     let published = &package.manifest.capabilities;
     if base.tools.is_empty() {
         return published.clone();
     }
-    let mut merged: Vec<_> =
-        base.tools
-            .iter()
-            .filter_map(|declared| {
-                match published.iter().find(|fresh| fresh.id == declared.id) {
-                    // Discovered this time: the fresh entry carries the live
-                    // schema and wins.
-                    Some(fresh) => Some(fresh.clone()),
-                    // Not discovered by this caller. Carry a real tool over, but
-                    // never the `[mcp]` discovery template: it is HostInternal,
-                    // it is not a callable tool, and the published package
-                    // legitimately drops it once discovery has run.
-                    None => (declared.visibility == CapabilityVisibility::Model)
-                        .then(|| declared.clone()),
-                }
-            })
-            .collect();
+    // A carried-over tool must still have a schema, or rebuilding the package
+    // from this record fails closed and the extension stops activating at all.
+    // Where schemas are dynamic, that means the base already recorded one for
+    // it from an earlier discovery; a tool that has never been discovered is
+    // not invented here. Where they are not, the manifest's own `$ref`
+    // resolves and every declared tool is safe to carry.
+    let has_schema = |id: &ironclaw_host_api::ids::CapabilityId| {
+        !captures_dynamic_schemas
+            || base
+                .mcp
+                .as_ref()
+                .is_some_and(|mcp| mcp.dynamic_input_schemas.contains_key(id.as_str()))
+    };
+    let mut merged: Vec<_> = base
+        .tools
+        .iter()
+        .filter_map(|declared| {
+            match published.iter().find(|fresh| fresh.id == declared.id) {
+                // Discovered this time: the fresh entry carries the live
+                // schema and wins.
+                Some(fresh) => Some(fresh.clone()),
+                // Not discovered by this caller. Carry a real tool over, but
+                // never the `[mcp]` discovery template: it is HostInternal,
+                // it is not a callable tool, and the published package
+                // legitimately drops it once discovery has run.
+                None => (declared.visibility == CapabilityVisibility::Model
+                    && has_schema(&declared.id))
+                .then(|| declared.clone()),
+            }
+        })
+        .collect();
     // `max_tools` bounds what a REMOTE server may inject into the surface, so
     // it is spent on discovered-only entries. Declared tools are manifest
     // authored and already counted against the ceiling at parse time, so they

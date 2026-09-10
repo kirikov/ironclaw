@@ -18,53 +18,62 @@ use ironclaw_extension_registry::{InstallationOwner, OverlayScope, ScopedPackage
 use ironclaw_product_contracts::error::ProductOperationFailure;
 
 #[derive(Clone, Default)]
-pub struct ExtensionCapabilitySurfaceSource {
-    extension_management: Option<Arc<RebornLocalExtensionManagementPort>>,
-    scoped_overlay: Option<Arc<ScopedPackageOverlay>>,
+pub enum ExtensionCapabilitySurfaceSource {
+    #[default]
+    Empty,
+    /// The live management port, plus the caller's discovered-package overlay
+    /// when one is attached. The overlay rides in the variant rather than in a
+    /// struct field so the test-only `Static` seam stays a variant too.
+    Management(
+        Arc<RebornLocalExtensionManagementPort>,
+        Option<Arc<ScopedPackageOverlay>>,
+    ),
     #[cfg(any(test, feature = "test-support"))]
-    static_surface: Option<ExtensionCapabilitySurface>,
+    Static(ExtensionCapabilitySurface),
 }
 
 impl ExtensionCapabilitySurfaceSource {
     pub fn new(extension_management: Option<Arc<RebornLocalExtensionManagementPort>>) -> Self {
-        Self {
-            extension_management,
-            scoped_overlay: None,
-            #[cfg(any(test, feature = "test-support"))]
-            static_surface: None,
+        match extension_management {
+            Some(extension_management) => Self::Management(extension_management, None),
+            None => Self::Empty,
         }
     }
 
     /// Attach the per-user discovered-package overlay so grants and provider
-    /// trust cover the caller's discovered hosted-MCP surface (P2b).
-    pub fn with_scoped_overlay(mut self, overlay: Arc<ScopedPackageOverlay>) -> Self {
-        self.scoped_overlay = Some(overlay);
-        self
+    /// trust cover the caller's discovered hosted-MCP surface. Without a
+    /// management port there is no surface to overlay, so the other variants
+    /// are returned unchanged.
+    pub fn with_scoped_overlay(self, overlay: Arc<ScopedPackageOverlay>) -> Self {
+        match self {
+            Self::Management(extension_management, _) => {
+                Self::Management(extension_management, Some(overlay))
+            }
+            other => other,
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_surface(surface: ExtensionCapabilitySurface) -> Self {
-        Self {
-            extension_management: None,
-            scoped_overlay: None,
-            static_surface: Some(surface),
-        }
+        Self::Static(surface)
     }
 
     pub async fn snapshot(&self) -> Result<ExtensionCapabilitySurface, ProductOperationFailure> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(surface) = &self.static_surface {
-            return Ok(surface.clone());
+        match self {
+            Self::Empty => Ok(ExtensionCapabilitySurface::default()),
+            Self::Management(extension_management, scoped_overlay) => {
+                let mut surface =
+                    ExtensionCapabilitySurface::from_extension_management(extension_management)
+                        .await?;
+                // The caller's discovered-package overlay rides with the
+                // surface, so grants and provider trust see the same catalog
+                // dispatch will.
+                surface.scoped_overlay = scoped_overlay.clone();
+                Ok(surface)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Static(surface) => Ok(surface.clone()),
         }
-        let Some(extension_management) = self.extension_management.as_deref() else {
-            return Ok(ExtensionCapabilitySurface::default());
-        };
-        let mut surface =
-            ExtensionCapabilitySurface::from_extension_management(extension_management).await?;
-        // The caller's discovered-package overlay rides with the surface, so
-        // grants and provider trust see the same catalog dispatch will (P2b).
-        surface.scoped_overlay = self.scoped_overlay.clone();
-        Ok(surface)
     }
 }
 
