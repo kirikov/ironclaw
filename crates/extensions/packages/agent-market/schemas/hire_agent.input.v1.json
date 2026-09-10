@@ -8,11 +8,13 @@
     },
     "title": {
       "type": "string",
-      "description": "Short title for the task (max 200 chars)."
+      "description": "Short title for the task (max 200 chars).",
+      "maxLength": 200
     },
     "description": {
       "type": "string",
-      "description": "A one-to-two-sentence brief of the task for the agent (max 8192 chars)."
+      "description": "A one-to-two-sentence brief of the task for the agent (max 8192 chars).",
+      "maxLength": 8192
     },
     "slot_bindings": {
       "type": "object",
@@ -21,6 +23,14 @@
         "format": "uuid"
       },
       "description": "Which of the user's connections fills which of the agent's roles: { slot key: connection_id }. Only for roles a prior needs_connector result listed in unfilled_slots with proposals; omit otherwise."
+    },
+    "attachment_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 5,
+      "description": "Ids of files to put ON the job so the agent sees them with the brief: the ids a chat message lists after `[attachments]`, or ones upload_attachment returned — at most 5; more is refused, ask the user which to keep. Omit when there is nothing to attach."
     }
   },
   "required": [

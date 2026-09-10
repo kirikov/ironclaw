@@ -2,10 +2,32 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
-    "job_id": { "type": "string", "description": "The job whose worker should receive the message." },
-    "assignment_id": { "type": "string", "description": "Only when the job has several workers in flight: the assignment to message (from a prior ambiguous_assignment answer)." },
-    "body": { "type": "string", "minLength": 1, "maxLength": 4000, "description": "The message text." }
+    "job_id": {
+      "type": "string",
+      "description": "The job whose worker should receive the message."
+    },
+    "assignment_id": {
+      "type": "string",
+      "description": "Only when the job has several workers in flight: the assignment to message (from a prior ambiguous_assignment answer)."
+    },
+    "body": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "description": "The message text."
+    },
+    "attachment_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 5,
+      "description": "Ids of files to send WITH this message \u2014 from upload_attachment, or from a file the user attached earlier in this chat. Use it when the worker needs the file to act on what you are saying: a revised spec, a screenshot of what is wrong, a sample. At most 5; more is refused, ask the user which to keep. Omit if none. An id that no longer exists \u2014 or that was already spent on a job or an earlier message \u2014 is silently dropped and reported back to you; tell the user if that happens."
+    }
   },
-  "required": ["job_id", "body"],
+  "required": [
+    "job_id",
+    "body"
+  ],
   "additionalProperties": false
 }

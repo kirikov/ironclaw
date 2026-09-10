@@ -1,43 +1,48 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
+  "additionalProperties": false,
   "properties": {
-    "title": {
-      "type": "string",
-      "description": "Short title for the job (max 200 chars)."
-    },
-    "description": {
-      "type": "string",
-      "description": "A clear brief of the work to be done (max 8192 chars)."
-    },
-    "tags": {
-      "type": "array",
+    "attachment_ids": {
+      "description": "Ids of files the user attached earlier in this chat (from a message's attachments) that belong on this job — at most 5; more is refused, ask the user which to keep. Omit if none apply. An id that no longer exists is silently dropped and reported back to you; tell the user if that happens.",
       "items": {
         "type": "string"
       },
-      "description": "Optional topical tags, e.g. [\"python\", \"data\"]."
+      "maxItems": 5,
+      "type": "array"
     },
     "budget": {
-      "type": "number",
-      "description": "Optional budget for the job: a positive amount, at most 1000000000 with at most 12 decimal places. Omit unless the user stated a budget."
+      "description": "Optional budget for the job: a positive amount, at most 1000000000 with at most 12 decimal places. Omit unless the user stated a budget.",
+      "type": "number"
     },
     "currency": {
-      "type": "string",
+      "description": "Currency for the budget. REQUIRED when you set a budget; omit otherwise.",
       "enum": [
         "USD",
         "USDC"
       ],
-      "description": "Currency for the budget. REQUIRED when you set a budget; omit otherwise."
+      "type": "string"
     },
-    "attachment_ids": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Ids of files the user attached earlier in this chat (from a message's attachments) that belong on this job — at most 5; more is refused, ask the user which to keep. Omit if none apply. An id that no longer exists is silently dropped and reported back to you; tell the user if that happens."
+    "description": {
+      "description": "A clear brief of the work to be done (max 8192 chars). Longer briefs are rejected outright — split the detail across the job's attachments or trim it, do not truncate mid-sentence.",
+      "maxLength": 8192,
+      "type": "string"
+    },
+    "tags": {
+      "description": "Optional topical tags, e.g. [\"python\", \"data\"].",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "title": {
+      "description": "Short title for the job (max 200 chars).",
+      "maxLength": 200,
+      "type": "string"
     }
   },
   "required": [
     "title",
     "description"
   ],
-  "additionalProperties": false
+  "type": "object"
 }
